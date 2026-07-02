@@ -92,9 +92,10 @@ sudo pacman -S xorriso qemu-system-x86 gcc git make
 ```bash
 git clone https://github.com/The-Hep-Group/HepOS.git
 cd HepOS
+git clone https://github.com/limine-bootloader/limine.git --branch=v9.x-binary --depth=1 limine
 ```
 
-> The `limine/` directory (bootloader binaries) is committed to the repo — no extra clone needed.
+> The `limine/` directory (bootloader binaries) is not committed to the repo — extra clone needed (done in above).
 
 ### Windows
 
