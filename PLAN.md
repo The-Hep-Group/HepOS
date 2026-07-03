@@ -86,7 +86,7 @@ qemu-system-x86_64
   -device qemu-xhci,id=xhci
   -device usb-tablet,bus=xhci.0     # absolute mouse via USB HID
   -vga std
-  -display sdl,window-close=off,zoom-to-fit=off
+  -display sdl,window-close=off
   -serial stdio
   -no-reboot
   -no-shutdown
@@ -341,7 +341,7 @@ RX works on Linux/KVM — this is a QEMU Windows SLiRP path issue, not a driver 
 | ✓ | Full-edge resize — drag any edge or corner; left edge also moves the window |
 | ✓ | Window maximize — double-click title bar or □ button; edge-drag snap to left/right half or full |
 | ✓ | "+" button on terminal title bars — click to spawn a new floating terminal window |
-| ✓ | QEMU cursor fix — `zoom-to-fit=off` prevents coordinate mismatch when QEMU window is resized or fullscreened |
+| ○ | QEMU cursor on resize — USB tablet coords are logical (0–32767 → fb size) and should be unaffected by SDL window scale, but QEMU/Windows SDL sometimes breaks this when the window is dragged to a different size; workaround: don't resize the QEMU window, or use Ctrl+Alt+F for fullscreen |
 | ○ | Desktop icons / wallpaper |
 | ○ | Multiple instances of the same app |
 
@@ -391,8 +391,9 @@ RX works on Linux/KVM — this is a QEMU Windows SLiRP path issue, not a driver 
 6. ~~**Window maximize / snap**~~ ✓ done
 7. ~~**Multiple terminal windows**~~ ✓ done
 8. ~~**Full-edge resize + directional cursors**~~ ✓ done
-9. ~~**"+" new terminal button + QEMU cursor fix**~~ ✓ done
-10. **Desktop icons** — clickable icons on the desktop background for each app
+9. ~~**"+" new terminal button**~~ ✓ done
+10. **QEMU cursor on window resize** — `zoom-to-fit` not available on this QEMU/Windows build; known SDL limitation; no fix yet
+11. **Desktop icons** — clickable icons on the desktop background for each app
 9. **RTL8169 / real hardware NIC** — for running on physical machines
 
 ---
