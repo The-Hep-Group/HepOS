@@ -200,6 +200,7 @@ Terminal column count adapts to window width dynamically (up to 120 cols max).
 | `exec <file>` | Load and run ELF64 binary from HepFS |
 | `ps` | List all processes (PID, state, name) |
 | `runtest` | Run embedded ring-3 ELF sanity test |
+| `newterm` | Spawn a new floating terminal window |
 
 ---
 
@@ -349,7 +350,7 @@ RX works on Linux/KVM — this is a QEMU Windows SLiRP path issue, not a driver 
 | ✓ | HepFS file manager — back/forward/path bar, click-to-navigate, click-to-open |
 | ✓ | Welcome window — system info |
 | ✓ | Sysmon window — RAM bar, uptime, PCI list, storage/net status |
-| ○ | Multiple terminal windows |
+| ✓ | Multiple terminal windows — `newterm` spawns additional floating terminals, each independently focusable |
 | ○ | Image viewer |
 | ○ | Audio player |
 | ○ | Settings panel |
@@ -385,7 +386,7 @@ RX works on Linux/KVM — this is a QEMU Windows SLiRP path issue, not a driver 
 4. **Intel HDA audio** — PCI enumerate, CORB/RIRB setup, play PCM; pair with a beep command
 5. **TCP/UDP stack** — build on existing ARP/IP layer; needed for any real networking app
 6. ~~**Window maximize / snap**~~ ✓ done
-7. **Multiple terminal windows** — allow spawning a second terminal from start menu
+7. ~~**Multiple terminal windows**~~ ✓ done
 8. **Desktop icons** — clickable icons on the desktop background for each app
 9. **RTL8169 / real hardware NIC** — for running on physical machines
 

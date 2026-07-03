@@ -253,7 +253,7 @@ impl Terminal {
             "help", "clear", "pwd", "ls", "cd", "cat", "mkdir", "touch",
             "rm", "cp", "mv", "write", "edit", "uname", "mem", "date",
             "history", "lspci", "netdiag", "netstart", "netpoll", "ifconfig",
-            "ping", "shutdown", "reboot", "echo", "sysinfo", "syscallinfo", "runtest", "exec", "ps",
+            "ping", "shutdown", "reboot", "echo", "sysinfo", "syscallinfo", "runtest", "exec", "ps", "newterm",
         ];
 
         let partial = self.cmd_buf.clone();
@@ -718,6 +718,18 @@ impl Terminal {
                 if !any { self.print("  (no processes)\n"); }
             }
 
+            "newterm" => {
+                let id = crate::terminal::spawn_terminal();
+                if id == usize::MAX {
+                    self.print_colored("newterm: desktop not ready\n", ERR);
+                } else {
+                    self.print_colored(
+                        &alloc::format!("Spawned terminal (window {}). Click it to focus.\n", id),
+                        OK,
+                    );
+                }
+            }
+
             "syscallinfo" => {
                 // Read back the MSRs we programmed in syscall::init() and show them.
                 // Values should match exactly what was written:
@@ -948,10 +960,32 @@ impl Terminal {
 
 pub static TERMINAL: Mutex<Option<Terminal>> = Mutex::new(None);
 
+/// Additional terminal instances keyed by their window ID.
+/// Window IDs for extra terminals are assigned by the desktop when spawned.
+pub static EXTRA_TERMINALS: Mutex<alloc::vec::Vec<(usize, Terminal)>> = Mutex::new(alloc::vec::Vec::new());
+
 pub fn init() {
     *TERMINAL.lock() = Some(Terminal::new());
     // Trigger desktop re-render so terminal content appears immediately
     if let Some(dt) = crate::desktop::DESKTOP.lock().as_mut() {
         dt.dirty = true;
     }
+}
+
+/// Spawn a new floating terminal window. Returns the new window ID.
+pub fn spawn_terminal() -> usize {
+    let count = EXTRA_TERMINALS.lock().len();
+    let off   = (count + 1) as i32 * 24;
+    let win_id = {
+        let mut dt = crate::desktop::DESKTOP.lock();
+        if let Some(dt) = dt.as_mut() {
+            let id = dt.add_window("Terminal", 80 + off, 80 + off, 520, 320);
+            dt.dirty = true;
+            id
+        } else {
+            return usize::MAX;
+        }
+    };
+    EXTRA_TERMINALS.lock().push((win_id, Terminal::new()));
+    win_id
 }

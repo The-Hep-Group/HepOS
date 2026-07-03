@@ -344,9 +344,19 @@ fn task_blink() -> ! {
                     }
                 }
             } else {
-                // Terminal (or any other window) gets the key
-                let mut tg = terminal::TERMINAL.lock();
-                if let Some(t) = tg.as_mut() { t.on_key(c); }
+                let focused = *FOCUSED_WIN.lock();
+                // Route to the focused extra terminal if one is focused
+                let routed_extra = {
+                    let mut et = terminal::EXTRA_TERMINALS.lock();
+                    if let Some((_, t)) = et.iter_mut().find(|(wid, _)| Some(*wid) == focused) {
+                        t.on_key(c);
+                        true
+                    } else { false }
+                };
+                if !routed_extra {
+                    let mut tg = terminal::TERMINAL.lock();
+                    if let Some(t) = tg.as_mut() { t.on_key(c); }
+                }
             }
         }
 
@@ -536,7 +546,8 @@ fn task_blink() -> ! {
         let content_dirty = {
             let dd = desktop::DESKTOP.lock().as_ref().map(|d| d.dirty).unwrap_or(false);
             let td = terminal::TERMINAL.lock().as_ref().map(|t| t.dirty).unwrap_or(false);
-            dd || td || ps2_had_input
+            let ed = terminal::EXTRA_TERMINALS.lock().iter().any(|(_, t)| t.dirty);
+            dd || td || ed || ps2_had_input
         };
         let mouse_moved = {
             let md = desktop::DESKTOP.lock().as_ref().map(|d| d.mouse_dirty).unwrap_or(false);
@@ -630,7 +641,14 @@ fn task_blink() -> ! {
                                    ed.render(display, wx, wy, *ww, *wh);
                                } }
                         4 => render_sysmon_window(display),
-                        _ => {}
+                        _ => {
+                            // Extra terminals spawned via `newterm`
+                            let mut et = terminal::EXTRA_TERMINALS.lock();
+                            if let Some((_, t)) = et.iter_mut().find(|(wid, _)| *wid == *id) {
+                                t.render(display, wx, wy, *ww, *wh);
+                                t.dirty = false;
+                            }
+                        }
                     }
                 }
 
