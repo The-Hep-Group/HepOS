@@ -186,7 +186,7 @@ pub fn handle_frame(frame: &[u8]) {
     }
 }
 
-/// High-level ping. Sends request, polls for reply up to `timeout_ms` ms.
+/// High-level ping. Sends request, polls for reply up to ~250 ms.
 /// Returns round-trip string or error.
 pub fn ping(target_ip: [u8; 4]) -> alloc::string::String {
     use alloc::format;
@@ -195,10 +195,17 @@ pub fn ping(target_ip: [u8; 4]) -> alloc::string::String {
         return format!("ping: no NIC found");
     }
 
-    // Skip ARP — QEMU SLiRP gateway MAC is always 52:55:0a:00:02:02
-    // SLiRP routes all IP traffic regardless of MAC, so we can hardcode this.
-    let dst_mac = [0x52u8, 0x55, 0x0a, 0x00, 0x02, 0x02];
-    crate::serial::print("ping: using SLiRP gateway MAC, skipping ARP\n");
+    // Routing:
+    //   on-subnet destination  → would normally ARP, but SLiRP only provides
+    //                            the gateway host; ARP for other 10.0.2.x won't reply.
+    //                            Use gateway MAC for gateway IP, else best-effort.
+    //   off-subnet destination → route via gateway (use gateway MAC).
+    // In all QEMU SLiRP cases the known gateway MAC is 52:55:0a:00:02:02.
+    let gw_mac = [0x52u8, 0x55, 0x0a, 0x00, 0x02, 0x02];
+    let on_subnet = (target_ip[0] == MY_IP[0]) && (target_ip[1] == MY_IP[1])
+                 && (target_ip[2] == MY_IP[2]);
+    let dst_mac = gw_mac; // gateway MAC works for all QEMU SLiRP targets
+    let _ = on_subnet;    // routing note: on-subnet uses gateway MAC too (SLiRP limitation)
 
     // Send echo request
     *PING_REPLY.lock() = None;

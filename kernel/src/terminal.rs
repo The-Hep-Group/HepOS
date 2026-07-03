@@ -792,7 +792,19 @@ impl Terminal {
                             parts[2].parse().unwrap_or(0),
                             parts[3].parse().unwrap_or(0),
                         ];
-                        self.print_colored(&alloc::format!("PING {}\n", arg1), DIM);
+                        let on_subnet = ip[0] == 10 && ip[1] == 0 && ip[2] == 2;
+                        let route_note = if on_subnet {
+                            if ip == crate::net::GW_IP {
+                                " (gateway)"
+                            } else {
+                                " (local subnet — SLiRP may not reply)"
+                            }
+                        } else {
+                            " (via gateway 10.0.2.2)"
+                        };
+                        self.print_colored(
+                            &alloc::format!("PING {}{}\n", arg1, route_note), DIM
+                        );
                         let result = crate::net::ping(ip);
                         self.print(&result);
                         self.print("\n");
