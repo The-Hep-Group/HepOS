@@ -295,7 +295,9 @@ fn task_blink() -> ! {
     let mut mx: i32 = 400;
     let mut my: i32 = 300;
     let mut btn: u8  = 0;
-    let mut prev_btn: u8 = 0; // for click detection outside update_mouse
+    let mut prev_btn: u8 = 0;
+    // Track where the cursor was last painted so we can restore only those rows
+    let mut prev_cursor_y: usize = 300;
 
     loop {
         ps2::poll();
@@ -526,24 +528,77 @@ fn task_blink() -> ! {
             if let Some(tm) = tm.as_mut() { tm.dirty = true; }
         }
 
-        // Render desktop + terminal every frame when dirty
-        let desktop_dirty = desktop::DESKTOP.lock().as_ref().map(|d| d.dirty).unwrap_or(false);
-        let term_dirty    = terminal::TERMINAL.lock().as_ref().map(|t| t.dirty).unwrap_or(false);
+        // Two-tier rendering:
+        //   content_dirty → full scene redraw + save_scene + cursor + full flush
+        //   mouse_only    → restore scene rows near cursor + repaint cursor + partial flush
+        // The partial path updates only ~20 rows (~100 KB) instead of 3.5 MB, so
+        // cursor movement is extremely cheap and runs at the full polling rate.
+        let content_dirty = {
+            let dd = desktop::DESKTOP.lock().as_ref().map(|d| d.dirty).unwrap_or(false);
+            let td = terminal::TERMINAL.lock().as_ref().map(|t| t.dirty).unwrap_or(false);
+            dd || td || ps2_had_input
+        };
+        let mouse_moved = {
+            let md = desktop::DESKTOP.lock().as_ref().map(|d| d.mouse_dirty).unwrap_or(false);
+            md
+        };
+        // Consume both flags before rendering
+        if mouse_moved {
+            let mut dt = desktop::DESKTOP.lock();
+            if let Some(dt) = dt.as_mut() { dt.mouse_dirty = false; }
+        }
 
-        if desktop_dirty || term_dirty || ps2_had_input {
-            if let Some(display) = DISPLAY.lock().as_mut() {
-                // 1. Background clear
-                {
+        // ── Closure-like block for cursor drawing ─────────────────────────────
+        // Shared between both render paths. Returns the cursor y-span (y0, rows).
+        macro_rules! draw_cursor {
+            ($display:expr, $cx:expr, $cy:expr) => {{
+                let cx = $cx;
+                let cy = $cy;
+                let white = framebuffer::Color::from_hex(0xFFFFFF);
+                let black = framebuffer::Color::from_hex(0x111111);
+                let over_resize = {
                     let dt = desktop::DESKTOP.lock();
-                    if let Some(dt) = dt.as_ref() { dt.render(display, mx, my); }
+                    dt.as_ref().map(|d| {
+                        d.windows.iter().any(|w| w.resizing)
+                        || d.windows.iter().rev()
+                            .any(|w| !w.minimized && w.resize_hit(mx, my))
+                    }).unwrap_or(false)
+                };
+                if over_resize {
+                    for i in -4_i32..=4 {
+                        let px = (cx as i32 + i + 1).max(0) as usize;
+                        let py = (cy as i32 + i + 1).max(0) as usize;
+                        $display.put_pixel_pub(px, py, black);
+                    }
+                    $display.fill_rect(cx.saturating_sub(3), cy.saturating_sub(5)+1, 5, 1, black);
+                    $display.fill_rect(cx.saturating_sub(5)+1, cy.saturating_sub(3), 1, 4, black);
+                    $display.fill_rect(cx + 1, cy + 5, 5, 1, black);
+                    $display.fill_rect(cx + 5, cy + 1, 1, 4, black);
+                    for i in -4_i32..=4 {
+                        let px = (cx as i32 + i).max(0) as usize;
+                        let py = (cy as i32 + i).max(0) as usize;
+                        $display.put_pixel_pub(px, py, white);
+                    }
+                    $display.fill_rect(cx.saturating_sub(3), cy.saturating_sub(5), 5, 1, white);
+                    $display.fill_rect(cx.saturating_sub(5), cy.saturating_sub(3), 1, 4, white);
+                    $display.fill_rect(cx + 1, cy + 5, 4, 1, white);
+                    $display.fill_rect(cx + 5, cy + 1, 1, 4, white);
+                } else {
+                    $display.fill_rect(cx.saturating_sub(6), cy, 13, 1, white);
+                    $display.fill_rect(cx, cy.saturating_sub(6), 1, 13, white);
                 }
-                {
-                    let mut dt = desktop::DESKTOP.lock();
-                    if let Some(dt) = dt.as_mut() { dt.dirty = false; }
-                }
+            }};
+        }
 
-                // 2. Windows in z-order: chrome then content for each window so
-                //    a lower window's content never paints over a higher window's chrome.
+        if content_dirty {
+            if let Some(display) = DISPLAY.lock().as_mut() {
+                // 1. Clear background
+                { let dt = desktop::DESKTOP.lock();
+                  if let Some(dt) = dt.as_ref() { dt.render(display, mx, my); } }
+                { let mut dt = desktop::DESKTOP.lock();
+                  if let Some(dt) = dt.as_mut() { dt.dirty = false; } }
+
+                // 2. Windows in z-order
                 let win_order: alloc::vec::Vec<(usize, bool, i32, i32, usize, usize)> = {
                     let dt = desktop::DESKTOP.lock();
                     dt.as_ref().map(|d| d.windows.iter()
@@ -552,112 +607,73 @@ fn task_blink() -> ! {
                         .collect()
                     ).unwrap_or_default()
                 };
-
                 for (id, focused, wx, wy, ww, wh) in &win_order {
-                    // Chrome (border + title bar + content-area background)
-                    {
-                        let dt = desktop::DESKTOP.lock();
-                        if let Some(dt) = dt.as_ref() {
-                            if let Some(win) = dt.windows.iter().find(|w| w.id == *id) {
-                                dt.draw_window(display, win, *focused);
-                            }
-                        }
+                    { let dt = desktop::DESKTOP.lock();
+                      if let Some(dt) = dt.as_ref() {
+                          if let Some(win) = dt.windows.iter().find(|w| w.id == *id) {
+                              dt.draw_window(display, win, *focused);
+                          }
+                      }
                     }
-                    // Content
                     let wx = (*wx).max(0) as usize;
                     let wy = (*wy).max(0) as usize;
                     match id {
                         0 => render_welcome_window(display),
                         1 => render_hepfs_window(display),
-                        2 => {
-                            let mut tg = terminal::TERMINAL.lock();
-                            if let Some(t) = tg.as_mut() {
-                                t.render(display, wx, wy, *ww, *wh);
-                                t.dirty = false;
-                            }
-                        }
-                        3 => {
-                            let mut eg = editor::EDITOR.lock();
-                            if let Some(ed) = eg.as_mut() {
-                                ed.render(display, wx, wy, *ww, *wh);
-                            }
-                        }
+                        2 => { let mut tg = terminal::TERMINAL.lock();
+                               if let Some(t) = tg.as_mut() {
+                                   t.render(display, wx, wy, *ww, *wh);
+                                   t.dirty = false;
+                               } }
+                        3 => { let mut eg = editor::EDITOR.lock();
+                               if let Some(ed) = eg.as_mut() {
+                                   ed.render(display, wx, wy, *ww, *wh);
+                               } }
                         4 => render_sysmon_window(display),
                         _ => {}
                     }
                 }
 
-                // 3. Start menu overlay (above windows, below taskbar)
-                {
-                    let dt = desktop::DESKTOP.lock();
-                    if let Some(dt) = dt.as_ref() { dt.draw_start_menu(display); }
-                }
+                // 3. Overlays
+                { let dt = desktop::DESKTOP.lock();
+                  if let Some(dt) = dt.as_ref() { dt.draw_start_menu(display); } }
+                { let dt = desktop::DESKTOP.lock();
+                  if let Some(dt) = dt.as_ref() { dt.draw_taskbar(display); } }
 
-                // 4. Taskbar — drawn after all windows so it always sits on top
-                {
-                    let dt = desktop::DESKTOP.lock();
-                    if let Some(dt) = dt.as_ref() { dt.draw_taskbar(display); }
-                }
+                // 4. Save scene (no cursor yet) so cursor-only path can erase later
+                display.save_scene();
 
-                // 5. Cursor — always last so it's above everything
-                {
-                    let cx = mx as usize;
-                    let cy = my as usize;
-                    let white = framebuffer::Color::from_hex(0xFFFFFF);
-                    let black = framebuffer::Color::from_hex(0x111111);
+                // 5. Cursor
+                let cy = my as usize;
+                draw_cursor!(display, mx as usize, cy);
+                prev_cursor_y = cy;
 
-                    // Show a SE-resize cursor when hovering or actively dragging a corner
-                    let over_resize = {
-                        let dt = desktop::DESKTOP.lock();
-                        dt.as_ref().map(|d| {
-                            d.windows.iter().any(|w| w.resizing)
-                            || d.windows.iter().rev()
-                                .any(|w| !w.minimized && w.resize_hit(mx, my))
-                        }).unwrap_or(false)
-                    };
-
-                    if over_resize {
-                        // Shadow pass (1 px down-right) for contrast on light content
-                        for i in -4_i32..=4 {
-                            let px = (cx as i32 + i + 1).max(0) as usize;
-                            let py = (cy as i32 + i + 1).max(0) as usize;
-                            display.put_pixel_pub(px, py, black);
-                        }
-                        // NW arrowhead shadow
-                        display.fill_rect(cx.saturating_sub(3), cy.saturating_sub(5)+1, 5, 1, black);
-                        display.fill_rect(cx.saturating_sub(5)+1, cy.saturating_sub(3), 1, 4, black);
-                        // SE arrowhead shadow
-                        display.fill_rect(cx + 1, cy + 5, 5, 1, black);
-                        display.fill_rect(cx + 5, cy + 1, 1, 4, black);
-
-                        // Diagonal (NW–SE)
-                        for i in -4_i32..=4 {
-                            let px = (cx as i32 + i).max(0) as usize;
-                            let py = (cy as i32 + i).max(0) as usize;
-                            display.put_pixel_pub(px, py, white);
-                        }
-                        // NW arrowhead: top bar + left bar
-                        display.fill_rect(cx.saturating_sub(3), cy.saturating_sub(5), 5, 1, white);
-                        display.fill_rect(cx.saturating_sub(5), cy.saturating_sub(3), 1, 4, white);
-                        // SE arrowhead: bottom bar + right bar
-                        display.fill_rect(cx + 1, cy + 5, 4, 1, white);
-                        display.fill_rect(cx + 5, cy + 1, 1, 4, white);
-                    } else {
-                        // Normal crosshair cursor
-                        display.fill_rect(cx.saturating_sub(6), cy, 13, 1, white);
-                        display.fill_rect(cx, cy.saturating_sub(6), 1, 13, white);
-                    }
-                }
-
-                // 6. Flush backbuffer → physical framebuffer (atomic, no tearing)
+                // 6. Full flush
                 display.flush();
+            }
+        } else if mouse_moved {
+            if let Some(display) = DISPLAY.lock().as_mut() {
+                let cy    = my as usize;
+                // Union of old and new cursor spans (crosshair is 13px tall, resize is 12px)
+                let span  = 8usize;
+                let y0    = prev_cursor_y.saturating_sub(span).min(cy.saturating_sub(span));
+                let y1    = (prev_cursor_y + span).max(cy + span);
+                let rows  = (y1 - y0 + 1).min(display.height().saturating_sub(y0));
+
+                // Restore scene pixels (erases old cursor)
+                display.restore_rows(y0, rows);
+
+                // Paint cursor at new position
+                draw_cursor!(display, mx as usize, cy);
+                prev_cursor_y = cy;
+
+                // Flush only the affected rows (~100 KB vs 3.5 MB full flush)
+                display.flush_rows(y0, rows);
             }
         }
 
         UPTIME_FRAMES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-
-        // ~60fps
-        for _ in 0..1_200_000 { core::hint::spin_loop(); }
+        // No sleep — dirty flags gate rendering; idle task uses hlt so CPU rests between quanta
     }
 }
 

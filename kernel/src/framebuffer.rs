@@ -26,10 +26,13 @@ pub struct Display {
     r_shift: u8,
     g_shift: u8,
     b_shift: u8,
-    // Software backbuffer — all rendering targets this; flush() copies to the FB
-    // in one shot so the user never sees a partially-drawn frame.
-    backbuf:     *mut u32,  // null until init_backbuf() is called
-    backbuf_len: usize,     // width * height (0 until allocated)
+    // Double-buffer setup:
+    //   backbuf  — what's currently being rendered/displayed (scene + cursor)
+    //   scene_buf — scene without cursor; saved after each full render so the
+    //               cursor can be erased cheaply without a full redraw
+    backbuf:     *mut u32,
+    scene_buf:   *mut u32,
+    backbuf_len: usize,     // width * height
 }
 
 unsafe impl Send for Display {}
@@ -46,27 +49,59 @@ impl Display {
             g_shift: fb.green_mask_shift,
             b_shift: fb.blue_mask_shift,
             backbuf:     core::ptr::null_mut(),
+            scene_buf:   core::ptr::null_mut(),
             backbuf_len: 0,
         }
     }
 
-    /// Allocate a contiguous PMM-backed backbuffer so all rendering is deferred
-    /// until flush().  Falls back to direct FB writes if allocation fails.
+    /// Allocate backbuf + scene_buf from PMM.  Falls back to direct FB writes
+    /// if allocation fails (no tearing elimination, but still works).
     pub fn init_backbuf(&mut self) {
         if self.bpp != 4 { return; }
         let pixels = self.width * self.height;
         let bytes  = pixels * 4;
         let pages  = (bytes + 4095) / 4096;
-        if let Some(phys) = crate::pmm::alloc_contiguous(pages) {
-            let virt = crate::vmm::phys_to_virt(phys);
-            unsafe { core::ptr::write_bytes(virt, 0, bytes); }
-            self.backbuf     = virt as *mut u32;
-            self.backbuf_len = pixels;
+        if let Some(p1) = crate::pmm::alloc_contiguous(pages) {
+            if let Some(p2) = crate::pmm::alloc_contiguous(pages) {
+                let v1 = crate::vmm::phys_to_virt(p1);
+                let v2 = crate::vmm::phys_to_virt(p2);
+                unsafe {
+                    core::ptr::write_bytes(v1, 0, bytes);
+                    core::ptr::write_bytes(v2, 0, bytes);
+                }
+                self.backbuf     = v1 as *mut u32;
+                self.scene_buf   = v2 as *mut u32;
+                self.backbuf_len = pixels;
+            }
         }
     }
 
-    /// Copy the completed backbuffer to the physical framebuffer in one memcpy
-    /// per row.  Only call after all rendering for this frame is done.
+    /// Save the current backbuf (scene without cursor) into scene_buf.
+    /// Call this after rendering the scene and before painting the cursor.
+    pub fn save_scene(&mut self) {
+        if self.backbuf.is_null() || self.scene_buf.is_null() { return; }
+        unsafe {
+            core::ptr::copy_nonoverlapping(self.backbuf, self.scene_buf, self.backbuf_len);
+        }
+    }
+
+    /// Restore rows `y .. y+count` of backbuf from scene_buf (erases cursor pixels).
+    pub fn restore_rows(&mut self, y: usize, count: usize) {
+        if self.backbuf.is_null() || self.scene_buf.is_null() { return; }
+        let y0    = y.min(self.height);
+        let y1    = (y + count).min(self.height);
+        let n     = (y1 - y0) * self.width;
+        if n == 0 { return; }
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                self.scene_buf.add(y0 * self.width),
+                self.backbuf.add(y0 * self.width),
+                n,
+            );
+        }
+    }
+
+    /// Flush the entire backbuf to the physical framebuffer.
     pub fn flush(&mut self) {
         if self.backbuf.is_null() || self.bpp != 4 { return; }
         let pitch_u32 = self.pitch / 4;
@@ -75,6 +110,24 @@ impl Display {
                 core::ptr::copy_nonoverlapping(
                     self.backbuf.add(y * self.width),
                     (self.addr as *mut u32).add(y * pitch_u32),
+                    self.width,
+                );
+            }
+        }
+    }
+
+    /// Flush only rows `y .. y+count` of backbuf to the physical framebuffer.
+    /// Used for cursor-only updates — far cheaper than a full flush.
+    pub fn flush_rows(&mut self, y: usize, count: usize) {
+        if self.backbuf.is_null() || self.bpp != 4 { return; }
+        let y0        = y.min(self.height);
+        let y1        = (y + count).min(self.height);
+        let pitch_u32 = self.pitch / 4;
+        unsafe {
+            for row in y0..y1 {
+                core::ptr::copy_nonoverlapping(
+                    self.backbuf.add(row * self.width),
+                    (self.addr as *mut u32).add(row * pitch_u32),
                     self.width,
                 );
             }

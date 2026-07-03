@@ -101,6 +101,7 @@ pub struct Desktop {
     pub fb_h:            usize,
     prev_btn:            u8,
     pub dirty:           bool,
+    pub mouse_dirty:     bool,  // set when only the cursor position changed (no content change)
     pub prev_cx:         i32,
     pub prev_cy:         i32,
     pub start_menu_open: bool,
@@ -110,7 +111,7 @@ impl Desktop {
     pub fn new(fb_w: usize, fb_h: usize) -> Self {
         Desktop {
             windows: Vec::new(), focused: None, next_id: 0,
-            fb_w, fb_h, prev_btn: 0, dirty: true,
+            fb_w, fb_h, prev_btn: 0, dirty: true, mouse_dirty: false,
             prev_cx: 0, prev_cy: 0, start_menu_open: false,
         }
     }
@@ -133,7 +134,7 @@ impl Desktop {
 
     pub fn update_mouse(&mut self, mx: i32, my: i32, buttons: u8) {
         if mx != self.prev_cx || my != self.prev_cy {
-            self.dirty = true;
+            self.mouse_dirty = true;  // cursor moved — don't force a full scene redraw
             self.prev_cx = mx;
             self.prev_cy = my;
         }
