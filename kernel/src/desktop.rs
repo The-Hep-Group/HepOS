@@ -235,7 +235,9 @@ impl Desktop {
         }
     }
 
-    pub fn update_mouse(&mut self, mx: i32, my: i32, buttons: u8) {
+    /// Returns true if a new terminal window should be spawned (caller must do it after dropping the DESKTOP lock).
+    pub fn update_mouse(&mut self, mx: i32, my: i32, buttons: u8) -> bool {
+        let mut spawn_terminal = false;
         if mx != self.prev_cx || my != self.prev_cy {
             self.mouse_dirty = true;  // cursor moved — don't force a full scene redraw
             self.prev_cx = mx;
@@ -265,7 +267,7 @@ impl Desktop {
                             win.w = new_w as usize;
                         }
                         self.dirty = true;
-                        return;
+                        return false;
                     }
                     if win.dragging && !win.maximized {
                         win.x = (mx - win.drag_off_x).max(0).min(self.fb_w as i32 - win.w as i32);
@@ -276,7 +278,7 @@ impl Desktop {
                                          else if my <= 4 { Some(SnapZone::Top) }
                                          else { None };
                         self.dirty = true;
-                        return;
+                        return false;
                     }
                 }
             }
@@ -308,7 +310,7 @@ impl Desktop {
             }
         }
 
-        if !clicked { return; }
+        if !clicked { return false; }
 
         // Double-click tracking: clear pending unless we land on the same title bar again
         let prev_dbl = self.dbl_click_pending.take();
@@ -332,7 +334,7 @@ impl Desktop {
                 self.start_menu_open = false;
                 self.dirty = true;
             }
-            return;
+            return false;
         }
 
         // Taskbar click
@@ -363,7 +365,7 @@ impl Desktop {
                     self.dirty = true;
                 }
             }
-            return;
+            return false;
         }
 
         // Desktop / window click — close start menu, hit-test windows top-to-bottom
@@ -386,7 +388,7 @@ impl Desktop {
                 win.minimized = true;
                 self.focused  = None;
             } else if win.newterm_hit(mx, my) {
-                crate::terminal::spawn_terminal();
+                spawn_terminal = true;
             } else if win.maximize_hit(mx, my) {
                 let sw = self.fb_w; let sh = self.fb_h;
                 win.toggle_maximize(sw, sh);
@@ -415,6 +417,7 @@ impl Desktop {
                 }
             }
         }
+        spawn_terminal
     }
 
     /// Returns the bounding rect of the snap-target zone, for drawing a preview overlay.

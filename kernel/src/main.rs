@@ -376,12 +376,11 @@ fn task_blink() -> ! {
         // Update WM (update_mouse sets dirty flag if position changed)
         let fresh_click = btn & 1 != 0 && prev_btn & 1 == 0;
         prev_btn = btn;
-        {
+        let spawn_terminal = {
             let mut dt_guard = desktop::DESKTOP.lock();
-            if let Some(dt) = dt_guard.as_mut() {
-                dt.update_mouse(mx, my, btn);
-            }
-        }
+            dt_guard.as_mut().map(|dt| dt.update_mouse(mx, my, btn)).unwrap_or(false)
+        };
+        if spawn_terminal { crate::terminal::spawn_terminal(); }
 
         // Sync keyboard focus with visual focus whenever a mouse click brings a window forward.
         // This fixes the case where the user clicks a window in cursor mode and expects to type.
