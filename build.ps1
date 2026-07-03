@@ -75,7 +75,7 @@ $qemu = "C:\Program Files\qemu\qemu-system-x86_64.exe"
     -device qemu-xhci,id=xhci `
     -device usb-tablet,bus=xhci.0 `
     -vga std `
-    -display sdl,window-close=off `
+    -display sdl,window-close=off,zoom-to-fit=off `
     -serial stdio `
     -no-reboot `
     -no-shutdown

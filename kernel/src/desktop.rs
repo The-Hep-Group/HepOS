@@ -33,6 +33,9 @@ pub const TASKBAR_H:  usize = 32;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum SnapZone { Left, Right, Top }
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum CursorType { Normal, ResizeEW, ResizeNS, ResizeNWSE, ResizeNESW }
 pub const BORDER_W:   usize = 1;
 const START_W:        usize = 68; // width of the "HepOS" start button
 const TASK_BTN_W:     usize = 120;
@@ -41,36 +44,42 @@ const MENU_W:         usize = 160;
 
 // ── Window ───────────────────────────────────────────────────────────────────
 pub struct Window {
-    pub id:        usize,
-    pub title:     String,
-    pub x:         i32,
-    pub y:         i32,
-    pub w:         usize,
-    pub h:         usize,
-    pub minimized: bool,
-    pub maximized: bool,
-    saved_x:       i32,
-    saved_y:       i32,
-    saved_w:       usize,
-    saved_h:       usize,
-    drag_off_x:    i32,
-    drag_off_y:    i32,
-    pub dragging:  bool,
-    pub resizing:  bool,
-    resize_orig_w: usize,
-    resize_orig_h: usize,
-    resize_orig_mx: i32,
-    resize_orig_my: i32,
+    pub id:          usize,
+    pub title:       String,
+    pub x:           i32,
+    pub y:           i32,
+    pub w:           usize,
+    pub h:           usize,
+    pub minimized:   bool,
+    pub maximized:   bool,
+    pub is_terminal: bool,
+    saved_x:         i32,
+    saved_y:         i32,
+    saved_w:         usize,
+    saved_h:         usize,
+    drag_off_x:      i32,
+    drag_off_y:      i32,
+    pub dragging:    bool,
+    pub resizing:    bool,
+    resize_edge_flags: u8,  // bits: 0=right, 1=bottom, 2=left
+    resize_orig_x:   i32,
+    resize_orig_y:   i32,
+    resize_orig_w:   usize,
+    resize_orig_h:   usize,
+    resize_orig_mx:  i32,
+    resize_orig_my:  i32,
 }
 
 impl Window {
     pub fn new(id: usize, title: &str, x: i32, y: i32, w: usize, h: usize) -> Self {
         Window {
             id, title: String::from(title),
-            x, y, w, h, minimized: false, maximized: false,
+            x, y, w, h, minimized: false, maximized: false, is_terminal: false,
             saved_x: x, saved_y: y, saved_w: w, saved_h: h,
             drag_off_x: 0, drag_off_y: 0, dragging: false,
-            resizing: false, resize_orig_w: w, resize_orig_h: h,
+            resizing: false, resize_edge_flags: 0,
+            resize_orig_x: x, resize_orig_y: y,
+            resize_orig_w: w, resize_orig_h: h,
             resize_orig_mx: 0, resize_orig_my: 0,
         }
     }
@@ -117,11 +126,36 @@ impl Window {
         mx >= self.x && mx < self.x + self.w as i32
             && my >= self.y && my < self.y + self.h as i32
     }
-    // 12×12 px corner resize handle in bottom-right of content area
-    pub fn resize_hit(&self, mx: i32, my: i32) -> bool {
-        let rx = self.x + self.w as i32;
-        let by = self.y + self.h as i32;
-        mx >= rx - 12 && mx < rx && my >= by - 12 && my < by
+    /// Returns edge-resize flags for the cursor position.
+    /// Bit 0 = right, bit 1 = bottom, bit 2 = left.  0 = not on any resize zone.
+    pub fn resize_edges_at(&self, mx: i32, my: i32) -> u8 {
+        if self.maximized { return 0; }
+        const M: i32 = 6;
+        let cx0 = self.x;
+        let cx1 = self.x + self.w as i32;
+        let cy0 = self.y;
+        let cy1 = self.y + self.h as i32;
+        let ox  = self.outer_x();
+        let ow  = self.outer_w() as i32;
+        if mx < ox - M || mx >= ox + ow + M { return 0; }
+        if my < cy0 || my >= cy1 + M        { return 0; }
+        let mut f = 0u8;
+        if mx >= cx1 - M && mx < cx1 + M && my >= cy0 { f |= 1; } // right
+        if my >= cy1 - M && my < cy1 + M                { f |= 2; } // bottom
+        if mx >= ox  - M && mx < ox  + M && my >= cy0  { f |= 4; } // left
+        f
+    }
+
+    /// Kept for compatibility — calls resize_edges_at and checks any edge.
+    pub fn resize_hit(&self, mx: i32, my: i32) -> bool { self.resize_edges_at(mx, my) != 0 }
+
+    /// Hit-test for the "+" spawn-terminal button on the left of the title bar.
+    /// Only returns true if is_terminal == true.
+    pub fn newterm_hit(&self, mx: i32, my: i32) -> bool {
+        if !self.is_terminal { return false; }
+        let tx = self.x.max(0);
+        let ty = self.outer_y() + BORDER_W as i32;
+        mx >= tx + 4 && mx < tx + 18 && my >= ty + 4 && my < ty + 18
     }
 }
 
@@ -160,6 +194,39 @@ impl Desktop {
         id
     }
 
+    pub fn set_terminal_window(&mut self, id: usize) {
+        if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+            w.is_terminal = true;
+        }
+    }
+
+    /// Which cursor shape to show at (mx, my).
+    pub fn cursor_type_at(&self, mx: i32, my: i32) -> CursorType {
+        // If a window is currently being resized, keep that cursor
+        for w in &self.windows {
+            if w.resizing {
+                return Self::cursor_for_flags(w.resize_edge_flags);
+            }
+        }
+        // Check hover over resize edges (top-to-bottom z-order, so last = topmost)
+        for w in self.windows.iter().rev() {
+            if w.minimized || w.maximized { continue; }
+            let f = w.resize_edges_at(mx, my);
+            if f != 0 { return Self::cursor_for_flags(f); }
+        }
+        CursorType::Normal
+    }
+
+    fn cursor_for_flags(f: u8) -> CursorType {
+        match f {
+            1 | 4 => CursorType::ResizeEW,    // right or left only
+            2     => CursorType::ResizeNS,     // bottom only
+            3     => CursorType::ResizeNWSE,   // bottom-right corner
+            6     => CursorType::ResizeNESW,   // bottom-left corner
+            _     => CursorType::ResizeNS,
+        }
+    }
+
     pub fn bring_to_front(&mut self, id: usize) {
         if let Some(pos) = self.windows.iter().position(|w| w.id == id) {
             let win = self.windows.remove(pos);
@@ -184,10 +251,19 @@ impl Desktop {
             if let Some(fid) = self.focused {
                 if let Some(win) = self.windows.iter_mut().find(|w| w.id == fid) {
                     if win.resizing {
-                        let dw = mx - win.resize_orig_mx;
-                        let dh = my - win.resize_orig_my;
-                        win.w = (win.resize_orig_w as i32 + dw).max(120) as usize;
-                        win.h = (win.resize_orig_h as i32 + dh).max(60) as usize;
+                        let dmx = mx - win.resize_orig_mx;
+                        let dmy = my - win.resize_orig_my;
+                        if win.resize_edge_flags & 1 != 0 { // right
+                            win.w = (win.resize_orig_w as i32 + dmx).max(120) as usize;
+                        }
+                        if win.resize_edge_flags & 2 != 0 { // bottom
+                            win.h = (win.resize_orig_h as i32 + dmy).max(60) as usize;
+                        }
+                        if win.resize_edge_flags & 4 != 0 { // left
+                            let new_w = (win.resize_orig_w as i32 - dmx).max(120);
+                            win.x = win.resize_orig_x + (win.resize_orig_w as i32 - new_w);
+                            win.w = new_w as usize;
+                        }
                         self.dirty = true;
                         return;
                     }
@@ -295,8 +371,8 @@ impl Desktop {
         let mut hit_id = None;
         for win in self.windows.iter().rev() {
             if win.minimized { continue; }
-            if win.close_hit(mx, my) || win.maximize_hit(mx, my) || win.title_hit(mx, my)
-                || win.resize_hit(mx, my) || win.content_hit(mx, my)
+            if win.close_hit(mx, my) || win.maximize_hit(mx, my) || win.newterm_hit(mx, my)
+                || win.title_hit(mx, my) || win.resize_hit(mx, my) || win.content_hit(mx, my)
             {
                 hit_id = Some(win.id);
                 break;
@@ -309,24 +385,29 @@ impl Desktop {
             if win.close_hit(mx, my) {
                 win.minimized = true;
                 self.focused  = None;
+            } else if win.newterm_hit(mx, my) {
+                crate::terminal::spawn_terminal();
             } else if win.maximize_hit(mx, my) {
                 let sw = self.fb_w; let sh = self.fb_h;
                 win.toggle_maximize(sw, sh);
-            } else if win.resize_hit(mx, my) && !win.maximized {
-                win.resizing       = true;
-                win.resize_orig_w  = win.w;
-                win.resize_orig_h  = win.h;
-                win.resize_orig_mx = mx;
-                win.resize_orig_my = my;
-            } else if win.title_hit(mx, my) {
-                if prev_dbl == Some(id) {
-                    // Double-click on title bar → toggle maximize
-                    let sw = self.fb_w; let sh = self.fb_h;
-                    win.toggle_maximize(sw, sh);
-                    // dbl_click_pending stays None (already cleared by take())
-                } else {
-                    self.dbl_click_pending = Some(id);
-                    if !win.maximized {
+            } else if !win.maximized {
+                let edges = win.resize_edges_at(mx, my);
+                if edges != 0 {
+                    win.resizing          = true;
+                    win.resize_edge_flags = edges;
+                    win.resize_orig_x     = win.x;
+                    win.resize_orig_y     = win.y;
+                    win.resize_orig_w     = win.w;
+                    win.resize_orig_h     = win.h;
+                    win.resize_orig_mx    = mx;
+                    win.resize_orig_my    = my;
+                } else if win.title_hit(mx, my) {
+                    if prev_dbl == Some(id) {
+                        // Double-click on title bar → toggle maximize
+                        let sw = self.fb_w; let sh = self.fb_h;
+                        win.toggle_maximize(sw, sh);
+                    } else {
+                        self.dbl_click_pending = Some(id);
                         win.dragging   = true;
                         win.drag_off_x = mx - win.x;
                         win.drag_off_y = my - win.y;
@@ -378,7 +459,15 @@ impl Desktop {
         let tx = (win.x as usize).max(0);
         let ty = (win.outer_y() + BORDER_W as i32).max(0) as usize;
         display.fill_rect(tx, ty, win.w, TITLE_H, title_col);
-        display.draw_text(tx + 6, ty + 5, &win.title, pal::TEXT, 1);
+
+        // "+" new-terminal button (left side of title bar, terminal windows only)
+        if win.is_terminal {
+            display.fill_rect(tx + 4, ty + 4, 14, 14, pal::TASKBAR_BTN);
+            display.draw_text(tx + 8, ty + 5, "+", pal::TEXT, 1);
+            display.draw_text(tx + 22, ty + 5, &win.title, pal::TEXT, 1);
+        } else {
+            display.draw_text(tx + 6, ty + 5, &win.title, pal::TEXT, 1);
+        }
 
         // Close button
         let close_x = tx + win.w.saturating_sub(18);

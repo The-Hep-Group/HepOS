@@ -142,6 +142,7 @@ extern "C" fn kmain() -> ! {
         dt.add_window("Welcome to HepOS", 20,  50,  300, 160);
         dt.add_window("HepFS",            340, 50,  260, 160);
         dt.add_window("Terminal",         20,  240, 580, 200);
+        dt.set_terminal_window(2);
         // Editor window (id=3) — hidden until `edit` command opens a file
         dt.add_window("Editor",           60,  40,  580, 380);
         // Sysmon window (id=4) — hidden until opened from start menu
@@ -567,36 +568,73 @@ fn task_blink() -> ! {
                 let cy = $cy;
                 let white = framebuffer::Color::from_hex(0xFFFFFF);
                 let black = framebuffer::Color::from_hex(0x111111);
-                let over_resize = {
+                let cursor_type = {
                     let dt = desktop::DESKTOP.lock();
-                    dt.as_ref().map(|d| {
-                        d.windows.iter().any(|w| w.resizing)
-                        || d.windows.iter().rev()
-                            .any(|w| !w.minimized && w.resize_hit(mx, my))
-                    }).unwrap_or(false)
+                    dt.as_ref().map(|d| d.cursor_type_at(mx, my))
+                        .unwrap_or(desktop::CursorType::Normal)
                 };
-                if over_resize {
-                    for i in -4_i32..=4 {
-                        let px = (cx as i32 + i + 1).max(0) as usize;
-                        let py = (cy as i32 + i + 1).max(0) as usize;
-                        $display.put_pixel_pub(px, py, black);
+                match cursor_type {
+                    // SE diagonal (↘)
+                    desktop::CursorType::ResizeNWSE => {
+                        for i in -4_i32..=4 {
+                            $display.put_pixel_pub((cx as i32+i+1).max(0) as usize, (cy as i32+i+1).max(0) as usize, black);
+                        }
+                        $display.fill_rect(cx.saturating_sub(3), cy.saturating_sub(5)+1, 5, 1, black);
+                        $display.fill_rect(cx.saturating_sub(5)+1, cy.saturating_sub(3), 1, 4, black);
+                        $display.fill_rect(cx+1, cy+5, 5, 1, black);
+                        $display.fill_rect(cx+5, cy+1, 1, 4, black);
+                        for i in -4_i32..=4 {
+                            $display.put_pixel_pub((cx as i32+i).max(0) as usize, (cy as i32+i).max(0) as usize, white);
+                        }
+                        $display.fill_rect(cx.saturating_sub(3), cy.saturating_sub(5), 5, 1, white);
+                        $display.fill_rect(cx.saturating_sub(5), cy.saturating_sub(3), 1, 4, white);
+                        $display.fill_rect(cx+1, cy+5, 4, 1, white);
+                        $display.fill_rect(cx+5, cy+1, 1, 4, white);
                     }
-                    $display.fill_rect(cx.saturating_sub(3), cy.saturating_sub(5)+1, 5, 1, black);
-                    $display.fill_rect(cx.saturating_sub(5)+1, cy.saturating_sub(3), 1, 4, black);
-                    $display.fill_rect(cx + 1, cy + 5, 5, 1, black);
-                    $display.fill_rect(cx + 5, cy + 1, 1, 4, black);
-                    for i in -4_i32..=4 {
-                        let px = (cx as i32 + i).max(0) as usize;
-                        let py = (cy as i32 + i).max(0) as usize;
-                        $display.put_pixel_pub(px, py, white);
+                    // NE diagonal (↗)
+                    desktop::CursorType::ResizeNESW => {
+                        for i in -4_i32..=4 {
+                            $display.put_pixel_pub((cx as i32+i+1).max(0) as usize, (cy as i32-i+1).max(0) as usize, black);
+                        }
+                        $display.fill_rect(cx.saturating_sub(3), cy+4, 5, 1, black);
+                        $display.fill_rect(cx.saturating_sub(5)+1, cy.saturating_sub(3), 1, 4, black);
+                        $display.fill_rect(cx+1, cy.saturating_sub(5)+1, 5, 1, black);
+                        $display.fill_rect(cx+5, cy.saturating_sub(3), 1, 4, black);
+                        for i in -4_i32..=4 {
+                            $display.put_pixel_pub((cx as i32+i).max(0) as usize, (cy as i32-i).max(0) as usize, white);
+                        }
+                        $display.fill_rect(cx.saturating_sub(3), cy+4, 4, 1, white);
+                        $display.fill_rect(cx.saturating_sub(5), cy.saturating_sub(3), 1, 4, white);
+                        $display.fill_rect(cx+1, cy.saturating_sub(5), 5, 1, white);
+                        $display.fill_rect(cx+5, cy.saturating_sub(3), 1, 4, white);
                     }
-                    $display.fill_rect(cx.saturating_sub(3), cy.saturating_sub(5), 5, 1, white);
-                    $display.fill_rect(cx.saturating_sub(5), cy.saturating_sub(3), 1, 4, white);
-                    $display.fill_rect(cx + 1, cy + 5, 4, 1, white);
-                    $display.fill_rect(cx + 5, cy + 1, 1, 4, white);
-                } else {
-                    $display.fill_rect(cx.saturating_sub(6), cy, 13, 1, white);
-                    $display.fill_rect(cx, cy.saturating_sub(6), 1, 13, white);
+                    // Horizontal resize (↔)
+                    desktop::CursorType::ResizeEW => {
+                        // Black outline
+                        $display.fill_rect(cx.saturating_sub(7), cy, 15, 1, black);
+                        $display.fill_rect(cx.saturating_sub(7), cy.saturating_sub(3), 1, 7, black);
+                        $display.fill_rect(cx+7, cy.saturating_sub(3), 1, 7, black);
+                        // White fill
+                        $display.fill_rect(cx.saturating_sub(6), cy, 13, 1, white);
+                        $display.fill_rect(cx.saturating_sub(6), cy.saturating_sub(2), 1, 5, white);
+                        $display.fill_rect(cx+6, cy.saturating_sub(2), 1, 5, white);
+                    }
+                    // Vertical resize (↕)
+                    desktop::CursorType::ResizeNS => {
+                        // Black outline
+                        $display.fill_rect(cx, cy.saturating_sub(7), 1, 15, black);
+                        $display.fill_rect(cx.saturating_sub(3), cy.saturating_sub(7), 7, 1, black);
+                        $display.fill_rect(cx.saturating_sub(3), cy+7, 7, 1, black);
+                        // White fill
+                        $display.fill_rect(cx, cy.saturating_sub(6), 1, 13, white);
+                        $display.fill_rect(cx.saturating_sub(2), cy.saturating_sub(6), 5, 1, white);
+                        $display.fill_rect(cx.saturating_sub(2), cy+6, 5, 1, white);
+                    }
+                    // Normal crosshair
+                    desktop::CursorType::Normal => {
+                        $display.fill_rect(cx.saturating_sub(6), cy, 13, 1, white);
+                        $display.fill_rect(cx, cy.saturating_sub(6), 1, 13, white);
+                    }
                 }
             }};
         }

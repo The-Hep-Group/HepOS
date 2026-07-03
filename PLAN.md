@@ -86,7 +86,7 @@ qemu-system-x86_64
   -device qemu-xhci,id=xhci
   -device usb-tablet,bus=xhci.0     # absolute mouse via USB HID
   -vga std
-  -display sdl,window-close=off
+  -display sdl,window-close=off,zoom-to-fit=off
   -serial stdio
   -no-reboot
   -no-shutdown
@@ -337,8 +337,11 @@ RX works on Linux/KVM — this is a QEMU Windows SLiRP path issue, not a driver 
 | ✓ | Close button minimizes to taskbar |
 | ✓ | Start menu (all programs) + taskbar (open windows only) + live clock |
 | ✓ | Mouse click syncs visual + keyboard focus |
-| ✓ | Context-sensitive cursor — crosshair normally, SE-resize icon over corner handle |
+| ✓ | Context-sensitive cursor — crosshair normally; EW/NS/NESW/NWSE resize icons on all four edges/corners |
+| ✓ | Full-edge resize — drag any edge or corner; left edge also moves the window |
 | ✓ | Window maximize — double-click title bar or □ button; edge-drag snap to left/right half or full |
+| ✓ | "+" button on terminal title bars — click to spawn a new floating terminal window |
+| ✓ | QEMU cursor fix — `zoom-to-fit=off` prevents coordinate mismatch when QEMU window is resized or fullscreened |
 | ○ | Desktop icons / wallpaper |
 | ○ | Multiple instances of the same app |
 
@@ -387,7 +390,9 @@ RX works on Linux/KVM — this is a QEMU Windows SLiRP path issue, not a driver 
 5. **TCP/UDP stack** — build on existing ARP/IP layer; needed for any real networking app
 6. ~~**Window maximize / snap**~~ ✓ done
 7. ~~**Multiple terminal windows**~~ ✓ done
-8. **Desktop icons** — clickable icons on the desktop background for each app
+8. ~~**Full-edge resize + directional cursors**~~ ✓ done
+9. ~~**"+" new terminal button + QEMU cursor fix**~~ ✓ done
+10. **Desktop icons** — clickable icons on the desktop background for each app
 9. **RTL8169 / real hardware NIC** — for running on physical machines
 
 ---
@@ -446,7 +451,7 @@ Each iteration (~16ms / 60fps):
             render content           — welcome / hepfs / terminal / editor / sysmon
        c. draw_start_menu()          — popup if open
        d. draw_taskbar()             — always on top
-       e. draw cursor                — white crosshair
+       e. draw cursor                — shape depends on CursorType (Normal/EW/NS/NWSE/NESW)
   8. UPTIME_FRAMES += 1
   9. spin ~16ms
 ```
@@ -488,7 +493,7 @@ Lines stored as `[Cell; MAX_COLS]` — no per-line allocation. `self.cols` is up
 - **Mouse** → click any window to focus it for keyboard input
 - **Tab** in terminal → complete command or filename
 - **←/→** in terminal → move cursor within current input line
-- **Resize window** → drag the diagonal-dot handle at the bottom-right corner
+- **Resize window** → drag any edge or corner (cursor changes to show resize direction); left edge also moves the window
 - **HepFS** → click `<`/`>` to navigate history; click a dir to enter; click `..` to go up
 - **Ctrl+F** in editor → find mode; type query, `Enter`/`Ctrl+G` = next match, `ESC` = exit
 - **Ctrl+L** in terminal → clear screen
