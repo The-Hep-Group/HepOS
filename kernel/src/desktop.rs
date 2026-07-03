@@ -30,6 +30,9 @@ pub mod pal {
 
 pub const TITLE_H:    usize = 22;
 pub const TASKBAR_H:  usize = 32;
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum SnapZone { Left, Right, Top }
 pub const BORDER_W:   usize = 1;
 const START_W:        usize = 68; // width of the "HepOS" start button
 const TASK_BTN_W:     usize = 120;
@@ -45,6 +48,11 @@ pub struct Window {
     pub w:         usize,
     pub h:         usize,
     pub minimized: bool,
+    pub maximized: bool,
+    saved_x:       i32,
+    saved_y:       i32,
+    saved_w:       usize,
+    saved_h:       usize,
     drag_off_x:    i32,
     drag_off_y:    i32,
     pub dragging:  bool,
@@ -59,11 +67,36 @@ impl Window {
     pub fn new(id: usize, title: &str, x: i32, y: i32, w: usize, h: usize) -> Self {
         Window {
             id, title: String::from(title),
-            x, y, w, h, minimized: false,
+            x, y, w, h, minimized: false, maximized: false,
+            saved_x: x, saved_y: y, saved_w: w, saved_h: h,
             drag_off_x: 0, drag_off_y: 0, dragging: false,
             resizing: false, resize_orig_w: w, resize_orig_h: h,
             resize_orig_mx: 0, resize_orig_my: 0,
         }
+    }
+
+    pub fn toggle_maximize(&mut self, sw: usize, sh: usize) {
+        if self.maximized {
+            self.x = self.saved_x; self.y = self.saved_y;
+            self.w = self.saved_w; self.h = self.saved_h;
+            self.maximized = false;
+        } else {
+            self.saved_x = self.x; self.saved_y = self.y;
+            self.saved_w = self.w; self.saved_h = self.h;
+            self.x = BORDER_W as i32;
+            self.y = TITLE_H as i32 + BORDER_W as i32;
+            self.w = sw.saturating_sub(BORDER_W * 2);
+            self.h = sh.saturating_sub(TITLE_H + TASKBAR_H + BORDER_W * 2);
+            self.maximized = true;
+        }
+    }
+
+    pub fn maximize_hit(&self, mx: i32, my: i32) -> bool {
+        let tx = self.x.max(0);
+        let ty = self.outer_y() + BORDER_W as i32;
+        let bx = tx + self.w as i32 - 34;
+        let by = ty + 4;
+        mx >= bx && mx < bx + 14 && my >= by && my < by + 14
     }
 
     pub fn outer_x(&self) -> i32 { self.x - BORDER_W as i32 }
@@ -94,17 +127,19 @@ impl Window {
 
 // ── Desktop ──────────────────────────────────────────────────────────────────
 pub struct Desktop {
-    pub windows:         Vec<Window>,
-    pub focused:         Option<usize>,
-    next_id:             usize,
-    pub fb_w:            usize,
-    pub fb_h:            usize,
-    prev_btn:            u8,
-    pub dirty:           bool,
-    pub mouse_dirty:     bool,  // set when only the cursor position changed (no content change)
-    pub prev_cx:         i32,
-    pub prev_cy:         i32,
-    pub start_menu_open: bool,
+    pub windows:          Vec<Window>,
+    pub focused:          Option<usize>,
+    next_id:              usize,
+    pub fb_w:             usize,
+    pub fb_h:             usize,
+    prev_btn:             u8,
+    pub dirty:            bool,
+    pub mouse_dirty:      bool,
+    pub prev_cx:          i32,
+    pub prev_cy:          i32,
+    pub start_menu_open:  bool,
+    dbl_click_pending:    Option<usize>,  // Some(id) = waiting for 2nd click on same title bar
+    pub snap_zone:        Option<SnapZone>, // active snap target while dragging
 }
 
 impl Desktop {
@@ -113,6 +148,7 @@ impl Desktop {
             windows: Vec::new(), focused: None, next_id: 0,
             fb_w, fb_h, prev_btn: 0, dirty: true, mouse_dirty: false,
             prev_cx: 0, prev_cy: 0, start_menu_open: false,
+            dbl_click_pending: None, snap_zone: None,
         }
     }
 
@@ -155,9 +191,14 @@ impl Desktop {
                         self.dirty = true;
                         return;
                     }
-                    if win.dragging {
+                    if win.dragging && !win.maximized {
                         win.x = (mx - win.drag_off_x).max(0).min(self.fb_w as i32 - win.w as i32);
                         win.y = (my - win.drag_off_y).max(TITLE_H as i32).min(self.fb_h as i32 - TASKBAR_H as i32 - 1);
+                        // Track snap zone based on cursor position
+                        self.snap_zone = if mx <= 4 { Some(SnapZone::Left) }
+                                         else if mx >= self.fb_w as i32 - 4 { Some(SnapZone::Right) }
+                                         else if my <= 4 { Some(SnapZone::Top) }
+                                         else { None };
                         self.dirty = true;
                         return;
                     }
@@ -165,6 +206,26 @@ impl Desktop {
             }
         }
         if released {
+            // Apply snap if a window was being dragged into a snap zone
+            if let Some(zone) = self.snap_zone.take() {
+                if let Some(fid) = self.focused {
+                    if let Some(win) = self.windows.iter_mut().find(|w| w.id == fid && w.dragging) {
+                        let sw = self.fb_w; let sh = self.fb_h;
+                        let bx = BORDER_W as i32;
+                        let by = TITLE_H as i32 + BORDER_W as i32;
+                        let hw = sw / 2;
+                        let fh = sh.saturating_sub(TITLE_H + TASKBAR_H + BORDER_W * 2);
+                        match zone {
+                            SnapZone::Left  => { win.x = bx; win.y = by;
+                                                 win.w = hw.saturating_sub(BORDER_W * 2); win.h = fh; }
+                            SnapZone::Right => { win.x = bx + hw as i32; win.y = by;
+                                                 win.w = hw.saturating_sub(BORDER_W * 2); win.h = fh; }
+                            SnapZone::Top   => { win.toggle_maximize(sw, sh); }
+                        }
+                        self.dirty = true;
+                    }
+                }
+            }
             for win in &mut self.windows {
                 win.dragging = false;
                 win.resizing = false;
@@ -172,6 +233,9 @@ impl Desktop {
         }
 
         if !clicked { return; }
+
+        // Double-click tracking: clear pending unless we land on the same title bar again
+        let prev_dbl = self.dbl_click_pending.take();
 
         let in_taskbar = my >= self.fb_h as i32 - TASKBAR_H as i32;
         let menu_h     = self.windows.len() * MENU_ENTRY_H + 8;
@@ -231,7 +295,7 @@ impl Desktop {
         let mut hit_id = None;
         for win in self.windows.iter().rev() {
             if win.minimized { continue; }
-            if win.close_hit(mx, my) || win.title_hit(mx, my)
+            if win.close_hit(mx, my) || win.maximize_hit(mx, my) || win.title_hit(mx, my)
                 || win.resize_hit(mx, my) || win.content_hit(mx, my)
             {
                 hit_id = Some(win.id);
@@ -245,18 +309,46 @@ impl Desktop {
             if win.close_hit(mx, my) {
                 win.minimized = true;
                 self.focused  = None;
-            } else if win.resize_hit(mx, my) {
+            } else if win.maximize_hit(mx, my) {
+                let sw = self.fb_w; let sh = self.fb_h;
+                win.toggle_maximize(sw, sh);
+            } else if win.resize_hit(mx, my) && !win.maximized {
                 win.resizing       = true;
                 win.resize_orig_w  = win.w;
                 win.resize_orig_h  = win.h;
                 win.resize_orig_mx = mx;
                 win.resize_orig_my = my;
             } else if win.title_hit(mx, my) {
-                win.dragging   = true;
-                win.drag_off_x = mx - win.x;
-                win.drag_off_y = my - win.y;
+                if prev_dbl == Some(id) {
+                    // Double-click on title bar → toggle maximize
+                    let sw = self.fb_w; let sh = self.fb_h;
+                    win.toggle_maximize(sw, sh);
+                    // dbl_click_pending stays None (already cleared by take())
+                } else {
+                    self.dbl_click_pending = Some(id);
+                    if !win.maximized {
+                        win.dragging   = true;
+                        win.drag_off_x = mx - win.x;
+                        win.drag_off_y = my - win.y;
+                    }
+                }
             }
         }
+    }
+
+    /// Returns the bounding rect of the snap-target zone, for drawing a preview overlay.
+    pub fn snap_preview_rect(&self) -> Option<(i32, i32, usize, usize)> {
+        let zone = self.snap_zone?;
+        let sw = self.fb_w; let sh = self.fb_h;
+        let bx = BORDER_W as i32;
+        let by = TITLE_H as i32 + BORDER_W as i32;
+        let hw = sw / 2;
+        let fh = sh.saturating_sub(TITLE_H + TASKBAR_H + BORDER_W * 2);
+        Some(match zone {
+            SnapZone::Left  => (bx,             by, hw.saturating_sub(BORDER_W * 2), fh),
+            SnapZone::Right => (bx + hw as i32, by, hw.saturating_sub(BORDER_W * 2), fh),
+            SnapZone::Top   => (bx,             by, sw.saturating_sub(BORDER_W * 2), fh),
+        })
     }
 
     // ── Rendering ─────────────────────────────────────────────────────────────
@@ -293,17 +385,29 @@ impl Desktop {
         display.fill_rect(close_x, ty + 4, 14, 14, pal::CLOSE_BTN);
         display.draw_text(close_x + 4, ty + 5, "x", pal::TEXT, 1);
 
+        // Maximize / restore button (14×14, just left of close button)
+        let max_x = close_x.saturating_sub(16);
+        let max_bg = if win.maximized { pal::ACCENT } else { pal::TASKBAR_BTN };
+        display.fill_rect(max_x, ty + 4, 14, 14, max_bg);
+        // Hollow square icon inside the button
+        display.fill_rect(max_x + 2, ty + 6, 10, 1, pal::TEXT);     // top
+        display.fill_rect(max_x + 2, ty + 15, 10, 1, pal::TEXT);    // bottom
+        display.fill_rect(max_x + 2, ty + 6, 1, 10, pal::TEXT);     // left
+        display.fill_rect(max_x + 11, ty + 6, 1, 10, pal::TEXT);    // right
+
         // Content background
         display.fill_rect(win.x.max(0) as usize, win.y.max(0) as usize, win.w, win.h, pal::WIN_BG);
         display.fill_rect(win.x.max(0) as usize, win.y.max(0) as usize, win.w, 1, pal::BORDER);
 
-        // Resize handle — three diagonal dots in bottom-right corner
-        let rx = (win.x + win.w as i32 - 2).max(0) as usize;
-        let by = (win.y + win.h as i32 - 2).max(0) as usize;
-        let hc = if focused { pal::BORDER_ACT } else { pal::BORDER };
-        for d in 0..3usize {
-            if rx >= d * 3 + 1 && by >= d + 1 {
-                display.fill_rect(rx - d * 3, by - d, 2, 1, hc);
+        // Resize handle — only visible when not maximized
+        if !win.maximized {
+            let rx = (win.x + win.w as i32 - 2).max(0) as usize;
+            let by = (win.y + win.h as i32 - 2).max(0) as usize;
+            let hc = if focused { pal::BORDER_ACT } else { pal::BORDER };
+            for d in 0..3usize {
+                if rx >= d * 3 + 1 && by >= d + 1 {
+                    display.fill_rect(rx - d * 3, by - d, 2, 1, hc);
+                }
             }
         }
     }

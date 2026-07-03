@@ -637,6 +637,20 @@ fn task_blink() -> ! {
                 // 3. Overlays
                 { let dt = desktop::DESKTOP.lock();
                   if let Some(dt) = dt.as_ref() { dt.draw_start_menu(display); } }
+                // 3a. Snap preview — outlined rect showing where window will snap
+                { let dt = desktop::DESKTOP.lock();
+                  if let Some(dt) = dt.as_ref() {
+                      if let Some((px, py, pw, ph)) = dt.snap_preview_rect() {
+                          let c = desktop::pal::ACCENT;
+                          let px = px.max(0) as usize;
+                          let py = py.max(0) as usize;
+                          display.fill_rect(px, py, pw, 2, c);
+                          if ph > 2 { display.fill_rect(px, py + ph - 2, pw, 2, c); }
+                          display.fill_rect(px, py, 2, ph, c);
+                          if pw > 2 { display.fill_rect(px + pw - 2, py, 2, ph, c); }
+                      }
+                  }
+                }
                 { let dt = desktop::DESKTOP.lock();
                   if let Some(dt) = dt.as_ref() { dt.draw_taskbar(display); } }
 

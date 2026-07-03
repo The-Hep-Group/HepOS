@@ -337,7 +337,7 @@ RX works on Linux/KVM — this is a QEMU Windows SLiRP path issue, not a driver 
 | ✓ | Start menu (all programs) + taskbar (open windows only) + live clock |
 | ✓ | Mouse click syncs visual + keyboard focus |
 | ✓ | Context-sensitive cursor — crosshair normally, SE-resize icon over corner handle |
-| ○ | Window maximize / snap to half-screen |
+| ✓ | Window maximize — double-click title bar or □ button; edge-drag snap to left/right half or full |
 | ○ | Desktop icons / wallpaper |
 | ○ | Multiple instances of the same app |
 
@@ -384,7 +384,7 @@ RX works on Linux/KVM — this is a QEMU Windows SLiRP path issue, not a driver 
 3. **Networking RX on Linux/KVM** — confirm RTL8139/e1000 RX works there; if yes, QEMU/Windows is a known environment issue not a bug
 4. **Intel HDA audio** — PCI enumerate, CORB/RIRB setup, play PCM; pair with a beep command
 5. **TCP/UDP stack** — build on existing ARP/IP layer; needed for any real networking app
-6. **Window maximize / snap** — double-click title bar to maximize; drag to screen edge to snap half
+6. ~~**Window maximize / snap**~~ ✓ done
 7. **Multiple terminal windows** — allow spawning a second terminal from start menu
 8. **Desktop icons** — clickable icons on the desktop background for each app
 9. **RTL8169 / real hardware NIC** — for running on physical machines
