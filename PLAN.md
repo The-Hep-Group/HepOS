@@ -1,7 +1,7 @@
 # HepOS — Design Reference & Roadmap
 
 > **Purpose:** Authoritative reference for HepOS. Survives context compaction.
-> **Last updated:** 2026-06-30
+> **Last updated:** 2026-07-02
 
 ---
 
@@ -50,8 +50,8 @@ kernel/
     e1000.rs       Intel 82540EM driver (TX works, RX pending)
     rtl8139.rs     RTL8139 driver (flat ring, TX works, RX broken on QEMU Windows)
     virtio_net.rs  virtio-net legacy (incomplete)
-    syscall.rs     SYSCALL/SYSRET gate, SWAPGS, MSR setup, dispatcher (write/exit)
-    process.rs     Ring-3 process: user PML4, ELF loader entry, IRETQ, exit longjmp
+    syscall.rs     SYSCALL/SYSRET gate, SWAPGS, MSR setup, dispatcher (write/exit/getpid)
+    process.rs     Ring-3 process: user PML4, ELF entry, process table (PID, state, exec, ps)
     elf.rs         ELF64 parser/loader — maps PT_LOAD segments into a user PML4
     serial.rs      COM1 debug: print, print_hex
     panic.rs       Prints file:line:message to serial, then spins
@@ -197,6 +197,9 @@ Terminal column count adapts to window width dynamically (up to 120 cols max).
 | `netstart` / `netdiag` / `netpoll` | NIC debug commands |
 | `shutdown` / `reboot` | ACPI off / PS/2 reset |
 | `echo` / `clear` | Print text / clear screen |
+| `exec <file>` | Load and run ELF64 binary from HepFS |
+| `ps` | List all processes (PID, state, name) |
+| `runtest` | Run embedded ring-3 ELF sanity test |
 
 ---
 
@@ -299,6 +302,7 @@ RX works on Linux/KVM — this is a QEMU Windows SLiRP path issue, not a driver 
 | ✓ | GDT: ring-3 code+data segments, 64-bit TSS descriptor, ltr |
 | ✓ | Per-process page tables — user PML4, ring-3 entry via IRETQ, exit longjmp |
 | ✓ | ELF loader — ELF64 header/phdr parsing, PT_LOAD mapping, exec from HepFS |
+| ✓ | Process table — PID tracking, running/exited state, `ps` command, `SYS_GETPID` |
 
 ### Drivers
 | ✓/○ | Feature |
@@ -357,7 +361,7 @@ RX works on Linux/KVM — this is a QEMU Windows SLiRP path issue, not a driver 
 | ○ | Working RX (Linux/KVM only right now) |
 | ○ | TCP / UDP stack |
 | ○ | DNS, HTTP client |
-| ✓ | Userspace — ring 3, SYSCALL/SYSRET, ELF loader, exec from HepFS |
+| ✓ | Userspace — ring 3, SYSCALL/SYSRET, ELF loader, exec from HepFS, process table |
 | ○ | `std` shim → unlock Rust crates |
 
 ---
@@ -376,7 +380,7 @@ RX works on Linux/KVM — this is a QEMU Windows SLiRP path issue, not a driver 
 ## Next Steps (Priority Order)
 
 1. **`std` shim** — implement enough of `std` (alloc, io, fs stubs) so external Rust crates can link
-2. **Process table** — struct per process (PML4, kernel stack, state), scheduler integration for preemptive multitasking
+2. **Preemptive multitasking** — scheduler integration for true concurrent processes (signal on exec, round-robin, wait/waitpid)
 3. **Networking RX on Linux/KVM** — confirm RTL8139/e1000 RX works there; if yes, QEMU/Windows is a known environment issue not a bug
 4. **Intel HDA audio** — PCI enumerate, CORB/RIRB setup, play PCM; pair with a beep command
 5. **TCP/UDP stack** — build on existing ARP/IP layer; needed for any real networking app
@@ -405,6 +409,8 @@ terminal::TERMINAL         Mutex<Option<Terminal>>
 editor::EDITOR             Mutex<Option<Editor>>
 scheduler::SCHEDULER       Mutex<Scheduler>
 mouse::MOUSE               Mutex<Mouse>                 // x, y, buttons — written by XHCI + PS/2
+process::CURRENT_PID       AtomicU32                    // PID of running user process (0 = none)
+process::PROCTAB           Mutex<Vec<ProcEntry>>        // process history (max 32, oldest exited dropped)
 ```
 
 ```rust

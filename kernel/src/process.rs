@@ -11,6 +11,9 @@
 //! The APIC timer is masked for the duration so the scheduler does not
 //! try to context-switch away from a process it doesn't know about.
 
+use core::sync::atomic::{AtomicU32, Ordering};
+use alloc::{string::String, vec::Vec};
+use spin::Mutex;
 use crate::{apic, elf, paging, pmm, vmm};
 
 // ── User virtual address layout ───────────────────────────────────────────────
@@ -86,6 +89,26 @@ static TEST_ELF: [u8; 183] = [
     b'r', b'i', b'n', b'g', b' ',
     b'3', b'!', b'\n',
 ];
+
+// ── Process table ─────────────────────────────────────────────────────────────
+
+#[derive(PartialEq, Clone, Copy)]
+pub enum ProcState { Running, Exited }
+
+struct ProcEntry {
+    pid:       u32,
+    name:      String,
+    state:     ProcState,
+    exit_code: u64,
+}
+
+const MAX_PROCS: usize = 32;
+
+static PROCTAB:  Mutex<Vec<ProcEntry>> = Mutex::new(Vec::new());
+static NEXT_PID: AtomicU32            = AtomicU32::new(1);
+
+/// PID of the currently-executing user process (0 = none).
+pub static CURRENT_PID: AtomicU32 = AtomicU32::new(0);
 
 // ── Process state ─────────────────────────────────────────────────────────────
 
@@ -184,9 +207,53 @@ pub unsafe fn do_exit(code: u64) -> ! {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
+/// Load and run an ELF64 binary, recording it in the process table.
+/// This is the primary public entry point for running user programs.
+pub fn exec(name: &str, data: &[u8]) -> Result<u64, &'static str> {
+    let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+    CURRENT_PID.store(pid, Ordering::Relaxed);
+
+    {
+        let mut tab = PROCTAB.lock();
+        // Drop oldest exited entry if table is full
+        if tab.len() >= MAX_PROCS {
+            if let Some(i) = tab.iter().position(|e| e.state == ProcState::Exited) {
+                tab.remove(i);
+            }
+        }
+        tab.push(ProcEntry {
+            pid,
+            name: String::from(name),
+            state: ProcState::Running,
+            exit_code: 0,
+        });
+    }
+
+    let result = run_elf(data);
+
+    {
+        let mut tab = PROCTAB.lock();
+        if let Some(e) = tab.iter_mut().find(|e| e.pid == pid) {
+            e.state     = ProcState::Exited;
+            e.exit_code = result.unwrap_or(u64::MAX);
+        }
+    }
+
+    CURRENT_PID.store(0, Ordering::Relaxed);
+    result
+}
+
+/// Iterate the process table, calling `f` for each entry.
+/// Arguments: (pid, name, is_running, exit_code)
+pub fn for_each_proc(mut f: impl FnMut(u32, &str, bool, u64)) {
+    for e in PROCTAB.lock().iter() {
+        f(e.pid, &e.name, e.state == ProcState::Running, e.exit_code);
+    }
+}
+
 /// Load an ELF64 binary from `data`, run it in a fresh user address space,
 /// and return its exit code.
-pub fn run_elf(data: &[u8]) -> Result<u64, &'static str> {
+fn run_elf(data: &[u8]) -> Result<u64, &'static str> {
     let pml4 = create_user_pml4();
 
     let loaded = elf::load(data, pml4)?;
@@ -220,5 +287,5 @@ pub fn run_elf(data: &[u8]) -> Result<u64, &'static str> {
 
 /// Run the embedded ELF test binary (prints "Hello from ring 3!" via serial).
 pub fn run_test() -> u64 {
-    run_elf(&TEST_ELF).unwrap_or(u64::MAX)
+    exec("<test>", &TEST_ELF).unwrap_or(u64::MAX)
 }

@@ -10,6 +10,7 @@
 //!   60 = exit(code)           — spins/halts (no processes yet)
 
 use core::arch::asm;
+use core::sync::atomic::Ordering;
 use crate::{gdt, pmm, serial, vmm};
 
 // MSR addresses
@@ -20,9 +21,10 @@ const MSR_SFMASK:         u32 = 0xC000_0084;
 const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
 
 // Syscall numbers (Linux x86-64 ABI)
-pub const SYS_READ:  u64 = 0;
-pub const SYS_WRITE: u64 = 1;
-pub const SYS_EXIT:  u64 = 60;
+pub const SYS_READ:   u64 = 0;
+pub const SYS_WRITE:  u64 = 1;
+pub const SYS_EXIT:   u64 = 60;
+pub const SYS_GETPID: u64 = 39;
 
 const ENOSYS: i64 = -38;
 const EBADF:  i64 = -9;
@@ -182,9 +184,10 @@ unsafe extern "C" fn syscall_entry() {
 #[unsafe(no_mangle)]
 extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 {
     match num {
-        SYS_WRITE => sys_write(a1, a2, a3),
-        SYS_EXIT  => sys_exit(a1),
-        _         => ENOSYS as u64,
+        SYS_WRITE  => sys_write(a1, a2, a3),
+        SYS_EXIT   => sys_exit(a1),
+        SYS_GETPID => crate::process::CURRENT_PID.load(Ordering::Relaxed) as u64,
+        _          => ENOSYS as u64,
     }
 }
 

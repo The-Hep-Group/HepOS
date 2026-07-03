@@ -253,7 +253,7 @@ impl Terminal {
             "help", "clear", "pwd", "ls", "cd", "cat", "mkdir", "touch",
             "rm", "cp", "mv", "write", "edit", "uname", "mem", "date",
             "history", "lspci", "netdiag", "netstart", "netpoll", "ifconfig",
-            "ping", "shutdown", "reboot", "echo", "sysinfo", "syscallinfo", "runtest", "exec",
+            "ping", "shutdown", "reboot", "echo", "sysinfo", "syscallinfo", "runtest", "exec", "ps",
         ];
 
         let partial = self.cmd_buf.clone();
@@ -688,7 +688,7 @@ impl Terminal {
                         if is_dir { self.print_colored("exec: is a directory\n", ERR); return; }
                         let data = self.with_ctrl(|ctrl| crate::hepfs::read_file(ctrl, ino));
                         self.print_colored("Executing ELF...\n", OK);
-                        match crate::process::run_elf(&data) {
+                        match crate::process::exec(arg1, &data) {
                             Ok(code) => self.print(&alloc::format!(
                                 "Process exited with code {}.\n\
                                  (check serial/host terminal for program output)\n",
@@ -700,6 +700,22 @@ impl Terminal {
                         }
                     }
                 }
+            }
+
+            "ps" => {
+                self.print("  PID  STATE        NAME\n");
+                self.print("  ---  -----------  ----\n");
+                let mut any = false;
+                crate::process::for_each_proc(|pid, name, running, code| {
+                    any = true;
+                    let state = if running {
+                        alloc::format!("running    ")
+                    } else {
+                        alloc::format!("exited({:<3})", code)
+                    };
+                    self.print(&alloc::format!("  {:>3}  {}  {}\n", pid, state, name));
+                });
+                if !any { self.print("  (no processes)\n"); }
             }
 
             "syscallinfo" => {
