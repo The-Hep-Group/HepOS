@@ -390,7 +390,7 @@ RX works on Linux/KVM — this is a QEMU Windows SLiRP path issue, not a driver 
 ## Next Steps (Priority Order)
 
 1. ~~**`std` shim**~~ ✓ done — `userspace/` workspace: `hepos-rt` (allocator/panic/syscalls), `hepos-std` (println!, String/Vec re-exports), `hello` demo; kernel bakes hello ELF via build.rs; `runhello` terminal command
-2. **Preemptive multitasking** — scheduler integration for true concurrent processes (signal on exec, round-robin, wait/waitpid)
+2. ~~**Preemptive ring-3**~~ ✓ done (scoped) — timer unmasked during `run_elf` so ring-3 is preemptible by the scheduler; `sys_write` output buffered in `PROC_OUT` and flushed to the terminal window after exec; `swapgs` GS-state bug fixed (was freezing on 2nd run); full multi-process scheduling (fork/waitpid) remains future work
 3. **Networking RX on Linux/KVM** — confirm RTL8139/e1000 RX works there; if yes, QEMU/Windows is a known environment issue not a bug
 4. **Intel HDA audio** — PCI enumerate, CORB/RIRB setup, play PCM; pair with a beep command
 5. **TCP/UDP stack** — build on existing ARP/IP layer; needed for any real networking app

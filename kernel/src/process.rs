@@ -90,6 +90,23 @@ static TEST_ELF: [u8; 183] = [
     b'3', b'!', b'\n',
 ];
 
+// ── Process stdout capture buffer ─────────────────────────────────────────────
+//
+// sys_write appends bytes here (in addition to serial) while USER_RUNNING.
+// After exec() returns the caller drains and displays the buffer in the terminal.
+static PROC_OUT: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+/// Append bytes to the process output capture buffer.
+/// Called from syscall::sys_write while a process is running.
+pub fn proc_write(bytes: &[u8]) {
+    PROC_OUT.lock().extend_from_slice(bytes);
+}
+
+/// Take and return all buffered process output, clearing the buffer.
+pub fn take_proc_output() -> Vec<u8> {
+    core::mem::take(&mut *PROC_OUT.lock())
+}
+
 // ── Process table ─────────────────────────────────────────────────────────────
 
 #[derive(PartialEq, Clone, Copy)]
@@ -192,6 +209,9 @@ pub unsafe fn do_exit(code: u64) -> ! {
     EXIT_CODE = code;
     USER_RUNNING = false;
     core::arch::asm!(
+        // syscall_entry did swapgs (GS=kernel, IA32_KERNEL_GS_BASE=user).
+        // Undo it so next ring-3 entry starts with GS=user, KERNEL_GS_BASE=kernel.
+        "swapgs",
         "mov rsp, [{rsp}]",
         "pop r15",
         "pop r14",
@@ -210,6 +230,9 @@ pub unsafe fn do_exit(code: u64) -> ! {
 /// Load and run an ELF64 binary, recording it in the process table.
 /// This is the primary public entry point for running user programs.
 pub fn exec(name: &str, data: &[u8]) -> Result<u64, &'static str> {
+    // Clear any stale output from a previous run.
+    PROC_OUT.lock().clear();
+
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
     CURRENT_PID.store(pid, Ordering::Relaxed);
 
@@ -263,8 +286,9 @@ fn run_elf(data: &[u8]) -> Result<u64, &'static str> {
     unsafe { core::ptr::write_bytes(vmm::phys_to_virt(stack_phys), 0, 4096); }
     paging::map_page_into(pml4, USER_STACK_PAGE, stack_phys, paging::USER | paging::WRITE);
 
-    // Mask timer, switch to user PML4, enter ring 3
-    apic::mask_timer();
+    // Switch to user PML4 and enter ring 3.
+    // Timer remains unmasked — the timer ISR saves the full interrupt frame and
+    // can preempt ring-3 via context_switch; iretq in the ISR resumes ring-3.
     let orig_cr3 = read_cr3();
     unsafe {
         write_cr3(pml4);
@@ -273,7 +297,6 @@ fn run_elf(data: &[u8]) -> Result<u64, &'static str> {
         // Returns here after do_exit longjmp
     }
     unsafe { write_cr3(orig_cr3); }
-    apic::unmask_timer();
 
     // Free user memory
     pmm::free_page(stack_phys);

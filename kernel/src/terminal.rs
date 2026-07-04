@@ -90,6 +90,20 @@ impl Terminal {
         self.print_colored(s, TEXT);
     }
 
+    /// Drain the process output capture buffer and print it to this terminal.
+    fn flush_proc_output(&mut self) {
+        let bytes = crate::process::take_proc_output();
+        if bytes.is_empty() { return; }
+        if let Ok(s) = core::str::from_utf8(&bytes) {
+            self.print(s);
+        } else {
+            // Non-UTF-8: print printable ASCII, replace others with '?'
+            for &b in &bytes {
+                self.put_char(if b.is_ascii_graphic() || b == b'\n' || b == b' ' { b } else { b'?' }, TEXT);
+            }
+        }
+    }
+
     fn put_char(&mut self, ch: u8, color: Color) {
         match ch {
             b'\n' => {
@@ -672,18 +686,18 @@ impl Terminal {
             "runtest" => {
                 self.print_colored("Launching ring-3 test process...\n", OK);
                 let code = crate::process::run_test();
-                self.print(&alloc::format!(
-                    "Process exited with code {}.\n\
-                     (check serial/host terminal for ring-3 write output)\n",
-                    code
-                ));
+                self.flush_proc_output();
+                self.print(&alloc::format!("Process exited: {}\n", code));
             }
 
             "runhello" => {
                 self.print_colored("Launching hello (hepos-std demo)...\n", OK);
                 match crate::process::run_hello() {
-                    Ok(code) => self.print(&alloc::format!("hello exited: {}\n", code)),
-                    Err(e)   => self.print_colored(&alloc::format!("runhello: {}\n", e), ERR),
+                    Ok(code) => {
+                        self.flush_proc_output();
+                        self.print(&alloc::format!("hello exited: {}\n", code));
+                    }
+                    Err(e) => self.print_colored(&alloc::format!("runhello: {}\n", e), ERR),
                 }
             }
 
@@ -697,14 +711,11 @@ impl Terminal {
                         let data = self.with_ctrl(|ctrl| crate::hepfs::read_file(ctrl, ino));
                         self.print_colored("Executing ELF...\n", OK);
                         match crate::process::exec(arg1, &data) {
-                            Ok(code) => self.print(&alloc::format!(
-                                "Process exited with code {}.\n\
-                                 (check serial/host terminal for program output)\n",
-                                code
-                            )),
-                            Err(e) => self.print_colored(
-                                &alloc::format!("exec: {}\n", e), ERR
-                            ),
+                            Ok(code) => {
+                                self.flush_proc_output();
+                                self.print(&alloc::format!("Process exited: {}\n", code));
+                            }
+                            Err(e) => self.print_colored(&alloc::format!("exec: {}\n", e), ERR),
                         }
                     }
                 }

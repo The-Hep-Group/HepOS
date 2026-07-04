@@ -207,6 +207,8 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
     for &b in bytes {
         serial::write_byte(b);
     }
+    // Also buffer output so the terminal can display it after exec returns.
+    crate::process::proc_write(bytes);
     count as u64
 }
 
