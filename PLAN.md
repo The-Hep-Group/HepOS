@@ -56,6 +56,11 @@ kernel/
     serial.rs      COM1 debug: print, print_hex
     panic.rs       Prints file:line:message to serial, then spins
 
+userspace/             Rust userspace workspace (builds before kernel; output baked into kernel via build.rs)
+  hepos-rt/        Ring-3 runtime: bump allocator (#[global_allocator]), panic handler, sys_write/exit/getpid
+  hepos-std/       std facade: re-exports alloc types + println!/print! macros backed by sys_write
+  hello/           Demo binary: exercises String, Vec, println!, sys_getpid — runs via `runhello`
+
 bootloader/
   limine.conf    Boot entry: timeout 0, loads /boot/hepos-kernel
 
@@ -200,6 +205,7 @@ Terminal column count adapts to window width dynamically (up to 120 cols max).
 | `exec <file>` | Load and run ELF64 binary from HepFS |
 | `ps` | List all processes (PID, state, name) |
 | `runtest` | Run embedded ring-3 ELF sanity test |
+| `runhello` | Run hello ELF built from userspace/hello (demos hepos-std: String, Vec, println!) |
 | `newterm` | Spawn a new floating terminal window |
 
 ---
@@ -366,7 +372,7 @@ RX works on Linux/KVM — this is a QEMU Windows SLiRP path issue, not a driver 
 | ○ | TCP / UDP stack |
 | ○ | DNS, HTTP client |
 | ✓ | Userspace — ring 3, SYSCALL/SYSRET, ELF loader, exec from HepFS, process table |
-| ○ | `std` shim → unlock Rust crates |
+| ✓ | `hepos-std` shim — `hepos-rt` (bump allocator, panic, sys_write/exit/getpid) + `hepos-std` (println!, String, Vec); `runhello` demo command |
 
 ---
 
@@ -383,7 +389,7 @@ RX works on Linux/KVM — this is a QEMU Windows SLiRP path issue, not a driver 
 
 ## Next Steps (Priority Order)
 
-1. **`std` shim** — implement enough of `std` (alloc, io, fs stubs) so external Rust crates can link
+1. ~~**`std` shim**~~ ✓ done — `userspace/` workspace: `hepos-rt` (allocator/panic/syscalls), `hepos-std` (println!, String/Vec re-exports), `hello` demo; kernel bakes hello ELF via build.rs; `runhello` terminal command
 2. **Preemptive multitasking** — scheduler integration for true concurrent processes (signal on exec, round-robin, wait/waitpid)
 3. **Networking RX on Linux/KVM** — confirm RTL8139/e1000 RX works there; if yes, QEMU/Windows is a known environment issue not a bug
 4. **Intel HDA audio** — PCI enumerate, CORB/RIRB setup, play PCM; pair with a beep command
@@ -392,9 +398,11 @@ RX works on Linux/KVM — this is a QEMU Windows SLiRP path issue, not a driver 
 7. ~~**Multiple terminal windows**~~ ✓ done
 8. ~~**Full-edge resize + directional cursors**~~ ✓ done
 9. ~~**"+" new terminal button**~~ ✓ done
-10. **QEMU cursor on window resize** — `zoom-to-fit` not available on this QEMU/Windows build; known SDL limitation; no fix yet
-11. **Desktop icons** — clickable icons on the desktop background for each app
-9. **RTL8169 / real hardware NIC** — for running on physical machines
+10. ~~**Deadlock fix — spawn_terminal outside DESKTOP lock**~~ ✓ done
+11. **QEMU cursor on window resize** — `zoom-to-fit` not available on this QEMU/Windows build; known SDL limitation; no fix yet
+12. **`std` shim** — implement enough of `std` (alloc, io, fs stubs) so external Rust crates can link
+13. **Desktop icons** — clickable icons on the desktop background for each app
+14. **RTL8169 / real hardware NIC** — for running on physical machines
 
 ---
 

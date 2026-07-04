@@ -253,7 +253,7 @@ impl Terminal {
             "help", "clear", "pwd", "ls", "cd", "cat", "mkdir", "touch",
             "rm", "cp", "mv", "write", "edit", "uname", "mem", "date",
             "history", "lspci", "netdiag", "netstart", "netpoll", "ifconfig",
-            "ping", "shutdown", "reboot", "echo", "sysinfo", "syscallinfo", "runtest", "exec", "ps", "newterm",
+            "ping", "shutdown", "reboot", "echo", "sysinfo", "syscallinfo", "runtest", "runhello", "exec", "ps", "newterm",
         ];
 
         let partial = self.cmd_buf.clone();
@@ -677,6 +677,14 @@ impl Terminal {
                      (check serial/host terminal for ring-3 write output)\n",
                     code
                 ));
+            }
+
+            "runhello" => {
+                self.print_colored("Launching hello (hepos-std demo)...\n", OK);
+                match crate::process::run_hello() {
+                    Ok(code) => self.print(&alloc::format!("hello exited: {}\n", code)),
+                    Err(e)   => self.print_colored(&alloc::format!("runhello: {}\n", e), ERR),
+                }
             }
 
             "exec" => {

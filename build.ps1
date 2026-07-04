@@ -4,7 +4,16 @@ $root = $PSScriptRoot
 # Ensure cargo is on PATH (Rust installer adds it to user env, but not always to this session)
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
 
-# ── 1. Build kernel ──────────────────────────────────────────────────────────
+# ── 1. Build userspace (hepos-rt + hepos-std + hello) ───────────────────────
+Push-Location "$root\userspace"
+cargo +nightly build --release
+Pop-Location
+
+$hello_elf = "$root\userspace\target\x86_64-unknown-none\release\hello"
+if (-not (Test-Path $hello_elf)) { Write-Error "userspace build failed"; exit 1 }
+Write-Host "Userspace built: $hello_elf"
+
+# ── 2. Build kernel ──────────────────────────────────────────────────────────
 Push-Location "$root\kernel"
 cargo +nightly build --release
 Pop-Location
