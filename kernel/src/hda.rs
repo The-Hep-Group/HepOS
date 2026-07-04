@@ -33,10 +33,6 @@ const SD_BDPU:  usize = 0x1C; // u32 – BDL Upper Base Address
 const SD_CTL_SRST: u32 = 1 << 0; // stream reset
 const SD_CTL_RUN:  u32 = 1 << 1; // stream run
 const SD_CTL_IOCE: u32 = 1 << 2; // interrupt on completion enable
-// BCIS = Buffer Completion Interrupt Status is byte 3 of the 4-byte block at
-// SD_CTL; since we do 32-bit reads, it appears in bits[26] (bit 2 of byte 3).
-// Byte 3 offset = SD_CTL + 3; bit 2 of that byte → bit 26 in the 32-bit word.
-const SD_STS_BCIS: u32 = 1 << 26;
 
 // ── BDL entry (Buffer Descriptor List) ───────────────────────────────────────
 #[repr(C)]
@@ -60,10 +56,6 @@ pub fn is_available() -> bool { HDA.lock().is_some() }
 // ── MMIO helpers ──────────────────────────────────────────────────────────────
 
 #[inline(always)]
-fn r8(base: *mut u8, off: usize) -> u8 {
-    unsafe { (base.add(off) as *const u8).read_volatile() }
-}
-#[inline(always)]
 fn r16(base: *mut u8, off: usize) -> u16 {
     unsafe { (base.add(off) as *const u16).read_volatile() }
 }
@@ -86,21 +78,76 @@ fn spin(n: u32) {
     }
 }
 
-// TSC used purely for timeout, not for precise timing.
+// ── TSC + PIT-calibrated timing ──────────────────────────────────────────────
+//
+// beep() must wait `duration_ms` without reading HDA MMIO (QEMU's HDA MMIO
+// emulation is extremely slow while DMA is active).  TICK_COUNT from the
+// scheduler is not usable because tasks run with IF=0 after the first
+// context-switch, so the APIC timer ISR never fires again.
+//
+// Solution: calibrate TSC against PIT timer 2 once at init time, then use
+// `rdtsc()` for all delays.  TSC advances regardless of IF flag.
+
+static TSC_PER_MS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(1_000_000); // sane default (1 GHz TSC)
+
 #[inline(always)]
 fn rdtsc() -> u64 {
     let lo: u32;
     let hi: u32;
     unsafe {
         core::arch::asm!(
-            "lfence",
             "rdtsc",
             out("eax") lo,
             out("edx") hi,
-            options(nostack, nomem),
+            options(nomem, nostack, preserves_flags),
         );
     }
     ((hi as u64) << 32) | lo as u64
+}
+
+#[inline(always)]
+fn pit_in(port: u16) -> u8 {
+    let v: u8;
+    unsafe { core::arch::asm!("in al, dx", out("al") v, in("dx") port, options(nomem, nostack)); }
+    v
+}
+#[inline(always)]
+fn pit_out(port: u16, v: u8) {
+    unsafe { core::arch::asm!("out dx, al", in("dx") port, in("al") v, options(nomem, nostack)); }
+}
+
+/// Measure TSC frequency using PIT timer 2 as a ~10 ms reference.
+/// Must be called with interrupts disabled (as is the case during init).
+fn calibrate_tsc() {
+    let old61 = pit_in(0x61);
+
+    // Program PIT timer 2: mode 0 (terminal count), LSB+MSB, binary
+    pit_out(0x43, 0xB0);
+    // 11932 counts at 1,193,182 Hz ≈ 10 ms
+    pit_out(0x42, (11932u16 & 0xFF) as u8);
+    pit_out(0x42, (11932u16 >> 8)   as u8);
+
+    // Gate timer 2 (bit 0 = 1), speaker off (bit 1 = 0)
+    pit_out(0x61, (old61 | 0x01) & !0x02);
+
+    let t0 = rdtsc();
+    // Poll OUT pin (bit 5 of port 0x61); bound the wait so we can't hang here.
+    // At the 1GHz TSC default, 100M iterations easily covers 50ms.
+    for _ in 0..100_000_000u32 {
+        if pit_in(0x61) & 0x20 != 0 { break; }
+        core::hint::spin_loop();
+    }
+    let t1 = rdtsc();
+
+    pit_out(0x61, old61); // restore
+
+    // 10ms reference → divide by 10 for cycles/ms
+    let elapsed = t1.wrapping_sub(t0);
+    if elapsed > 0 {
+        TSC_PER_MS.store(elapsed / 10, core::sync::atomic::Ordering::Relaxed);
+        serial::print("HDA: TSC calibrated\n");
+    }
 }
 
 // ── Immediate Command interface ───────────────────────────────────────────────
@@ -110,19 +157,18 @@ fn rdtsc() -> u64 {
 fn send_verb(mmio: *mut u8, cad: u8, nid: u8, verb: u32) -> u32 {
     let cmd = ((cad as u32) << 28) | ((nid as u32) << 20) | (verb & 0x000F_FFFF);
 
-    // Wait for ICB (bit 0 of IRS) to clear (previous command done)
-    for _ in 0..100_000u32 {
+    // Wait for ICB (bit 0) to clear — 1 000 iterations max (~10 µs).
+    // QEMU processes IC commands synchronously so this normally exits on iter 1.
+    for _ in 0..1_000u32 {
         if r16(mmio, IRS) & 1 == 0 { break; }
         spin(10);
     }
 
     w32(mmio, IC, cmd);
-    // Set ICB only (bit 0). Writing bit 1 would clear IRV since it's W1C,
-    // but we don't want to touch it here — just trigger the command.
-    w16(mmio, IRS, 0x01);
+    w16(mmio, IRS, 0x01); // set ICB to trigger command
 
-    // Wait for IRV (bit 1 set by hardware when response is ready)
-    for _ in 0..200_000u32 {
+    // Wait for IRV (bit 1) — bounded to 1 000 iterations for the same reason.
+    for _ in 0..1_000u32 {
         let irs = r16(mmio, IRS);
         if irs & 2 != 0 {
             w16(mmio, IRS, 0x02); // W1C: clear IRV
@@ -177,6 +223,9 @@ fn configure_codec(mmio: *mut u8, stream_id: u8, fmt: u16) {
 // ── Public init ───────────────────────────────────────────────────────────────
 
 pub fn init(devs: &[pci::PciDevice]) -> bool {
+    // Calibrate TSC now, while interrupts are still off and before HDA DMA starts.
+    calibrate_tsc();
+
     let dev = match devs.iter().find(|d| d.class == 0x04 && d.subclass == 0x03) {
         Some(d) => d,
         None => {
@@ -306,17 +355,11 @@ pub fn beep(freq_hz: u32, duration_ms: u32) {
     configure_codec(mmio, stream_id, fmt);
 
     // ── Stream descriptor setup ───────────────────────────────────────────────
-    // Reset stream
+    // Reset stream — write-only, no MMIO reads (QEMU processes resets instantly).
     w32(mmio, sd_off + SD_CTL, SD_CTL_SRST);
-    for _ in 0..10_000u32 {
-        if r32(mmio, sd_off + SD_CTL) & SD_CTL_SRST != 0 { break; }
-        spin(10);
-    }
+    spin(5_000); // ~50 µs settle
     w32(mmio, sd_off + SD_CTL, 0);
-    for _ in 0..10_000u32 {
-        if r32(mmio, sd_off + SD_CTL) & SD_CTL_SRST == 0 { break; }
-        spin(10);
-    }
+    spin(5_000);
 
     // Clear any pending status bits in SDnSTS (W1C).
     // BCIS=bit26, FIFOE=bit27, DESE=bit28 in the 32-bit read of the 4-byte CTL+STS block.
@@ -342,19 +385,30 @@ pub fn beep(freq_hz: u32, duration_ms: u32) {
     // Start stream
     w32(mmio, sd_off + SD_CTL, ctl_base | SD_CTL_RUN);
 
-    // Wait for BCIS (DMA finished the BDL), with a hard TSC deadline as fallback.
-    // TSC runs at ~CPU frequency; assume ≥1 GHz so 1M ticks ≥ 1ms.
-    // We give the stream 3× its nominal duration before forcing a stop.
-    let tsc_deadline = rdtsc() + 1_000_000u64 * (duration_ms as u64 * 3 + 500);
-    loop {
-        if r32(mmio, sd_off + SD_CTL) & SD_STS_BCIS != 0 { break; }
-        if rdtsc() >= tsc_deadline { break; }
-        spin(100);
+    // Wait using TSC — no MMIO reads, no interrupt dependency.
+    // TSC advances monotonically regardless of IF flag or HDA DMA activity.
+    // TSC_PER_MS was calibrated against PIT timer 2 during init().
+    {
+        let tsc_per_ms = TSC_PER_MS.load(core::sync::atomic::Ordering::Relaxed);
+        let deadline = rdtsc().wrapping_add(tsc_per_ms.saturating_mul(duration_ms as u64));
+        while rdtsc().wrapping_sub(deadline) > u64::MAX / 2 {
+            core::hint::spin_loop();
+        }
     }
 
-    // Stop stream, then clear status bits (W1C)
-    w32(mmio, sd_off + SD_CTL, 0);
-    w32(mmio, sd_off + SD_CTL, 0x1C00_0000);
+    // Stop stream: write-only sequence, no polling reads.
+    // RUN=0 tells QEMU to stop DMA. SRST flushes the codec FIFO.
+    // spin() gives QEMU a moment to process each write before the next.
+    w32(mmio, sd_off + SD_CTL, 0);           // clear RUN
+    spin(50_000);
+    w32(mmio, sd_off + SD_CTL, SD_CTL_SRST); // assert stream reset
+    spin(50_000);
+    w32(mmio, sd_off + SD_CTL, 0);           // deassert stream reset
+    spin(50_000);
+
+    // Zero the PCM buffer so any audio QEMU has already queued to the SDL
+    // backend plays as silence rather than repeating the tone.
+    unsafe { core::ptr::write_bytes(vmm::phys_to_virt(buf_phys), 0, buf_bytes); }
 
     // Free buffers
     pmm::free_page(bdl_phys);

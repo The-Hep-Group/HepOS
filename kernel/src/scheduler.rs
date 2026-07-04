@@ -88,8 +88,14 @@ impl Scheduler {
 
 pub static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::empty());
 
+/// Wall-time tick counter — incremented every ~10 ms by the APIC timer ISR.
+/// Safe to poll from any context without MMIO or TSC calibration.
+pub static TICK_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 /// Called from timer ISR. Drops the lock BEFORE switching stacks.
 pub fn tick() {
+    TICK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     // Acquire lock, compute switch, then DROP lock before context_switch.
     let switch = SCHEDULER.lock().next();
     if let Some((old_rsp, new_rsp)) = switch {
