@@ -354,7 +354,8 @@ Range 0–32767 scaled to framebuffer size.
 | ✓ | Window maximize — double-click title bar or □ button; edge-drag snap to left/right half or full |
 | ✓ | "+" button on terminal title bars — click to spawn a new floating terminal window |
 | ○ | QEMU cursor on resize — USB tablet coords are logical (0–32767 → fb size) and should be unaffected by SDL window scale, but QEMU/Windows SDL sometimes breaks this when the window is dragged to a different size; workaround: don't resize the QEMU window, or use Ctrl+Alt+F for fullscreen |
-| ○ | Desktop icons / wallpaper |
+| ✓ | Desktop icons — 5 icons (Welcome/Files/Terminal/Editor/Sysmon), click to open/focus |
+| ○ | Desktop wallpaper |
 | ○ | Multiple instances of the same app |
 
 ### Apps
@@ -409,7 +410,7 @@ Range 0–32767 scaled to framebuffer size.
 10. ~~**Deadlock fix — spawn_terminal outside DESKTOP lock**~~ ✓ done
 11. **QEMU cursor on window resize** — `zoom-to-fit` not available on this QEMU/Windows build; known SDL limitation; no fix yet
 12. **`std` shim** — implement enough of `std` (alloc, io, fs stubs) so external Rust crates can link
-13. **Desktop icons** — clickable icons on the desktop background for each app
+13. ~~**Desktop icons**~~ ✓ done — 5 coloured icons on desktop left edge (Welcome, Files, Terminal, Editor, Sysmon); click opens/focuses the window
 14. **RTL8169 / real hardware NIC** — for running on physical machines
 
 ---

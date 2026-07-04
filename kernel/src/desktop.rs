@@ -31,6 +31,25 @@ pub mod pal {
 pub const TITLE_H:    usize = 22;
 pub const TASKBAR_H:  usize = 32;
 
+// ── Desktop icons ─────────────────────────────────────────────────────────────
+// Each icon: 48×48 box + 8px gap + 8px text label = 64px slot, 80px stride.
+const ICON_SIZE:   usize = 48;
+const ICON_STRIDE: usize = 80; // vertical spacing between icon tops
+const ICON_X:      usize = 16; // left edge
+
+struct IconDef { win_id: usize, label: &'static str, color: Color }
+const ICONS: &[IconDef] = &[
+    IconDef { win_id: 0, label: "Welcome",  color: Color::from_hex(0xE8A020) },
+    IconDef { win_id: 1, label: "Files",    color: Color::from_hex(0x3A8FD4) },
+    IconDef { win_id: 2, label: "Terminal", color: Color::from_hex(0x2EA84A) },
+    IconDef { win_id: 3, label: "Editor",   color: Color::from_hex(0x9B5CE5) },
+    IconDef { win_id: 4, label: "Sysmon",   color: Color::from_hex(0x20B8B0) },
+];
+
+fn icon_rect(slot: usize) -> (i32, i32, usize, usize) {
+    (ICON_X as i32, (16 + slot * ICON_STRIDE) as i32, ICON_SIZE, ICON_SIZE)
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum SnapZone { Left, Right, Top }
 
@@ -380,6 +399,24 @@ impl Desktop {
                 break;
             }
         }
+        // No window hit — check desktop icon click
+        if hit_id.is_none() {
+            for (slot, icon) in ICONS.iter().enumerate() {
+                let (ix, iy, iw, ih) = icon_rect(slot);
+                if mx >= ix && mx < ix + iw as i32
+                    && my >= iy && my < iy + ih as i32 + 12 // include label row
+                {
+                    if let Some(w) = self.windows.iter_mut().find(|w| w.id == icon.win_id) {
+                        w.minimized = false;
+                    }
+                    self.bring_to_front(icon.win_id);
+                    self.dirty = true;
+                    return false;
+                }
+                let _ = slot; // suppress unused warning if loop body always returns
+            }
+        }
+
         if let Some(id) = hit_id {
             self.bring_to_front(id);
             self.dirty = true;
@@ -437,10 +474,27 @@ impl Desktop {
 
     // ── Rendering ─────────────────────────────────────────────────────────────
 
-    /// Clear the desktop background. Windows and taskbar are rendered by the
-    /// task_blink loop so that chrome + content render in correct z-order.
+    /// Clear the desktop background and draw desktop icons.
     pub fn render(&self, display: &mut Display, _cx: i32, _cy: i32) {
         display.clear(pal::BG);
+        for (slot, icon) in ICONS.iter().enumerate() {
+            let (ix, iy, iw, ih) = icon_rect(slot);
+            if iy < 0 { continue; }
+            let ix = ix as usize; let iy = iy as usize;
+            // Outer border (1px, slightly lighter than bg)
+            display.fill_rect(ix, iy, iw, ih, Color::from_hex(0x2A2A3A));
+            // Coloured icon face (inset 2px)
+            display.fill_rect(ix + 2, iy + 2, iw - 4, ih - 4, icon.color);
+            // Dark title-bar strip on the icon face
+            display.fill_rect(ix + 2, iy + 2, iw - 4, 8, Color::from_hex(0x111111));
+            // Label below (scale=1, centred under icon)
+            let label_y = iy + ih + 4;
+            let label_len = icon.label.len();
+            let label_x = if label_len * 8 < iw {
+                ix + (iw - label_len * 8) / 2
+            } else { ix };
+            display.draw_text(label_x, label_y, icon.label, pal::TEXT, 1);
+        }
     }
 
     /// Draw a single window's chrome (title bar, border, content-area background).
