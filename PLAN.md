@@ -324,7 +324,7 @@ RX works on Linux/KVM — this is a QEMU Windows SLiRP path issue, not a driver 
 | ✓ | NVMe — admin + IO queues |
 | ✓ | RTL8139 NIC — TX only |
 | ✓ | e1000 NIC — TX only |
-| ○ | Networking RX (works on Linux/KVM, broken on QEMU/Windows SLiRP) |
+| ✓ | Networking RX — e1000 RX confirmed working on QEMU/Windows (ping 10.0.2.2 replies) |
 | ✓ | Intel HDA audio — `beep [hz] [ms]` via hda-duplex codec, square-wave PCM, DMA stream |
 | ○ | ACPI FADT parsing (for real hardware shutdown) |
 
@@ -384,7 +384,7 @@ RX works on Linux/KVM — this is a QEMU Windows SLiRP path issue, not a driver 
 
 | Issue | Status |
 |-------|--------|
-| Network RX broken on QEMU/Windows | SLiRP path issue — TX works fine; RX works on Linux/KVM |
+| Network RX | e1000 RX confirmed working on QEMU/Windows; RTL8139 RX status unknown |
 | NVMe size reported as 0 MB | Identify Namespace command hangs; workaround: hardcoded 512B/block |
 | ACPI shutdown only on QEMU | Hardcoded port 0x604 — real hardware needs FADT parsing |
 | Terminal text doesn't reflow on resize | Existing output stays at old column width; new input uses current width |
@@ -395,7 +395,7 @@ RX works on Linux/KVM — this is a QEMU Windows SLiRP path issue, not a driver 
 
 1. ~~**`std` shim**~~ ✓ done — `userspace/` workspace: `hepos-rt` (allocator/panic/syscalls), `hepos-std` (println!, String/Vec re-exports), `hello` demo; kernel bakes hello ELF via build.rs; `runhello` terminal command
 2. ~~**Preemptive ring-3**~~ ✓ done (scoped) — timer unmasked during `run_elf` so ring-3 is preemptible by the scheduler; `sys_write` output buffered in `PROC_OUT` and flushed to the terminal window after exec; `swapgs` GS-state bug fixed (was freezing on 2nd run); full multi-process scheduling (fork/waitpid) remains future work
-3. **Networking RX on Linux/KVM** — confirm RTL8139/e1000 RX works there; if yes, QEMU/Windows is a known environment issue not a bug
+3. ~~**Networking RX**~~ ✓ works — e1000 RX confirmed working on QEMU/Windows (user confirmed ping 10.0.2.2 replies); previously thought to be Windows-only broken but appears to work
 4. ~~**Intel HDA audio**~~ ✓ done — PCI detect (class 04/03), MMIO BAR map, immediate-cmd codec config (QEMU hda-duplex), output stream DMA + BDL, square-wave PCM generation, `beep [hz] [ms]` terminal command; add `-device intel-hda -device hda-duplex` to QEMU command
 5. **TCP/UDP stack** — build on existing ARP/IP layer; needed for any real networking app
 6. ~~**Window maximize / snap**~~ ✓ done

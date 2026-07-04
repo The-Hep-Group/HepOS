@@ -86,6 +86,23 @@ fn spin(n: u32) {
     }
 }
 
+// TSC used purely for timeout, not for precise timing.
+#[inline(always)]
+fn rdtsc() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        core::arch::asm!(
+            "lfence",
+            "rdtsc",
+            out("eax") lo,
+            out("edx") hi,
+            options(nostack, nomem),
+        );
+    }
+    ((hi as u64) << 32) | lo as u64
+}
+
 // ── Immediate Command interface ───────────────────────────────────────────────
 //
 // Sends one codec verb and returns the response word.
@@ -100,20 +117,20 @@ fn send_verb(mmio: *mut u8, cad: u8, nid: u8, verb: u32) -> u32 {
     }
 
     w32(mmio, IC, cmd);
-    // Set ICB
-    let irs = r16(mmio, IRS);
-    w16(mmio, IRS, irs | 1);
+    // Set ICB only (bit 0). Writing bit 1 would clear IRV since it's W1C,
+    // but we don't want to touch it here — just trigger the command.
+    w16(mmio, IRS, 0x01);
 
-    // Wait for IRV (bit 1)
-    for _ in 0..100_000u32 {
+    // Wait for IRV (bit 1 set by hardware when response is ready)
+    for _ in 0..200_000u32 {
         let irs = r16(mmio, IRS);
         if irs & 2 != 0 {
-            w16(mmio, IRS, irs | 2); // clear IRV
+            w16(mmio, IRS, 0x02); // W1C: clear IRV
             return r32(mmio, IR);
         }
         spin(10);
     }
-    0 // timeout
+    0 // timeout — codec not responding
 }
 
 // Helpers for the two verb encodings used by HDA:
@@ -301,8 +318,9 @@ pub fn beep(freq_hz: u32, duration_ms: u32) {
         spin(10);
     }
 
-    // Clear any pending status (write 1 to clear)
-    w32(mmio, sd_off + SD_CTL, 0x001C_0000); // clear BCIS/FIFOE/DESE in STS byte
+    // Clear any pending status bits in SDnSTS (W1C).
+    // BCIS=bit26, FIFOE=bit27, DESE=bit28 in the 32-bit read of the 4-byte CTL+STS block.
+    w32(mmio, sd_off + SD_CTL, 0x1C00_0000);
 
     // BDL address
     w32(mmio, sd_off + SD_BDPL, bdl_phys as u32);
@@ -324,15 +342,19 @@ pub fn beep(freq_hz: u32, duration_ms: u32) {
     // Start stream
     w32(mmio, sd_off + SD_CTL, ctl_base | SD_CTL_RUN);
 
-    // Poll BCIS until the single BDL entry completes
-    for _ in 0..50_000_000u32 {
+    // Wait for BCIS (DMA finished the BDL), with a hard TSC deadline as fallback.
+    // TSC runs at ~CPU frequency; assume ≥1 GHz so 1M ticks ≥ 1ms.
+    // We give the stream 3× its nominal duration before forcing a stop.
+    let tsc_deadline = rdtsc() + 1_000_000u64 * (duration_ms as u64 * 3 + 500);
+    loop {
         if r32(mmio, sd_off + SD_CTL) & SD_STS_BCIS != 0 { break; }
-        spin(1);
+        if rdtsc() >= tsc_deadline { break; }
+        spin(100);
     }
 
-    // Stop stream and clear BCIS
+    // Stop stream, then clear status bits (W1C)
     w32(mmio, sd_off + SD_CTL, 0);
-    w32(mmio, sd_off + SD_CTL, SD_STS_BCIS); // write 1 to clear
+    w32(mmio, sd_off + SD_CTL, 0x1C00_0000);
 
     // Free buffers
     pmm::free_page(bdl_phys);
