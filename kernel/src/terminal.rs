@@ -267,7 +267,7 @@ impl Terminal {
             "help", "clear", "pwd", "ls", "cd", "cat", "mkdir", "touch",
             "rm", "cp", "mv", "write", "edit", "uname", "mem", "date",
             "history", "lspci", "netdiag", "netstart", "netpoll", "ifconfig",
-            "ping", "shutdown", "reboot", "echo", "sysinfo", "syscallinfo", "runtest", "runhello", "exec", "ps", "newterm",
+            "ping", "shutdown", "reboot", "echo", "sysinfo", "syscallinfo", "runtest", "runhello", "exec", "ps", "newterm", "beep",
         ];
 
         let partial = self.cmd_buf.clone();
@@ -354,6 +354,7 @@ impl Terminal {
                     ("shutdown",       "power off (ACPI)"),
                     ("reboot",         "reboot"),
                     ("echo <text>",    "print text"),
+                    ("beep [hz] [ms]", "play tone via HDA audio"),
                 ];
                 for (name, desc) in &cmds {
                     self.print_colored("  ", DIM);
@@ -698,6 +699,18 @@ impl Terminal {
                         self.print(&alloc::format!("hello exited: {}\n", code));
                     }
                     Err(e) => self.print_colored(&alloc::format!("runhello: {}\n", e), ERR),
+                }
+            }
+
+            "beep" => {
+                // beep [freq_hz] [duration_ms]
+                let freq: u32 = arg1.parse().unwrap_or(440);
+                let ms:   u32 = arg2.parse().unwrap_or(200);
+                if !crate::hda::is_available() {
+                    self.print_colored("beep: HDA not available (launch QEMU with -device intel-hda -device hda-duplex)\n", ERR);
+                } else {
+                    self.print(&alloc::format!("beep: {} Hz for {} ms\n", freq, ms));
+                    crate::hda::beep(freq, ms);
                 }
             }
 

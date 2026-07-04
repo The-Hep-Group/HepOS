@@ -81,6 +81,8 @@ $qemu = "C:\Program Files\qemu\qemu-system-x86_64.exe"
     -device nvme,serial=heposv1,drive=nvme0 `
     -netdev user,id=net0 `
     -device rtl8139,netdev=net0 `
+    -device intel-hda `
+    -device hda-duplex `
     -device qemu-xhci,id=xhci `
     -device usb-tablet,bus=xhci.0 `
     -vga std `

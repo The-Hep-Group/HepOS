@@ -15,6 +15,7 @@ mod xhci;
 mod desktop;
 mod framebuffer;
 mod gdt;
+mod hda;
 mod heap;
 mod hepfs;
 mod idt;
@@ -254,6 +255,9 @@ extern "C" fn kmain() -> ! {
     } else {
         serial::print("No NVMe device found\n");
     }
+
+    // Intel HDA audio
+    hda::init(&pci_devices);
 
     // Networking — try RTL8139 first (simplest QEMU NIC), then e1000
     rtl8139::init(&pci_devices);

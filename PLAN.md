@@ -1,7 +1,7 @@
 # HepOS — Design Reference & Roadmap
 
 > **Purpose:** Authoritative reference for HepOS. Survives context compaction.
-> **Last updated:** 2026-07-02
+> **Last updated:** 2026-07-03
 
 ---
 
@@ -53,6 +53,7 @@ kernel/
     syscall.rs     SYSCALL/SYSRET gate, SWAPGS, MSR setup, dispatcher (write/exit/getpid)
     process.rs     Ring-3 process: user PML4, ELF entry, process table (PID, state, exec, ps)
     elf.rs         ELF64 parser/loader — maps PT_LOAD segments into a user PML4
+    hda.rs         Intel HDA driver: PCI detect, BAR0 map, immediate-cmd codec config, stream + BDL, beep()
     serial.rs      COM1 debug: print, print_hex
     panic.rs       Prints file:line:message to serial, then spins
 
@@ -88,6 +89,8 @@ qemu-system-x86_64
   -device nvme,serial=heposv1,drive=nvme0
   -netdev user,id=net0
   -device rtl8139,netdev=net0
+  -device intel-hda
+  -device hda-duplex
   -device qemu-xhci,id=xhci
   -device usb-tablet,bus=xhci.0     # absolute mouse via USB HID
   -vga std
@@ -207,6 +210,7 @@ Terminal column count adapts to window width dynamically (up to 120 cols max).
 | `runtest` | Run embedded ring-3 ELF sanity test |
 | `runhello` | Run hello ELF built from userspace/hello (demos hepos-std: String, Vec, println!) |
 | `newterm` | Spawn a new floating terminal window |
+| `beep [hz] [ms]` | Play square-wave tone via Intel HDA (default: 440 Hz, 200 ms) |
 
 ---
 
@@ -321,7 +325,7 @@ RX works on Linux/KVM — this is a QEMU Windows SLiRP path issue, not a driver 
 | ✓ | RTL8139 NIC — TX only |
 | ✓ | e1000 NIC — TX only |
 | ○ | Networking RX (works on Linux/KVM, broken on QEMU/Windows SLiRP) |
-| ○ | Intel HDA audio |
+| ✓ | Intel HDA audio — `beep [hz] [ms]` via hda-duplex codec, square-wave PCM, DMA stream |
 | ○ | ACPI FADT parsing (for real hardware shutdown) |
 
 ### Storage
@@ -392,7 +396,7 @@ RX works on Linux/KVM — this is a QEMU Windows SLiRP path issue, not a driver 
 1. ~~**`std` shim**~~ ✓ done — `userspace/` workspace: `hepos-rt` (allocator/panic/syscalls), `hepos-std` (println!, String/Vec re-exports), `hello` demo; kernel bakes hello ELF via build.rs; `runhello` terminal command
 2. ~~**Preemptive ring-3**~~ ✓ done (scoped) — timer unmasked during `run_elf` so ring-3 is preemptible by the scheduler; `sys_write` output buffered in `PROC_OUT` and flushed to the terminal window after exec; `swapgs` GS-state bug fixed (was freezing on 2nd run); full multi-process scheduling (fork/waitpid) remains future work
 3. **Networking RX on Linux/KVM** — confirm RTL8139/e1000 RX works there; if yes, QEMU/Windows is a known environment issue not a bug
-4. **Intel HDA audio** — PCI enumerate, CORB/RIRB setup, play PCM; pair with a beep command
+4. ~~**Intel HDA audio**~~ ✓ done — PCI detect (class 04/03), MMIO BAR map, immediate-cmd codec config (QEMU hda-duplex), output stream DMA + BDL, square-wave PCM generation, `beep [hz] [ms]` terminal command; add `-device intel-hda -device hda-duplex` to QEMU command
 5. **TCP/UDP stack** — build on existing ARP/IP layer; needed for any real networking app
 6. ~~**Window maximize / snap**~~ ✓ done
 7. ~~**Multiple terminal windows**~~ ✓ done
