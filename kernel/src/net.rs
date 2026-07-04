@@ -259,6 +259,94 @@ pub fn parse_ip(s: &str) -> Option<[u8; 4]> {
     Some([a, b, c, d])
 }
 
+/// DNS A-record lookup via SLiRP's built-in resolver at 10.0.2.3:53.
+/// Returns the first IPv4 address for `hostname`, or None on timeout / NXDOMAIN.
+pub fn dns_resolve(hostname: &str) -> Option<[u8; 4]> {
+    let dns_ip  = [10u8, 0, 2, 3];
+    let dns_mac = [0x52u8, 0x55, 0x0a, 0x00, 0x02, 0x02];
+    let src_port = 53000u16;
+    let txid = (crate::hda::rdtsc() & 0xFFFF) as u16;
+
+    // Build DNS query packet
+    let mut q: Vec<u8> = Vec::new();
+    q.extend_from_slice(&txid.to_be_bytes());
+    q.extend_from_slice(&[0x01, 0x00]); // flags: recursion desired
+    q.extend_from_slice(&[0x00, 0x01]); // QDCOUNT=1
+    q.extend_from_slice(&[0x00, 0x00]); // ANCOUNT=0
+    q.extend_from_slice(&[0x00, 0x00]); // NSCOUNT=0
+    q.extend_from_slice(&[0x00, 0x00]); // ARCOUNT=0
+    for label in hostname.split('.') {
+        if label.is_empty() { continue; }
+        q.push(label.len() as u8);
+        q.extend_from_slice(label.as_bytes());
+    }
+    q.push(0);                          // root label
+    q.extend_from_slice(&[0x00, 0x01]); // QTYPE=A
+    q.extend_from_slice(&[0x00, 0x01]); // QCLASS=IN
+
+    udp_send(dns_ip, dns_mac, src_port, 53, &q);
+
+    let tsc_per_ms = crate::hda::TSC_PER_MS.load(core::sync::atomic::Ordering::Relaxed);
+    let deadline   = crate::hda::rdtsc().wrapping_add(tsc_per_ms.saturating_mul(2_000));
+
+    loop {
+        if crate::hda::rdtsc().wrapping_sub(deadline) < u64::MAX / 2 { return None; }
+
+        let frame = with_nic(|n| n.recv()).flatten();
+        if let Some(f) = frame {
+            if f.len() < 14 { continue; }
+            if u16::from_be_bytes([f[12], f[13]]) != 0x0800 { continue; }
+            let ip = &f[14..];
+            if ip.len() < 20 { continue; }
+            let src_ip: [u8; 4] = ip[12..16].try_into().unwrap_or([0; 4]);
+            if src_ip != dns_ip || ip[9] != 17 { continue; }
+            let ihl = ((ip[0] & 0x0F) as usize) * 4;
+            let udp = &ip[ihl..];
+            if udp.len() < 8 { continue; }
+            if u16::from_be_bytes([udp[0], udp[1]]) != 53    { continue; }
+            if u16::from_be_bytes([udp[2], udp[3]]) != src_port { continue; }
+            let dns = &udp[8..];
+            if dns.len() < 12 { continue; }
+            if u16::from_be_bytes([dns[0], dns[1]]) != txid  { continue; }
+            if dns[2] & 0x80 == 0 { continue; } // not a response
+            let ancount = u16::from_be_bytes([dns[6], dns[7]]) as usize;
+            if ancount == 0 { return None; }
+
+            // Skip header + question section (QNAME + QTYPE + QCLASS)
+            let mut pos = 12usize;
+            loop {
+                if pos >= dns.len() { return None; }
+                let l = dns[pos] as usize;
+                if l == 0 { pos += 1; break; }
+                if l & 0xC0 == 0xC0 { pos += 2; break; }
+                pos += 1 + l;
+            }
+            pos += 4; // QTYPE + QCLASS
+
+            // Walk answer RRs looking for A record
+            for _ in 0..ancount {
+                if pos + 10 > dns.len() { break; }
+                // NAME: pointer or labels
+                if dns[pos] & 0xC0 == 0xC0 { pos += 2; }
+                else {
+                    while pos < dns.len() && dns[pos] != 0 { pos += 1 + dns[pos] as usize; }
+                    pos += 1;
+                }
+                if pos + 10 > dns.len() { break; }
+                let rtype = u16::from_be_bytes([dns[pos],   dns[pos+1]]);
+                let rdlen = u16::from_be_bytes([dns[pos+8], dns[pos+9]]) as usize;
+                pos += 10;
+                if rtype == 1 && rdlen == 4 && pos + 4 <= dns.len() {
+                    return Some([dns[pos], dns[pos+1], dns[pos+2], dns[pos+3]]);
+                }
+                pos += rdlen;
+            }
+            return None;
+        }
+        for _ in 0..10_000u32 { core::hint::spin_loop(); }
+    }
+}
+
 /// Open a TCP connection to `dst_ip:dst_port`, send `request`, collect the full
 /// response (until the server sends FIN or we time out after ~5 s), then close.
 /// Routes via the SLiRP gateway MAC so external IPs work out of the box.

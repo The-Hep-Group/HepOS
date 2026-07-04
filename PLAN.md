@@ -46,7 +46,7 @@ kernel/
     desktop.rs     Compositor, WM, start menu, taskbar, resize handles, RTC clock
     terminal.rs    Full shell: history, left/right cursor, tab completion, 30+ commands
     editor.rs      Text editor: Ctrl+F find, PgUp/Dn, Ctrl+Home/End, F2=save, F10=close
-    net.rs         ARP, ICMP, eth_send, ping (bypasses ARP, uses SLiRP MAC)
+    net.rs         ARP, ICMP, IP, TCP (hand-written stack), HTTP GET client (wget), ping
     e1000.rs       Intel 82540EM driver (TX works, RX pending)
     rtl8139.rs     RTL8139 driver (flat ring, TX works, RX broken on QEMU Windows)
     virtio_net.rs  virtio-net legacy (incomplete)
@@ -203,6 +203,7 @@ Terminal column count adapts to window width dynamically (up to 120 cols max).
 | `lspci` | List all PCI devices |
 | `ifconfig` | IP / MAC / gateway |
 | `ping <ip>` | ICMP echo |
+| `wget <host>[:<port>] [/path]` | HTTP GET with DNS resolution (default port 80); prints up to 4KB |
 | `netstart` / `netdiag` / `netpoll` | NIC debug commands |
 | `shutdown` / `reboot` | ACPI off / PS/2 reset |
 | `echo` / `clear` | Print text / clear screen |
@@ -283,16 +284,16 @@ Range 0–32767 scaled to framebuffer size.
 
 ## Networking
 
-**Stack:** `net.rs` — hand-written Ethernet → ARP → IP → ICMP (no smoltcp)  
+**Stack:** `net.rs` — hand-written Ethernet → ARP → IP → ICMP + TCP (no smoltcp)  
 **Static config:** IP 10.0.2.15, GW 10.0.2.2, mask 255.255.255.0
 
 | Driver | TX | RX | Notes |
 |--------|----|----|-------|
-| RTL8139 | ✓ | ✗ | SLiRP RX broken on QEMU/Windows |
-| e1000 | ✓ | ✗ | Same issue |
+| RTL8139 | ✓ | ✓ | Confirmed working on QEMU/Windows — ping and HTTP wget both work |
+| e1000 | ✓ | ✓ | Also confirmed working |
 | virtio-net | ✗ | ✗ | Not detected |
 
-RX works on Linux/KVM — this is a QEMU Windows SLiRP path issue, not a driver bug.
+**TCP implementation:** 3-way handshake (SYN → SYN-ACK → ACK), data receive, FIN close. TSC-based 3s timeout. Rotating ephemeral source ports (49152+) to avoid SLiRP TIME_WAIT collisions on repeated calls.
 
 ---
 
@@ -373,9 +374,11 @@ RX works on Linux/KVM — this is a QEMU Windows SLiRP path issue, not a driver 
 | ✓/○ | Feature |
 |-----|---------|
 | ✓ | ARP, ICMP, IP checksum, eth_send |
-| ○ | Working RX (Linux/KVM only right now) |
-| ○ | TCP / UDP stack |
-| ○ | DNS, HTTP client |
+| ✓ | RTL8139 + e1000 RX — confirmed on QEMU/Windows |
+| ✓ | TCP stack — 3-way handshake, data receive, FIN close, rotating ephemeral ports |
+| ✓ | HTTP GET client — `wget <host>[:<port>] [/path]`, prints up to 4KB |
+| ✓ | DNS resolver — UDP query to SLiRP's 10.0.2.3:53; `wget example.com` works |
+| ○ | UDP stack (general-purpose) |
 | ✓ | Userspace — ring 3, SYSCALL/SYSRET, ELF loader, exec from HepFS, process table |
 | ✓ | `hepos-std` shim — `hepos-rt` (bump allocator, panic, sys_write/exit/getpid) + `hepos-std` (println!, String, Vec); `runhello` demo command |
 
@@ -385,7 +388,6 @@ RX works on Linux/KVM — this is a QEMU Windows SLiRP path issue, not a driver 
 
 | Issue | Status |
 |-------|--------|
-| Network RX | e1000 RX confirmed working on QEMU/Windows; RTL8139 RX status unknown |
 | NVMe size reported as 0 MB | Identify Namespace command hangs; workaround: hardcoded 512B/block |
 | ACPI shutdown only on QEMU | Hardcoded port 0x604 — real hardware needs FADT parsing |
 | Terminal text doesn't reflow on resize | Existing output stays at old column width; new input uses current width |
@@ -399,7 +401,7 @@ RX works on Linux/KVM — this is a QEMU Windows SLiRP path issue, not a driver 
 2. ~~**Preemptive ring-3**~~ ✓ done (scoped) — timer unmasked during `run_elf` so ring-3 is preemptible by the scheduler; `sys_write` output buffered in `PROC_OUT` and flushed to the terminal window after exec; `swapgs` GS-state bug fixed (was freezing on 2nd run); full multi-process scheduling (fork/waitpid) remains future work
 3. ~~**Networking RX**~~ ✓ works — e1000 RX confirmed working on QEMU/Windows (user confirmed ping 10.0.2.2 replies); previously thought to be Windows-only broken but appears to work
 4. ~~**Intel HDA audio**~~ ✓ done (partial) — PCI detect (class 04/03), MMIO BAR map, immediate-cmd codec config (QEMU hda-duplex), output stream DMA + BDL, square-wave PCM generation, `beep [hz] [ms]` terminal command; TSC/PIT-calibrated timing so beep() returns correctly. **Known issue:** audio continues looping after beep() returns — DMA stop sequence (SD_CTL=0 / SRST / 0) not reliably halting QEMU's HDA engine; needs investigation.
-5. **TCP/UDP stack** — build on existing ARP/IP layer; needed for any real networking app
+5. ~~**TCP/UDP stack**~~ ✓ TCP + DNS done — 3-way handshake, HTTP GET (`wget <host>[:<port>]`), DNS A-record resolver via SLiRP 10.0.2.3:53, TSC timeouts, rotating source ports. General UDP stack remains.
 6. ~~**Window maximize / snap**~~ ✓ done
 7. ~~**Multiple terminal windows**~~ ✓ done
 8. ~~**Full-edge resize + directional cursors**~~ ✓ done

@@ -355,7 +355,7 @@ impl Terminal {
                     ("reboot",         "reboot"),
                     ("echo <text>",    "print text"),
                     ("beep [hz] [ms]", "play tone via HDA audio"),
-                    ("wget <ip>[:<port>] [path]","HTTP GET (default port 80)"),
+                    ("wget <host>[:<port>] [path]","HTTP GET, resolves DNS (default port 80)"),
                 ];
                 for (name, desc) in &cmds {
                     self.print_colored("  ", DIM);
@@ -861,30 +861,36 @@ impl Terminal {
 
             "wget" => {
                 if arg1.is_empty() {
-                    self.print_colored("usage: wget <ip>[:<port>] [/path]\n", ERR);
+                    self.print_colored("usage: wget <ip|host>[:<port>] [/path]\n", ERR);
                 } else {
-                    // Parse optional port from "ip:port"
-                    let (ip_str, port) = if let Some(colon) = arg1.rfind(':') {
+                    // Split optional ":port" suffix
+                    let (host_str, port) = if let Some(colon) = arg1.rfind(':') {
                         let p = arg1[colon+1..].parse::<u16>().unwrap_or(80);
                         (&arg1[..colon], p)
                     } else {
                         (arg1, 80u16)
                     };
-                    match crate::net::parse_ip(ip_str) {
-                        None => self.print_colored("wget: invalid IP address\n", ERR),
+                    // Resolve: bare IP first, then DNS
+                    let resolved = if let Some(ip) = crate::net::parse_ip(host_str) {
+                        Some(ip)
+                    } else {
+                        self.print(&alloc::format!("Resolving {}…\n", host_str));
+                        crate::net::dns_resolve(host_str)
+                    };
+                    match resolved {
+                        None => self.print_colored("wget: could not resolve host\n", ERR),
                         Some(ip) => {
                             let path = if arg2.is_empty() { "/" } else { arg2 };
                             let req  = alloc::format!(
                                 "GET {} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n",
-                                path, ip_str
+                                path, host_str
                             );
-                            self.print(&alloc::format!("Connecting to {}:{}…\n", ip_str, port));
+                            self.print(&alloc::format!("Connecting to {}:{}…\n", host_str, port));
                             match crate::net::tcp_get(ip, port, req.as_bytes()) {
                                 Err(e) => self.print_colored(
                                     &alloc::format!("wget: {}\n", e), ERR
                                 ),
                                 Ok(data) => {
-                                    // Print up to 4 KB so we don't flood the terminal
                                     let limit = data.len().min(4096);
                                     let s = core::str::from_utf8(&data[..limit])
                                         .unwrap_or("(non-UTF-8 response)");
