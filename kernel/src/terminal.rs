@@ -355,7 +355,7 @@ impl Terminal {
                     ("reboot",         "reboot"),
                     ("echo <text>",    "print text"),
                     ("beep [hz] [ms]", "play tone via HDA audio"),
-                    ("wget <ip> [path]","HTTP GET from ip (port 80)"),
+                    ("wget <ip>[:<port>] [path]","HTTP GET (default port 80)"),
                 ];
                 for (name, desc) in &cmds {
                     self.print_colored("  ", DIM);

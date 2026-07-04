@@ -262,10 +262,18 @@ pub fn parse_ip(s: &str) -> Option<[u8; 4]> {
 /// Open a TCP connection to `dst_ip:dst_port`, send `request`, collect the full
 /// response (until the server sends FIN or we time out after ~5 s), then close.
 /// Routes via the SLiRP gateway MAC so external IPs work out of the box.
+static NEXT_SRC_PORT: core::sync::atomic::AtomicU16 =
+    core::sync::atomic::AtomicU16::new(49152);
+
 pub fn tcp_get(dst_ip: [u8; 4], dst_port: u16, request: &[u8]) -> Result<Vec<u8>, &'static str> {
     let gw_mac   = [0x52u8, 0x55, 0x0a, 0x00, 0x02, 0x02];
-    let src_port = 49152u16;
-    let mut seq  = 0xC0FFEE00u32;
+    // Rotate through ephemeral ports to avoid TIME_WAIT collisions on repeated calls.
+    let src_port = {
+        let p = NEXT_SRC_PORT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if p == 0 { NEXT_SRC_PORT.store(49153, core::sync::atomic::Ordering::Relaxed); 49152 } else { p }
+    };
+    // Use TSC as a varying ISN so SLiRP doesn't confuse this with an old connection.
+    let mut seq  = crate::hda::rdtsc() as u32 | 1;
     let mut ack  = 0u32;
     let mut state: u8 = 0; // 0 = SYN_SENT, 1 = ESTABLISHED, 2 = done
     let mut rx   = Vec::new();
