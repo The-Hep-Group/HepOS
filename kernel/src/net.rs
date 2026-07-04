@@ -171,7 +171,195 @@ fn handle_ip(eth_src: [u8; 6], data: &[u8]) {
     let proto = data[9];
     let ihl = (data[0] & 0x0F) as usize * 4;
     if data.len() < ihl { return; }
-    if proto == 1 { handle_icmp(src_ip, eth_src, &data[ihl..]); }
+    match proto {
+        1  => handle_icmp(src_ip, eth_src, &data[ihl..]),
+        17 => handle_udp(&data[ihl..]),
+        _  => {}
+    }
+}
+
+// ── UDP ───────────────────────────────────────────────────────────────────────
+
+pub fn udp_send(dst_ip: [u8; 4], dst_mac: [u8; 6], src_port: u16, dst_port: u16, data: &[u8]) {
+    let len = (8 + data.len()) as u16;
+    let mut seg = vec![0u8; len as usize];
+    seg[0..2].copy_from_slice(&src_port.to_be_bytes());
+    seg[2..4].copy_from_slice(&dst_port.to_be_bytes());
+    seg[4..6].copy_from_slice(&len.to_be_bytes());
+    // checksum is optional for IPv4 UDP — leave as 0
+    seg[8..].copy_from_slice(data);
+    ip_send(dst_ip, dst_mac, 17, &seg);
+}
+
+fn handle_udp(_data: &[u8]) {
+    // Placeholder — incoming UDP is not yet dispatched to any service.
+}
+
+// ── TCP ───────────────────────────────────────────────────────────────────────
+
+const TCP_FIN: u8 = 0x01;
+const TCP_SYN: u8 = 0x02;
+const TCP_RST: u8 = 0x04;
+const TCP_PSH: u8 = 0x08;
+const TCP_ACK: u8 = 0x10;
+
+fn tcp_checksum(src_ip: [u8; 4], dst_ip: [u8; 4], tcp_seg: &[u8]) -> u16 {
+    // Pseudo-header: src_ip, dst_ip, 0x00, proto=6, tcp_length
+    let tcp_len = tcp_seg.len() as u16;
+    let mut buf = vec![0u8; 12 + tcp_seg.len()];
+    buf[0..4].copy_from_slice(&src_ip);
+    buf[4..8].copy_from_slice(&dst_ip);
+    buf[8] = 0;
+    buf[9] = 6;
+    buf[10..12].copy_from_slice(&tcp_len.to_be_bytes());
+    buf[12..].copy_from_slice(tcp_seg);
+    ip_checksum(&buf)
+}
+
+fn tcp_send_seg(
+    dst_ip: [u8; 4], dst_mac: [u8; 6],
+    src_port: u16, dst_port: u16,
+    seq: u32, ack: u32, flags: u8,
+    data: &[u8],
+) {
+    let mut seg = vec![0u8; 20 + data.len()];
+    seg[0..2].copy_from_slice(&src_port.to_be_bytes());
+    seg[2..4].copy_from_slice(&dst_port.to_be_bytes());
+    seg[4..8].copy_from_slice(&seq.to_be_bytes());
+    seg[8..12].copy_from_slice(&ack.to_be_bytes());
+    seg[12] = 0x50;                                         // data offset = 5 (20 byte header)
+    seg[13] = flags;
+    seg[14..16].copy_from_slice(&65535u16.to_be_bytes());   // window
+    // [16..18] = checksum placeholder (zero)
+    seg[20..].copy_from_slice(data);
+    let ck = tcp_checksum(MY_IP, dst_ip, &seg);
+    seg[16..18].copy_from_slice(&ck.to_be_bytes());
+    ip_send(dst_ip, dst_mac, 6, &seg);
+}
+
+fn tcp_parse(data: &[u8]) -> Option<(u16, u16, u32, u8, &[u8])> {
+    if data.len() < 20 { return None; }
+    let src_port = u16::from_be_bytes([data[0], data[1]]);
+    let dst_port = u16::from_be_bytes([data[2], data[3]]);
+    let seq      = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+    let flags    = data[13];
+    let doff     = ((data[12] >> 4) as usize) * 4;
+    if doff > data.len() { return None; }
+    Some((src_port, dst_port, seq, flags, &data[doff..]))
+}
+
+/// Parse a dotted-quad IP address string into bytes.
+pub fn parse_ip(s: &str) -> Option<[u8; 4]> {
+    let mut it = s.split('.');
+    let a = it.next()?.parse::<u8>().ok()?;
+    let b = it.next()?.parse::<u8>().ok()?;
+    let c = it.next()?.parse::<u8>().ok()?;
+    let d = it.next()?.parse::<u8>().ok()?;
+    if it.next().is_some() { return None; }
+    Some([a, b, c, d])
+}
+
+/// Open a TCP connection to `dst_ip:dst_port`, send `request`, collect the full
+/// response (until the server sends FIN or we time out after ~5 s), then close.
+/// Routes via the SLiRP gateway MAC so external IPs work out of the box.
+pub fn tcp_get(dst_ip: [u8; 4], dst_port: u16, request: &[u8]) -> Result<Vec<u8>, &'static str> {
+    let gw_mac   = [0x52u8, 0x55, 0x0a, 0x00, 0x02, 0x02];
+    let src_port = 49152u16;
+    let mut seq  = 0xC0FFEE00u32;
+    let mut ack  = 0u32;
+    let mut state: u8 = 0; // 0 = SYN_SENT, 1 = ESTABLISHED, 2 = done
+    let mut rx   = Vec::new();
+
+    tcp_send_seg(dst_ip, gw_mac, src_port, dst_port, seq, 0, TCP_SYN, &[]);
+    crate::serial::print("tcp: SYN sent\n");
+
+    // TSC-based 8-second timeout — immune to QEMU speed variations.
+    let tsc_per_ms = crate::hda::TSC_PER_MS.load(core::sync::atomic::Ordering::Relaxed);
+    let deadline   = crate::hda::rdtsc().wrapping_add(tsc_per_ms.saturating_mul(3_000));
+
+    'poll: loop {
+        // Timeout check
+        if crate::hda::rdtsc().wrapping_sub(deadline) < u64::MAX / 2 { break 'poll; }
+
+        loop {
+            let frame = with_nic(|n| n.recv()).flatten();
+            let Some(f) = frame else { break };
+            if f.len() < 14 { continue; }
+            let etype = u16::from_be_bytes([f[12], f[13]]);
+            if etype != 0x0800 {
+                crate::serial::print("tcp: non-IP frame etype=");
+                crate::serial::print_hex("", etype as u64);
+                crate::serial::print("\n");
+                continue;
+            }
+
+            let ip = &f[14..];
+            if ip.len() < 20 { continue; }
+            // ICMP unreachable (type=3) → treat as hard error
+            if ip[9] == 1 {
+                let ihl2 = ((ip[0] & 0x0F) as usize) * 4;
+                if ip.len() > ihl2 && ip[ihl2] == 3 { return Err("tcp: unreachable"); }
+                continue;
+            }
+            if ip[9] != 6 {
+                crate::serial::print("tcp: IP proto not TCP: ");
+                crate::serial::print_hex("", ip[9] as u64);
+                crate::serial::print("\n");
+                continue;
+            }
+            let src_ip: [u8; 4] = ip[12..16].try_into().unwrap_or([0; 4]);
+            crate::serial::print("tcp: TCP from ");
+            crate::serial::print_hex("", src_ip[0] as u64); crate::serial::print(".");
+            crate::serial::print_hex("", src_ip[1] as u64); crate::serial::print(".");
+            crate::serial::print_hex("", src_ip[2] as u64); crate::serial::print(".");
+            crate::serial::print_hex("", src_ip[3] as u64);
+            crate::serial::print(" flags=");
+            if ip.len() > 20 { crate::serial::print_hex("", ip[33] as u64); }
+            crate::serial::print("\n");
+            if src_ip != dst_ip { continue; }
+            if ip[16..20] != MY_IP { continue; }
+
+            let ihl = ((ip[0] & 0x0F) as usize) * 4;
+            let Some((sp, dp, seg_seq, flags, payload)) = tcp_parse(&ip[ihl..]) else { continue };
+            if sp != dst_port || dp != src_port { continue; }
+
+            if flags & TCP_RST != 0 { return Err("tcp: connection refused"); }
+
+            match state {
+                0 => {
+                    if flags & (TCP_SYN | TCP_ACK) == (TCP_SYN | TCP_ACK) {
+                        seq   = seq.wrapping_add(1);
+                        ack   = seg_seq.wrapping_add(1);
+                        tcp_send_seg(dst_ip, gw_mac, src_port, dst_port, seq, ack, TCP_ACK, &[]);
+                        tcp_send_seg(dst_ip, gw_mac, src_port, dst_port, seq, ack, TCP_PSH | TCP_ACK, request);
+                        seq   = seq.wrapping_add(request.len() as u32);
+                        state = 1;
+                    }
+                }
+                1 => {
+                    if !payload.is_empty() {
+                        rx.extend_from_slice(payload);
+                        ack = seg_seq.wrapping_add(payload.len() as u32);
+                        tcp_send_seg(dst_ip, gw_mac, src_port, dst_port, seq, ack, TCP_ACK, &[]);
+                    }
+                    if flags & TCP_FIN != 0 {
+                        ack = ack.wrapping_add(1);
+                        tcp_send_seg(dst_ip, gw_mac, src_port, dst_port, seq, ack, TCP_FIN | TCP_ACK, &[]);
+                        state = 2;
+                        break 'poll;
+                    }
+                }
+                _ => break 'poll,
+            }
+        }
+
+        // Nothing in ring right now — brief pause, then re-check.
+        for _ in 0..10_000u32 { core::hint::spin_loop(); }
+    }
+
+    if state == 0 { return Err("tcp: timeout — no SYN-ACK received"); }
+    if rx.is_empty() { return Err("tcp: connected but no data received"); }
+    Ok(rx)
 }
 
 /// Process one incoming Ethernet frame. Call this from your polling loop.

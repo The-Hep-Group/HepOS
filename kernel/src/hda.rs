@@ -88,11 +88,11 @@ fn spin(n: u32) {
 // Solution: calibrate TSC against PIT timer 2 once at init time, then use
 // `rdtsc()` for all delays.  TSC advances regardless of IF flag.
 
-static TSC_PER_MS: core::sync::atomic::AtomicU64 =
+pub static TSC_PER_MS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(1_000_000); // sane default (1 GHz TSC)
 
 #[inline(always)]
-fn rdtsc() -> u64 {
+pub fn rdtsc() -> u64 {
     let lo: u32;
     let hi: u32;
     unsafe {

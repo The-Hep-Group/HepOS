@@ -1,7 +1,7 @@
 # HepOS — Design Reference & Roadmap
 
 > **Purpose:** Authoritative reference for HepOS. Survives context compaction.
-> **Last updated:** 2026-07-03
+> **Last updated:** 2026-07-04
 
 ---
 
@@ -114,12 +114,13 @@ Limine → kmain()
  6. Terminal init + HepFS navigator state
  7. PCI enumerate
  8. NVMe init → HepFS mount/format → write /kernel.txt
- 9. Networking init (RTL8139 → e1000 fallback)
-10. PS/2 keyboard + mouse init
-11. XHCI USB init (finds usb-tablet, sets up HID ring)
-12. Scheduler (2 tasks: idle, task_blink) + APIC timer   ← MUST be last
-13. sti → first timer tick context-switches kmain → task_blink
-14. task_blink loops forever (input poll + render)
+ 9. Intel HDA init: PIT-calibrates TSC frequency (used by beep() for timing), then initialises controller
+10. Networking init (RTL8139 → e1000 fallback)
+11. PS/2 keyboard + mouse init
+12. XHCI USB init (finds usb-tablet, sets up HID ring)
+13. Scheduler (2 tasks: idle, task_blink) + APIC timer   ← MUST be last
+14. sti → first timer tick context-switches kmain → task_blink
+15. task_blink loops forever (input poll + render)
 ```
 
 **Critical:** APIC timer starts last. The first tick switches to task_blink; if APIC starts early, task_blink runs before XHCI/NVMe are ready.
@@ -388,6 +389,7 @@ RX works on Linux/KVM — this is a QEMU Windows SLiRP path issue, not a driver 
 | NVMe size reported as 0 MB | Identify Namespace command hangs; workaround: hardcoded 512B/block |
 | ACPI shutdown only on QEMU | Hardcoded port 0x604 — real hardware needs FADT parsing |
 | Terminal text doesn't reflow on resize | Existing output stays at old column width; new input uses current width |
+| `beep` audio doesn't stop | HDA DMA keeps looping the PCM buffer after beep() returns; writing SD_CTL=0/SRST doesn't reliably stop QEMU's HDA engine; buffer is zeroed (silence) but stream stays active |
 
 ---
 
@@ -396,7 +398,7 @@ RX works on Linux/KVM — this is a QEMU Windows SLiRP path issue, not a driver 
 1. ~~**`std` shim**~~ ✓ done — `userspace/` workspace: `hepos-rt` (allocator/panic/syscalls), `hepos-std` (println!, String/Vec re-exports), `hello` demo; kernel bakes hello ELF via build.rs; `runhello` terminal command
 2. ~~**Preemptive ring-3**~~ ✓ done (scoped) — timer unmasked during `run_elf` so ring-3 is preemptible by the scheduler; `sys_write` output buffered in `PROC_OUT` and flushed to the terminal window after exec; `swapgs` GS-state bug fixed (was freezing on 2nd run); full multi-process scheduling (fork/waitpid) remains future work
 3. ~~**Networking RX**~~ ✓ works — e1000 RX confirmed working on QEMU/Windows (user confirmed ping 10.0.2.2 replies); previously thought to be Windows-only broken but appears to work
-4. ~~**Intel HDA audio**~~ ✓ done — PCI detect (class 04/03), MMIO BAR map, immediate-cmd codec config (QEMU hda-duplex), output stream DMA + BDL, square-wave PCM generation, `beep [hz] [ms]` terminal command; add `-device intel-hda -device hda-duplex` to QEMU command
+4. ~~**Intel HDA audio**~~ ✓ done (partial) — PCI detect (class 04/03), MMIO BAR map, immediate-cmd codec config (QEMU hda-duplex), output stream DMA + BDL, square-wave PCM generation, `beep [hz] [ms]` terminal command; TSC/PIT-calibrated timing so beep() returns correctly. **Known issue:** audio continues looping after beep() returns — DMA stop sequence (SD_CTL=0 / SRST / 0) not reliably halting QEMU's HDA engine; needs investigation.
 5. **TCP/UDP stack** — build on existing ARP/IP layer; needed for any real networking app
 6. ~~**Window maximize / snap**~~ ✓ done
 7. ~~**Multiple terminal windows**~~ ✓ done

@@ -267,7 +267,7 @@ impl Terminal {
             "help", "clear", "pwd", "ls", "cd", "cat", "mkdir", "touch",
             "rm", "cp", "mv", "write", "edit", "uname", "mem", "date",
             "history", "lspci", "netdiag", "netstart", "netpoll", "ifconfig",
-            "ping", "shutdown", "reboot", "echo", "sysinfo", "syscallinfo", "runtest", "runhello", "exec", "ps", "newterm", "beep",
+            "ping", "wget", "shutdown", "reboot", "echo", "sysinfo", "syscallinfo", "runtest", "runhello", "exec", "ps", "newterm", "beep",
         ];
 
         let partial = self.cmd_buf.clone();
@@ -355,6 +355,7 @@ impl Terminal {
                     ("reboot",         "reboot"),
                     ("echo <text>",    "print text"),
                     ("beep [hz] [ms]", "play tone via HDA audio"),
+                    ("wget <ip> [path]","HTTP GET from ip (port 80)"),
                 ];
                 for (name, desc) in &cmds {
                     self.print_colored("  ", DIM);
@@ -854,6 +855,50 @@ impl Terminal {
                         self.print("\n");
                     } else {
                         self.print_colored("ping: invalid IP address\n", ERR);
+                    }
+                }
+            }
+
+            "wget" => {
+                if arg1.is_empty() {
+                    self.print_colored("usage: wget <ip>[:<port>] [/path]\n", ERR);
+                } else {
+                    // Parse optional port from "ip:port"
+                    let (ip_str, port) = if let Some(colon) = arg1.rfind(':') {
+                        let p = arg1[colon+1..].parse::<u16>().unwrap_or(80);
+                        (&arg1[..colon], p)
+                    } else {
+                        (arg1, 80u16)
+                    };
+                    match crate::net::parse_ip(ip_str) {
+                        None => self.print_colored("wget: invalid IP address\n", ERR),
+                        Some(ip) => {
+                            let path = if arg2.is_empty() { "/" } else { arg2 };
+                            let req  = alloc::format!(
+                                "GET {} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                                path, ip_str
+                            );
+                            self.print(&alloc::format!("Connecting to {}:{}…\n", ip_str, port));
+                            match crate::net::tcp_get(ip, port, req.as_bytes()) {
+                                Err(e) => self.print_colored(
+                                    &alloc::format!("wget: {}\n", e), ERR
+                                ),
+                                Ok(data) => {
+                                    // Print up to 4 KB so we don't flood the terminal
+                                    let limit = data.len().min(4096);
+                                    let s = core::str::from_utf8(&data[..limit])
+                                        .unwrap_or("(non-UTF-8 response)");
+                                    self.print(s);
+                                    if data.len() > limit {
+                                        self.print_colored(
+                                            &alloc::format!("\n[… {} bytes truncated]\n",
+                                                data.len() - limit), DIM
+                                        );
+                                    }
+                                    self.print("\n");
+                                }
+                            }
+                        }
                     }
                 }
             }
