@@ -355,7 +355,7 @@ Range 0–32767 scaled to framebuffer size.
 | ✓ | "+" button on terminal title bars — click to spawn a new floating terminal window |
 | ○ | QEMU cursor on resize — USB tablet coords are logical (0–32767 → fb size) and should be unaffected by SDL window scale, but QEMU/Windows SDL sometimes breaks this when the window is dragged to a different size; workaround: don't resize the QEMU window, or use Ctrl+Alt+F for fullscreen |
 | ✓ | Desktop icons — 5 icons (Welcome/Files/Terminal/Editor/Sysmon), click to open/focus |
-| ○ | Desktop wallpaper |
+| ✓ | Desktop wallpaper — vertical gradient (navy → near-black) + deterministic LCG star field |
 | ○ | Multiple instances of the same app |
 
 ### Apps

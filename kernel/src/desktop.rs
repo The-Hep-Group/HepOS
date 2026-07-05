@@ -474,9 +474,43 @@ impl Desktop {
 
     // ── Rendering ─────────────────────────────────────────────────────────────
 
+    /// Vertical gradient (navy top → near-black bottom) + deterministic stars.
+    fn draw_wallpaper(&self, display: &mut Display) {
+        let w = display.width();
+        let h = display.height();
+        // Gradient: deep navy (0x0D,0x1F,0x40) → near-black indigo (0x07,0x07,0x10)
+        let (tr, tg, tb) = (0x0D_i32, 0x1F_i32, 0x40_i32);
+        let (br, bg, bb) = (0x07_i32, 0x07_i32, 0x10_i32);
+        let n = h as i32;
+        for y in 0..h {
+            let t = y as i32;
+            let r = ((tr * (n - t) + br * t) / n) as u8;
+            let g = ((tg * (n - t) + bg * t) / n) as u8;
+            let b = ((tb * (n - t) + bb * t) / n) as u8;
+            display.fill_rect(0, y, w, 1, Color { r, g, b });
+        }
+        // Deterministic stars — LCG stepped over a 16px grid
+        let mut rng = 0x9E3779B9u32;
+        let cols = w / 16;
+        let rows = h / 16;
+        for sy in 0..rows {
+            for sx in 0..cols {
+                rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+                if rng & 0x1F == 0 {
+                    let px = sx * 16 + (rng >> 20 & 15) as usize;
+                    let py = sy * 16 + (rng >> 16 & 15) as usize;
+                    let bright = ((rng >> 24 & 0x5F) as u8).saturating_add(0x60);
+                    if px < w && py < h {
+                        display.put_pixel_pub(px, py, Color { r: bright, g: bright, b: bright });
+                    }
+                }
+            }
+        }
+    }
+
     /// Clear the desktop background and draw desktop icons.
     pub fn render(&self, display: &mut Display, _cx: i32, _cy: i32) {
-        display.clear(pal::BG);
+        self.draw_wallpaper(display);
         for (slot, icon) in ICONS.iter().enumerate() {
             let (ix, iy, iw, ih) = icon_rect(slot);
             if iy < 0 { continue; }
