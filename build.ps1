@@ -22,7 +22,7 @@ $kernel_elf = "$root\kernel\target\x86_64-unknown-none\release\hepos-kernel"
 if (-not (Test-Path $kernel_elf)) { Write-Error "kernel build failed"; exit 1 }
 
 # ── 3. Build HepBL (our UEFI bootloader, written from scratch) ───────────────
-rustup target add x86_64-unknown-uefi --toolchain nightly 2>$null | Out-Null
+try { rustup target add x86_64-unknown-uefi --toolchain nightly *>$null } catch {}
 Push-Location "$root\hepbl"
 cargo +nightly build --release
 Pop-Location
