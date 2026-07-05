@@ -148,6 +148,8 @@ extern "C" fn kmain() -> ! {
         dt.add_window("Editor",           60,  40,  580, 380);
         // Sysmon window (id=4) — hidden until opened from start menu
         dt.add_window("Sysmon",           80,  60,  340, 260);
+        // Settings window (id=5) — hidden until opened from icon or right-click menu
+        dt.add_window("Settings",         120, 80,  480, 320);
         *desktop::DESKTOP.lock() = Some(dt);
     }
 
@@ -163,11 +165,11 @@ extern "C" fn kmain() -> ! {
         fwd:  alloc::vec::Vec::new(),
     });
 
-    // Minimize editor and sysmon until explicitly opened; focus terminal (id=2)
+    // Minimize editor, sysmon, and settings until explicitly opened; focus terminal (id=2)
     {
         let mut dt = desktop::DESKTOP.lock();
         if let Some(dt) = dt.as_mut() {
-            for id in [3usize, 4] {
+            for id in [3usize, 4, 5] {
                 if let Some(w) = dt.windows.iter_mut().find(|w| w.id == id) {
                     w.minimized = true;
                 }
@@ -386,6 +388,29 @@ fn task_blink() -> ! {
         };
         if spawn_terminal { crate::terminal::spawn_terminal(); }
 
+        // Handle open_settings_requested from right-click context menu
+        {
+            let requested = {
+                let mut dt = desktop::DESKTOP.lock();
+                if let Some(dt) = dt.as_mut() {
+                    let r = dt.open_settings_requested;
+                    dt.open_settings_requested = false;
+                    r
+                } else { false }
+            };
+            if requested {
+                let mut dt = desktop::DESKTOP.lock();
+                if let Some(dt) = dt.as_mut() {
+                    if let Some(w) = dt.windows.iter_mut().find(|w| w.id == 5) {
+                        w.minimized = false;
+                    }
+                    dt.bring_to_front(5);
+                    *FOCUSED_WIN.lock() = Some(5);
+                    dt.dirty = true;
+                }
+            }
+        }
+
         // Sync keyboard focus with visual focus whenever a mouse click brings a window forward.
         // This fixes the case where the user clicks a window in cursor mode and expects to type.
         if fresh_click {
@@ -531,6 +556,40 @@ fn task_blink() -> ! {
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // Settings window: click on wallpaper thumbnail to change background
+        if fresh_click {
+            let settings_click = {
+                let dt = desktop::DESKTOP.lock();
+                dt.as_ref().and_then(|d| {
+                    let win = d.windows.iter().find(|w| w.id == 5 && !w.minimized)?;
+                    if mx < win.x || mx >= win.x + win.w as i32 { return None; }
+                    if my < win.y || my >= win.y + win.h as i32  { return None; }
+                    // Sidebar is 110px wide — clicks there are nav (only one page for now)
+                    let rel_x = (mx - win.x) as usize;
+                    let rel_y = (my - win.y) as usize;
+                    if rel_x < 110 { return None; } // sidebar click, no action
+                    // Thumbnails start at content_x=120, y=50 (relative)
+                    // Each thumb is 120×80 with 16px gap
+                    let tx0 = 120usize; let ty0 = 50usize;
+                    let tw = 120usize;  let th = 80usize; let tgap = 16usize;
+                    for i in 0..2usize {
+                        let tleft = tx0 + i * (tw + tgap);
+                        if rel_x >= tleft && rel_x < tleft + tw
+                            && rel_y >= ty0 && rel_y < ty0 + th + 14
+                        {
+                            return Some(i as u8);
+                        }
+                    }
+                    None
+                })
+            };
+            if let Some(wp) = settings_click {
+                desktop::WALLPAPER.store(wp, core::sync::atomic::Ordering::Relaxed);
+                let mut dt = desktop::DESKTOP.lock();
+                if let Some(dt) = dt.as_mut() { dt.dirty = true; }
             }
         }
 
@@ -682,6 +741,7 @@ fn task_blink() -> ! {
                                    ed.render(display, wx, wy, *ww, *wh);
                                } }
                         4 => render_sysmon_window(display),
+                        5 => render_settings_window(display),
                         _ => {
                             // Extra terminals spawned via `newterm`
                             let mut et = terminal::EXTRA_TERMINALS.lock();
@@ -696,6 +756,8 @@ fn task_blink() -> ! {
                 // 3. Overlays
                 { let dt = desktop::DESKTOP.lock();
                   if let Some(dt) = dt.as_ref() { dt.draw_start_menu(display); } }
+                { let dt = desktop::DESKTOP.lock();
+                  if let Some(dt) = dt.as_ref() { dt.draw_context_menu(display); } }
                 // 3a. Snap preview — outlined rect showing where window will snap
                 { let dt = desktop::DESKTOP.lock();
                   if let Some(dt) = dt.as_ref() {
@@ -1023,4 +1085,99 @@ fn write_u64(mut n: u64, pos: &mut usize, buf: &mut [u8; 64]) {
         n /= 10;
     }
     buf[start..*pos].reverse();
+}
+
+fn render_settings_window(display: &mut framebuffer::Display) {
+    let Some((wx, wy, ww, wh)) = window_rect("Settings") else { return; };
+    use framebuffer::Color;
+    let bg       = Color::from_hex(0x0C0C0C);
+    let sidebar  = Color::from_hex(0x111122);
+    let acc      = Color::from_hex(0x6C8EFF);
+    let text     = Color::from_hex(0xE8E8E8);
+    let dim      = Color::from_hex(0x666688);
+    let sel_bg   = Color::from_hex(0x1E1E40);
+    let cur_wp   = desktop::WALLPAPER.load(core::sync::atomic::Ordering::Relaxed);
+
+    // Content background
+    display.fill_rect(wx, wy, ww, wh, bg);
+
+    // ── Left sidebar ─────────────────────────────────────────────────────────
+    const SB_W: usize = 110;
+    display.fill_rect(wx, wy, SB_W, wh, sidebar);
+    display.fill_rect(wx + SB_W, wy, 1, wh, Color::from_hex(0x2A2A50)); // divider
+
+    // "Settings" header in sidebar
+    display.draw_text(wx + 8, wy + 10, "Settings", acc, 1);
+    display.fill_rect(wx, wy + 24, SB_W, 1, Color::from_hex(0x2A2A50));
+
+    // Only item: "Background" — always selected
+    display.fill_rect(wx + 2, wy + 30, SB_W - 4, 22, sel_bg);
+    display.fill_rect(wx, wy + 30, 3, 22, acc); // accent left bar
+    display.draw_text(wx + 10, wy + 37, "Background", text, 1);
+
+    // ── Right panel ──────────────────────────────────────────────────────────
+    let px = wx + SB_W + 1; // panel left edge
+    let pw = ww.saturating_sub(SB_W + 1);
+
+    display.draw_text(px + 12, wy + 10, "Background", acc, 1);
+    display.draw_text(px + 12, wy + 24, "Choose your desktop background", dim, 1);
+    display.fill_rect(px, wy + 38, pw, 1, Color::from_hex(0x2A2A50));
+
+    // Wallpaper thumbnails — two side by side
+    const TW: usize = 120;  // thumb width
+    const TH: usize = 80;   // thumb height
+    const TGAP: usize = 16;
+    let ty0 = wy + 50;
+
+    let thumbs: &[(&str, u8)] = &[
+        ("Dark Space", desktop::WP_DARK),
+        ("Bliss",      desktop::WP_BLISS),
+    ];
+
+    for (i, &(label, wp_id)) in thumbs.iter().enumerate() {
+        let tx = px + 12 + i * (TW + TGAP);
+
+        // Thumb border — accent if selected
+        let border = if cur_wp == wp_id { acc } else { Color::from_hex(0x333355) };
+        display.fill_rect(tx.saturating_sub(2), ty0.saturating_sub(2), TW + 4, TH + 4, border);
+
+        // Thumbnail preview
+        if wp_id == desktop::WP_DARK {
+            // Mini dark gradient + a couple of stars
+            for dy in 0..TH {
+                let t = dy as i32; let n = TH as i32;
+                let r = ((0x0D*(n-t) + 0x07*t) / n) as u8;
+                let g = ((0x1F*(n-t) + 0x07*t) / n) as u8;
+                let b = ((0x40*(n-t) + 0x10*t) / n) as u8;
+                display.fill_rect(tx, ty0 + dy, TW, 1, Color { r, g, b });
+            }
+            // Dot stars
+            for &(sx, sy) in &[(10usize,8usize),(40,15),(80,5),(105,22),(55,35),(20,50),(90,60)] {
+                if sx < TW && sy < TH {
+                    display.put_pixel_pub(tx + sx, ty0 + sy, Color { r:180, g:180, b:220 });
+                }
+            }
+        } else {
+            // Mini Bliss: blue sky top half, green bottom half
+            let sky_h = TH * 55 / 100;
+            let (str_, stg, stb) = (0x27_i32, 0x76_i32, 0xD0_i32);
+            let (shr, shg, shb) = (0x8B_i32, 0xCE_i32, 0xF4_i32);
+            for dy in 0..sky_h {
+                let t = dy as i32; let n = sky_h as i32;
+                let r = ((str_*(n-t) + shr*t) / n.max(1)) as u8;
+                let g = ((stg*(n-t)  + shg*t) / n.max(1)) as u8;
+                let b = ((stb*(n-t)  + shb*t) / n.max(1)) as u8;
+                display.fill_rect(tx, ty0 + dy, TW, 1, Color { r, g, b });
+            }
+            // Green hills at bottom
+            display.fill_rect(tx, ty0 + sky_h, TW, TH - sky_h, Color::from_hex(0x5A8C32));
+            // Far hill bump
+            let bx = tx + TW / 4; let by_h = sky_h.saturating_sub(6);
+            display.fill_rect(bx, ty0 + by_h, TW / 2, 7, Color::from_hex(0x6BA239));
+        }
+
+        // Label below thumbnail
+        let lx = tx + TW / 2 - label.len() * 4;
+        display.draw_text(lx, ty0 + TH + 6, label, if cur_wp == wp_id { acc } else { dim }, 1);
+    }
 }

@@ -31,6 +31,12 @@ pub mod pal {
 pub const TITLE_H:    usize = 22;
 pub const TASKBAR_H:  usize = 32;
 
+// ── Wallpaper ─────────────────────────────────────────────────────────────────
+pub const WP_DARK:  u8 = 0;
+pub const WP_BLISS: u8 = 1;
+pub static WALLPAPER: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(WP_DARK);
+
 // ── Desktop icons ─────────────────────────────────────────────────────────────
 // Each icon: 48×48 box + 8px gap + 8px text label = 64px slot, 80px stride.
 const ICON_SIZE:   usize = 48;
@@ -44,6 +50,7 @@ const ICONS: &[IconDef] = &[
     IconDef { win_id: 2, label: "Terminal", color: Color::from_hex(0x2EA84A) },
     IconDef { win_id: 3, label: "Editor",   color: Color::from_hex(0x9B5CE5) },
     IconDef { win_id: 4, label: "Sysmon",   color: Color::from_hex(0x20B8B0) },
+    IconDef { win_id: 5, label: "Settings", color: Color::from_hex(0x888888) },
 ];
 
 fn icon_rect(slot: usize) -> (i32, i32, usize, usize) {
@@ -191,8 +198,10 @@ pub struct Desktop {
     pub prev_cx:          i32,
     pub prev_cy:          i32,
     pub start_menu_open:  bool,
-    dbl_click_pending:    Option<usize>,  // Some(id) = waiting for 2nd click on same title bar
-    pub snap_zone:        Option<SnapZone>, // active snap target while dragging
+    dbl_click_pending:    Option<usize>,
+    pub snap_zone:        Option<SnapZone>,
+    pub context_menu:     Option<(i32, i32)>, // Some(x,y) = right-click menu position
+    pub open_settings_requested: bool,
 }
 
 impl Desktop {
@@ -202,6 +211,7 @@ impl Desktop {
             fb_w, fb_h, prev_btn: 0, dirty: true, mouse_dirty: false,
             prev_cx: 0, prev_cy: 0, start_menu_open: false,
             dbl_click_pending: None, snap_zone: None,
+            context_menu: None, open_settings_requested: false,
         }
     }
 
@@ -262,6 +272,7 @@ impl Desktop {
             self.prev_cx = mx;
             self.prev_cy = my;
         }
+        let right_clicked = buttons & 0x02 != 0 && self.prev_btn & 0x02 == 0;
         let clicked  = buttons & 0x01 != 0 && self.prev_btn & 0x01 == 0;
         let released = buttons & 0x01 == 0 && self.prev_btn & 0x01 != 0;
         let held     = buttons & 0x01 != 0;
@@ -329,7 +340,33 @@ impl Desktop {
             }
         }
 
+        // Right-click on desktop (not on a window or taskbar) → open context menu
+        if right_clicked {
+            let in_taskbar = my >= self.fb_h as i32 - TASKBAR_H as i32;
+            let on_window  = !in_taskbar && self.windows.iter().rev().any(|w| {
+                !w.minimized && (w.close_hit(mx, my) || w.maximize_hit(mx, my)
+                    || w.newterm_hit(mx, my) || w.title_hit(mx, my)
+                    || w.resize_hit(mx, my) || w.content_hit(mx, my))
+            });
+            if !on_window && !in_taskbar {
+                self.context_menu     = Some((mx, my));
+                self.start_menu_open  = false;
+                self.dirty            = true;
+            }
+        }
+
         if !clicked { return false; }
+
+        // Left-click dismisses context menu; handle the item first if clicked on it.
+        if self.context_menu.is_some() {
+            let item = self.context_menu_item_at(mx, my);
+            self.context_menu = None;
+            self.dirty = true;
+            if item == Some(0) {
+                self.open_settings_requested = true;
+            }
+            return false;
+        }
 
         // Double-click tracking: clear pending unless we land on the same title bar again
         let prev_dbl = self.dbl_click_pending.take();
@@ -474,25 +511,29 @@ impl Desktop {
 
     // ── Rendering ─────────────────────────────────────────────────────────────
 
-    /// Vertical gradient (navy top → near-black bottom) + deterministic stars.
     fn draw_wallpaper(&self, display: &mut Display) {
+        match WALLPAPER.load(core::sync::atomic::Ordering::Relaxed) {
+            WP_BLISS => self.draw_bliss(display),
+            _        => self.draw_dark_gradient(display),
+        }
+    }
+
+    /// Dark navy gradient + deterministic star field.
+    fn draw_dark_gradient(&self, display: &mut Display) {
         let w = display.width();
         let h = display.height();
-        // Gradient: deep navy (0x0D,0x1F,0x40) → near-black indigo (0x07,0x07,0x10)
         let (tr, tg, tb) = (0x0D_i32, 0x1F_i32, 0x40_i32);
         let (br, bg, bb) = (0x07_i32, 0x07_i32, 0x10_i32);
         let n = h as i32;
         for y in 0..h {
             let t = y as i32;
-            let r = ((tr * (n - t) + br * t) / n) as u8;
-            let g = ((tg * (n - t) + bg * t) / n) as u8;
-            let b = ((tb * (n - t) + bb * t) / n) as u8;
+            let r = ((tr * (n-t) + br * t) / n) as u8;
+            let g = ((tg * (n-t) + bg * t) / n) as u8;
+            let b = ((tb * (n-t) + bb * t) / n) as u8;
             display.fill_rect(0, y, w, 1, Color { r, g, b });
         }
-        // Deterministic stars — LCG stepped over a 16px grid
         let mut rng = 0x9E3779B9u32;
-        let cols = w / 16;
-        let rows = h / 16;
+        let cols = w / 16; let rows = h / 16;
         for sy in 0..rows {
             for sx in 0..cols {
                 rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
@@ -504,6 +545,63 @@ impl Desktop {
                         display.put_pixel_pub(px, py, Color { r: bright, g: bright, b: bright });
                     }
                 }
+            }
+        }
+    }
+
+    /// Parabolic sine approximation: ang in 0..256 → result in -1024..1024.
+    fn isin(ang: i32) -> i32 {
+        let neg = ang & 128 != 0;
+        let a   = ang & 127;
+        let v   = a * (128 - a) / 4; // peak at a=64: 64*64/4 = 1024
+        if neg { -v } else { v }
+    }
+
+    /// Windows-XP-Bliss-style wallpaper: blue sky gradient + two green hill layers.
+    fn draw_bliss(&self, display: &mut Display) {
+        let w = display.width();
+        let h = display.height();
+
+        // Sky gradient: #2776D0 (top) → #8BCEF4 (horizon at 60%)
+        let horizon = h * 60 / 100;
+        let (str_, stg, stb) = (0x27_i32, 0x76_i32, 0xD0_i32);
+        let (shr, shg, shb) = (0x8B_i32, 0xCE_i32, 0xF4_i32);
+        for y in 0..h {
+            let t  = y.min(horizon) as i32;
+            let n  = horizon as i32;
+            let r  = ((str_ * (n-t) + shr * t) / n.max(1)) as u8;
+            let g  = ((stg  * (n-t) + shg * t) / n.max(1)) as u8;
+            let b  = ((stb  * (n-t) + shb * t) / n.max(1)) as u8;
+            display.fill_rect(0, y, w, 1, Color { r, g, b });
+        }
+
+        // Far hills: base at 57%, amplitude 9%, ~1.5 sine cycles
+        let far_base = h * 57 / 100;
+        let far_amp  = h * 9  / 100;
+        // Near hills: base at 70%, amplitude 8%, ~1 cycle (offset phase)
+        let near_base = h * 70 / 100;
+        let near_amp  = h * 8  / 100;
+
+        for x in 0..w {
+            // Far hills
+            let ang_f  = (x * 192 / w.max(1)) as i32;
+            let hy_f   = (far_base as i32  + far_amp  as i32 * Self::isin(ang_f)  / 1024)
+                            .max(0).min(h as i32 - 1) as usize;
+            // Near hills (different frequency + phase shift)
+            let ang_n  = (x * 128 / w.max(1) + 32) as i32;
+            let hy_n   = (near_base as i32 + near_amp as i32 * Self::isin(ang_n) / 1024)
+                            .max(0).min(h as i32 - 1) as usize;
+
+            // Far grass column (from hy_f down to hy_n or bottom)
+            let grass_far_bot = hy_n.min(h);
+            if hy_f < grass_far_bot {
+                display.fill_rect(x, hy_f, 1, grass_far_bot - hy_f,
+                    Color::from_hex(0x6BA239));
+            }
+            // Near grass column (from hy_n to bottom)
+            if hy_n < h {
+                display.fill_rect(x, hy_n, 1, h - hy_n,
+                    Color::from_hex(0x4E8C27));
             }
         }
     }
@@ -628,6 +726,46 @@ impl Desktop {
         let time = crate::rtc::fmt_time(&mut tbuf);
         let tw   = time.len() * 9;
         display.draw_text(self.fb_w.saturating_sub(tw + 8), ty + 10, time, pal::TEXT, 1);
+    }
+
+    /// Draw right-click context menu if one is open.
+    pub fn draw_context_menu(&self, display: &mut Display) {
+        let (cx, cy) = match self.context_menu {
+            Some(p) => p,
+            None    => return,
+        };
+        const CM_W: usize = 168;
+        const ITEM_H: usize = 26;
+        const CM_H: usize = ITEM_H + 8; // 1 item + padding
+        // Clamp so it stays on screen
+        let x = (cx as usize).min(self.fb_w.saturating_sub(CM_W));
+        let y = (cy as usize).min(self.fb_h.saturating_sub(CM_H + TASKBAR_H));
+        // Shadow
+        display.fill_rect(x + 3, y + 3, CM_W, CM_H, Color::from_hex(0x000000));
+        // Background + border
+        display.fill_rect(x, y, CM_W, CM_H, pal::MENU_BG);
+        display.fill_rect(x, y, CM_W, 1, pal::MENU_BORDER);
+        display.fill_rect(x, y + CM_H - 1, CM_W, 1, pal::MENU_BORDER);
+        display.fill_rect(x, y, 1, CM_H, pal::MENU_BORDER);
+        display.fill_rect(x + CM_W - 1, y, 1, CM_H, pal::MENU_BORDER);
+        // Item: "Change background"
+        display.draw_text(x + 10, y + 8, "Change background", pal::TEXT, 1);
+    }
+
+    /// Context-menu item hit-test.  Returns Some(item_index) if (mx,my) is inside
+    /// the menu and on a valid item.
+    pub fn context_menu_item_at(&self, mx: i32, my: i32) -> Option<usize> {
+        let (cx, cy) = self.context_menu?;
+        const CM_W: i32 = 168;
+        const ITEM_H: i32 = 26;
+        const CM_H: i32 = ITEM_H + 8;
+        let x = (cx as usize).min(self.fb_w.saturating_sub(CM_W as usize)) as i32;
+        let y = (cy as usize).min(self.fb_h.saturating_sub((CM_H as usize) + TASKBAR_H)) as i32;
+        if mx >= x && mx < x + CM_W && my >= y + 4 && my < y + 4 + ITEM_H {
+            Some(0) // only one item for now
+        } else {
+            None
+        }
     }
 
     /// Draw the start menu popup. Call BEFORE draw_taskbar so taskbar renders on top.
