@@ -1,7 +1,7 @@
 # HepOS — Design Reference & Roadmap
 
 > **Purpose:** Authoritative reference for HepOS. Survives context compaction.
-> **Last updated:** 2026-07-04
+> **Last updated:** 2026-07-05
 
 ---
 
@@ -108,8 +108,10 @@ qemu-system-x86_64
 
 ## Boot Sequence
 
+**OVMF** = the QEMU-targeted build of **TianoCore/EDK2** (the open-source reference UEFI firmware). It's what runs before HepBL — POSTs the virtual hardware, sets up UEFI boot/runtime services, switches to long mode, then loads `\EFI\BOOT\BOOTX64.EFI` (HepBL) off the ESP. TianoCore's job ends the moment `ExitBootServices` succeeds inside HepBL.
+
 ```
-OVMF (UEFI) → HepBL (\EFI\BOOT\BOOTX64.EFI)
+OVMF (TianoCore/EDK2 UEFI firmware) → HepBL (\EFI\BOOT\BOOTX64.EFI)
  a. GOP mode select (prefers 1280x800 / 1024x768)
  b. Load + parse \kernel.elf (ELF64, PT_LOAD → allocated pages)
  c. Page tables: identity 0..4GiB (transitional) + HHDM at 0xffff800000000000
@@ -542,8 +544,8 @@ Lines stored as `[Cell; MAX_COLS]` — no per-line allocation. `self.cols` is up
 |------|-------|
 | RAM | 256 MB |
 | NVMe disk | 512 MB raw (`hepos_disk.img`) |
-| NVMe BAR | 0xFEBD4000 |
-| e1000 BAR | 0xFEBC0000 |
+| NVMe BAR | Assigned dynamically by OVMF's PCI allocator (observed 0xC000004000 — well above 4GiB, despite `X-PciMmio64Mb=0`); `map_mmio` handles it fine since `map_page`'s PML4 walker creates whatever intermediate tables the address needs, not just the ones from the initial HHDM build |
+| e1000 BAR | Also OVMF-assigned, varies by boot |
 | e1000 MAC | 52:54:00:12:34:56 |
 | SLiRP gateway | 10.0.2.2, MAC 52:55:0a:00:02:02 |
 | Static IP | 10.0.2.15 / 255.255.255.0 |

@@ -18,9 +18,14 @@ HepOS is an **exokernel**: the kernel only multiplexes hardware (memory, storage
 - **NVMe driver** — admin + IO queues, custom queue management
 - **Networking** — RTL8139/e1000 drivers, ARP, ICMP ping (TX works; RX broken on QEMU/Windows SLiRP)
 - **Sysmon window** — live RAM bar, uptime, PCI device list, storage/net status
+- **Settings app** — background picker (dark gradient / Windows-XP-style Bliss), right-click desktop for a context menu
 - **Preemptive scheduler** — round-robin, APIC timer, context switch in naked asm
 - **x2APIC** — MSR-mode APIC (no MMIO mapping needed)
 - **PS/2 keyboard** — full scancode set 1, shift/caps/ctrl, extended keys
+- **Ring-3 userspace** — SYSCALL/SYSRET, per-process page tables, ELF loader, `exec`/`ps` from the shell
+- **HepBL** — our own UEFI bootloader, written from scratch in Rust (no Limine, no external bootloader crates)
+- **Networking** — hand-written TCP stack, DNS resolver, `wget <host>[:<port>]` HTTP client
+- **Intel HDA audio** — `beep [hz] [ms]` via a real DMA PCM stream
 
 ---
 
@@ -33,17 +38,24 @@ HepOS is an **exokernel**: the kernel only multiplexes hardware (memory, storage
 ├─────────────────────────────────────────────────────────┤
 │  Kernel                                                 │
 │  PMM · VMM · Heap · GDT · IDT · APIC · Scheduler       │
+│  Syscall gate · Per-process page tables · ELF loader    │
 ├────────────┬────────────┬────────────┬──────────────────┤
 │  Storage   │  Display   │  Input     │  Network         │
-│  NVMe      │  GOP FB    │  PS/2 kbd  │  RTL8139         │
-│  HepFS     │  SW render │  XHCI USB  │  e1000           │
+│  NVMe      │  GOP FB    │  PS/2 kbd  │  RTL8139 / e1000 │
+│  HepFS     │  SW render │  XHCI USB  │  TCP/DNS/wget    │
 └────────────┴────────────┴────────────┴──────────────────┘
-Hardware: x86_64, BIOS boot via Limine v9
+        ↑ handed off from kernel.elf's entry point
+┌─────────────────────────────────────────────────────────┐
+│  HepBL — our own UEFI bootloader (hepbl/, pure Rust)    │
+│  GOP mode select · ELF64 loader · page tables + HHDM    │
+└─────────────────────────────────────────────────────────┘
+        ↑ loaded from \EFI\BOOT\BOOTX64.EFI
+Hardware: x86_64, UEFI boot (OVMF/TianoCore firmware under QEMU)
 ```
 
 **Language:** Rust nightly (`no_std` + `alloc`)  
-**Bootloader:** [Limine](https://github.com/limine-bootloader/limine) v9.x (BIOS + UEFI)  
-**Target:** `x86_64-unknown-none`
+**Bootloader:** [HepBL](hepbl/) — written from scratch for this project, in Rust, UEFI-only  
+**Target:** `x86_64-unknown-none` (kernel), `x86_64-unknown-uefi` (bootloader)
 
 ---
 
@@ -55,10 +67,12 @@ Hardware: x86_64, BIOS boot via Limine v9
 |------|-------------|
 | Rust (nightly) | https://rustup.rs — then `rustup toolchain install nightly` |
 | `x86_64-unknown-none` target | `rustup target add x86_64-unknown-none` |
+| `x86_64-unknown-uefi` target | `rustup target add x86_64-unknown-uefi --toolchain nightly` (build.ps1 also adds this automatically) |
 | rust-src component | `rustup component add rust-src --toolchain nightly` |
-| MSYS2 (for xorriso) | https://www.msys2.org — then `pacman -S xorriso` in MSYS2 |
-| QEMU | https://www.qemu.org/download/#windows — install to `C:\Program Files\qemu\` |
+| QEMU | https://www.qemu.org/download/#windows — install to `C:\Program Files\qemu\` (ships with OVMF/edk2 firmware, used automatically) |
 | Git | https://git-scm.com |
+
+> MSYS2/xorriso are **no longer needed** — HepOS dropped the ISO + Limine pipeline in favor of HepBL + a plain FAT boot directory that QEMU mounts directly.
 
 ### Linux (Debian/Ubuntu)
 
@@ -67,10 +81,11 @@ Hardware: x86_64, BIOS boot via Limine v9
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 rustup toolchain install nightly
 rustup target add x86_64-unknown-none
+rustup target add x86_64-unknown-uefi --toolchain nightly
 rustup component add rust-src --toolchain nightly
 
 # Build tools
-sudo apt install xorriso qemu-system-x86 gcc git make
+sudo apt install qemu-system-x86 ovmf gcc git make
 ```
 
 ### Linux (Arch)
@@ -78,10 +93,13 @@ sudo apt install xorriso qemu-system-x86 gcc git make
 ```bash
 rustup toolchain install nightly
 rustup target add x86_64-unknown-none
+rustup target add x86_64-unknown-uefi --toolchain nightly
 rustup component add rust-src --toolchain nightly
 
-sudo pacman -S xorriso qemu-system-x86 gcc git make
+sudo pacman -S qemu-system-x86 edk2-ovmf gcc git make
 ```
+
+> **Note:** `build.sh`'s OVMF auto-detection currently looks for `edk2-x86_64-code.fd` next to the `qemu-system-x86_64` binary (matching the bundled Windows QEMU package layout this project was developed against). Native Debian/Arch OVMF packages install to `/usr/share/OVMF/` or `/usr/share/edk2-ovmf/` with different filenames — if the script can't find the firmware, point `CODE_FD`/`VARS_FD` in `build.sh` at your distro's actual OVMF paths.
 
 ---
 
@@ -92,10 +110,9 @@ sudo pacman -S xorriso qemu-system-x86 gcc git make
 ```bash
 git clone https://github.com/The-Hep-Group/HepOS.git
 cd HepOS
-git clone https://github.com/limine-bootloader/limine.git --branch=v9.x-binary --depth=1 limine
 ```
 
-> The `limine/` directory (bootloader binaries) is not committed to the repo — extra clone needed (done in above).
+No submodules or extra clones needed — HepBL replaced Limine, so there's no external bootloader binary to fetch.
 
 ### Windows
 
@@ -104,13 +121,14 @@ git clone https://github.com/limine-bootloader/limine.git --branch=v9.x-binary -
 ```
 
 That's it. The script:
-1. Builds the kernel with `cargo +nightly build --release`
-2. Assembles the ISO with xorriso (from MSYS2)
-3. Installs the Limine BIOS stage onto the ISO
-4. Creates `hepos_disk.img` (512 MB NVMe image) if missing
-5. Launches QEMU
+1. Builds the userspace workspace, then the kernel (`cargo +nightly build --release`)
+2. Builds HepBL, our own UEFI bootloader (`hepbl/`, target `x86_64-unknown-uefi`)
+3. Assembles an `esp/` directory: `EFI/BOOT/BOOTX64.EFI` (HepBL) + `kernel.elf`
+4. Copies OVMF firmware (ships with QEMU) and creates a writable NVRAM file (`hepbl_vars.fd`) if missing
+5. Creates `hepos_disk.img` (512 MB NVMe image) if missing
+6. Launches QEMU, booting UEFI → HepBL → HepOS
 
-**Requirements:** MSYS2 must be at `C:\msys64\` and QEMU at `C:\Program Files\qemu\`.
+**Requirements:** QEMU at `C:\Program Files\qemu\` (its bundled `share/edk2-x86_64-code.fd` is used as the UEFI firmware).
 
 ### Linux
 
@@ -119,7 +137,7 @@ chmod +x build.sh
 ./build.sh
 ```
 
-The script does the same steps as the Windows one. On Linux it also compiles the `limine` installer tool from the included `limine/limine.c` source (`make -C limine` runs automatically if the binary is missing).
+Same steps as the Windows script.
 
 ### Build only (no QEMU launch)
 
@@ -139,19 +157,23 @@ Output: `kernel/target/x86_64-unknown-none/release/hepos-kernel`
 
 ## QEMU Command (manual)
 
-If you want to run a pre-built ISO without the build script:
+If you want to run a pre-built `esp/` directory without the build script:
 
 ```bash
 qemu-system-x86_64 \
   -M q35 \
   -cpu qemu64,+x2apic \
   -m 256M \
-  -cdrom hepos.iso \
-  -boot d \
+  -drive if=pflash,format=raw,readonly=on,file=edk2-x86_64-code.fd \
+  -drive if=pflash,format=raw,file=hepbl_vars.fd \
+  -drive format=raw,file=fat:rw:esp \
+  -fw_cfg name=opt/ovmf/X-PciMmio64Mb,string=0 \
   -drive file=hepos_disk.img,if=none,id=nvme0,format=raw \
   -device nvme,serial=heposv1,drive=nvme0 \
   -netdev user,id=net0 \
   -device rtl8139,netdev=net0 \
+  -device intel-hda \
+  -device hda-duplex \
   -device qemu-xhci,id=xhci \
   -device usb-tablet,bus=xhci.0 \
   -vga std \
@@ -161,8 +183,9 @@ qemu-system-x86_64 \
   -no-shutdown
 ```
 
+> `-drive format=raw,file=fat:rw:esp` mounts the `esp/` directory as a virtual FAT disk (QEMU's VVFAT) — no ISO or disk image needed for booting; just drop files into `esp/EFI/BOOT/` and `esp/kernel.elf`.  
 > `-device usb-tablet` gives absolute mouse coordinates via XHCI — the mouse works out of the box without grabbing.  
-> `-serial stdio` prints kernel debug output (boot messages, panics) to your terminal.
+> `-serial stdio` prints kernel debug output (boot messages, panics) to your terminal — this also captures HepBL's own boot log (GOP mode pick, kernel load, page table setup) before the kernel takes over.
 
 ---
 
@@ -226,63 +249,73 @@ HepOS/
 ├── kernel/
 │   ├── src/
 │   │   ├── main.rs        # kmain, task_blink, global state, window rendering
-│   │   ├── desktop.rs     # WM: windows, taskbar, start menu, compositor
+│   │   ├── bootinfo.rs    # HepBL boot protocol structs (kept in sync with hepbl/src/main.rs)
+│   │   ├── desktop.rs     # WM: windows, taskbar, start menu, compositor, wallpaper, context menu
 │   │   ├── terminal.rs    # Shell with 30+ commands, tab completion
 │   │   ├── editor.rs      # Text editor with find mode
 │   │   ├── hepfs.rs       # Custom filesystem (flat inode, 4 KB blocks, indirect blocks)
-│   │   ├── framebuffer.rs # GOP pixel renderer, 8×8 bitmap font
+│   │   ├── framebuffer.rs # Pixel renderer, 8×8 bitmap font, built from HepBL's BootInfo
 │   │   ├── nvme.rs        # NVMe host controller driver
 │   │   ├── xhci.rs        # XHCI USB host controller, USB HID tablet
 │   │   ├── ps2.rs         # PS/2 keyboard (scancode set 1 + extended)
 │   │   ├── apic.rs        # x2APIC timer (MSR mode)
 │   │   ├── scheduler.rs   # Preemptive round-robin, context switch
-│   │   ├── pmm.rs         # Bitmap physical memory manager
-│   │   ├── heap.rs        # Bump allocator (GlobalAlloc)
+│   │   ├── pmm.rs         # Bitmap physical memory manager (reads HepBL's memory map)
+│   │   ├── heap.rs        # Slab allocator (GlobalAlloc), full dealloc
 │   │   ├── pci.rs         # PCI config-space enumeration
-│   │   ├── net.rs         # ARP + ICMP stack
+│   │   ├── net.rs         # ARP, ICMP, IP, TCP, DNS resolver, HTTP GET (wget)
 │   │   ├── rtl8139.rs     # RTL8139 NIC driver
 │   │   ├── e1000.rs       # Intel e1000 NIC driver
+│   │   ├── syscall.rs     # SYSCALL/SYSRET gate, dispatcher
+│   │   ├── process.rs     # Ring-3 process table, user PML4, exec/ps
+│   │   ├── elf.rs         # ELF64 loader
+│   │   ├── hda.rs         # Intel HDA driver — beep() via DMA PCM stream
 │   │   └── ...            # gdt, idt, vmm, paging, rtc, serial, panic
-│   ├── linker.ld          # Custom linker script (Limine-compatible)
+│   ├── linker.ld          # Custom linker script (higher-half, ENTRY(kmain))
 │   ├── build.rs           # Emits linker script path (cross-platform)
 │   └── Cargo.toml
-├── bootloader/
-│   └── limine.conf        # Boot entry: loads /boot/hepos-kernel
-├── limine/                # Limine v9.x binary release (committed)
-│   ├── limine-bios.sys    # BIOS stage 2
-│   ├── limine-bios-cd.bin # El Torito BIOS boot image
-│   ├── limine-uefi-cd.bin # El Torito UEFI boot image
-│   ├── BOOTX64.EFI        # UEFI application
-│   ├── limine.exe         # Windows installer tool
-│   ├── limine.c           # Installer source (compiled on Linux by build.sh)
-│   └── Makefile           # Builds limine installer on Linux/macOS
-├── build.ps1              # Windows: build + launch QEMU
-├── build.sh               # Linux: build + launch QEMU
+├── hepbl/                 # HepBL — our own UEFI bootloader, written from scratch
+│   ├── src/main.rs        # Hand-written UEFI FFI, GOP mode select, ELF64 loader,
+│   │                      # page table + HHDM builder, ExitBootServices, asm handoff
+│   └── Cargo.toml         # No dependencies
+├── userspace/              # Ring-3 workspace (hepos-rt, hepos-std, hello demo)
+├── build.ps1              # Windows: build + assemble ESP + launch QEMU
+├── build.sh               # Linux: same
 └── PLAN.md                # Architecture reference and development roadmap
 ```
 
 ---
 
-## Limine Bootloader
+## HepBL — Our Own Bootloader
 
-HepOS uses [Limine](https://github.com/limine-bootloader/limine) v9.x as its bootloader.
+Earlier versions of HepOS used [Limine](https://github.com/limine-bootloader/limine). It has since been fully replaced by **HepBL**, a UEFI bootloader written from scratch for this project in `hepbl/`.
 
-**The `limine/` directory contains pre-compiled binary blobs only** — there is no bootloader assembly source in this repository. Limine's source code (which is written in C and x86 assembly) lives in the main Limine repository on a different branch.
+**Why UEFI-only, and (almost) no assembly:** a UEFI application already runs in 64-bit long mode when the firmware hands it control, so there's no need to hand-roll real-mode → protected-mode → long-mode transitions the way a BIOS bootloader would. That leaves HepBL free to be ordinary Rust almost everywhere — the UEFI FFI (`extern "efiapi"` function pointers, hand-written from the UEFI spec, no external crate) reads like any other FFI call. The **entire assembly footprint is five instructions**, at the very end of `efi_main_inner`:
 
-The files committed here are from Limine's `v9.x-binary` release branch:
+```rust
+core::arch::asm!(
+    "cli",
+    "mov cr3, {pml4}",   // switch to HepBL's page tables
+    "mov rsp, {stack}",  // switch to the kernel's stack
+    "xor rbp, rbp",
+    "jmp {entry}",       // jump to kernel.elf's entry point
+    pml4 = in(reg) pml4, stack = in(reg) stack_top, entry = in(reg) entry,
+    in("rdi") bi_virt,   // RDI = &BootInfo, per the SysV calling convention
+    options(noreturn),
+);
+```
 
-| File | Purpose |
-|------|---------|
-| `limine-bios.sys` | BIOS stage 2 — loaded by the boot sector, sets up Limine protocol |
-| `limine-bios-cd.bin` | El Torito boot image for BIOS CD boot |
-| `limine-uefi-cd.bin` | El Torito boot image for UEFI CD boot |
-| `BOOTX64.EFI` | UEFI application (x86\_64) |
-| `limine.exe` | Windows tool: installs BIOS stage onto a disk/ISO |
-| `limine.c` + `Makefile` | Source to compile the installer on Linux/macOS |
+What HepBL does before that handoff:
+1. Locates the **GOP** (Graphics Output Protocol) and picks the best available video mode (prefers 1280×800, then 1024×768)
+2. Reads `\kernel.elf` off the boot volume via **SimpleFileSystem**
+3. Parses the ELF64 header and `PT_LOAD` segments, allocating and mapping each one
+4. Builds its own page tables: an HHDM (higher-half direct map) of physical memory at `0xffff800000000000`, using 4 KiB pages throughout (so the kernel's own `map_page`/`map_mmio` can walk and extend them later), plus a transitional identity map that the kernel clears during early boot
+5. Reads the UEFI memory map, calls `ExitBootServices`
+6. Hands off via the 5-instruction asm block above, passing a `BootInfo` struct (framebuffer info, HHDM offset, memory map) in `RDI`
 
-The kernel communicates with Limine at boot time via the **Limine boot protocol** — a set of request/response structs placed in special ELF sections. Limine reads these before jumping to `kmain`, fills in the responses (framebuffer address, HHDM offset, memory map, etc.), and hands off execution.
+The `BootInfo` protocol is defined twice — once in `hepbl/src/main.rs`, once in `kernel/src/bootinfo.rs` — and the two must be kept in sync by hand (no shared crate; HepBL and the kernel target different platforms, `x86_64-unknown-uefi` vs `x86_64-unknown-none`).
 
-If you want to read Limine's assembly: `git clone https://github.com/limine-bootloader/limine --branch=v9.x-release-binary` and look at the `common/` and `stage2/` directories.
+Before HepBL runs, **OVMF** (the QEMU build of [TianoCore/EDK2](https://github.com/tianocore/edk2), the open-source reference UEFI firmware) does the actual hardware POST and sets up UEFI boot/runtime services — TianoCore's job ends the moment `ExitBootServices` succeeds inside HepBL.
 
 ---
 
