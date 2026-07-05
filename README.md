@@ -323,11 +323,11 @@ Before HepBL runs, **OVMF** (the QEMU build of [TianoCore/EDK2](https://github.c
 
 | Issue | Status |
 |-------|--------|
-| Network RX broken on QEMU/Windows | QEMU SLiRP issue — TX works fine; test on Linux/KVM for full networking |
-| Heap cannot free memory | Bump allocator by design — slab allocator planned |
 | Files max ~4.1 MB | Single indirect block only — double indirect not yet implemented |
 | Terminal doesn't reflow text on resize | Column count adapts for new input; existing output stays at old width |
 | ACPI shutdown only works on QEMU | Hardcoded port 0x604 (QEMU PIIX4) — real hardware needs FADT parsing |
+| NVMe size reported as 0 MB | Identify Namespace command hangs; workaround: hardcoded 512B/block |
+| PCI BAR addresses vary by boot | OVMF's PCI allocator assigns them dynamically (not fixed like under BIOS/Limine); `map_mmio` handles any address transparently |
 
 ---
 
@@ -336,12 +336,11 @@ Before HepBL runs, **OVMF** (the QEMU build of [TianoCore/EDK2](https://github.c
 See [PLAN.md](PLAN.md) for the full architecture reference and prioritised next-steps list.
 
 High-level upcoming work:
-- Syscall interface (SYSCALL/SYSRET) + per-process page tables
-- ELF loader → userspace processes
-- `std` shim → unlock Rust crates
-- Slab allocator (free memory)
-- Intel HDA audio
+- `std` shim — enough of `std` (alloc/io/fs stubs) for external Rust crates to link
 - Double-indirect blocks (files up to ~4 GB)
+- General-purpose UDP stack
+- RTL8169 / real-hardware NIC support
+- Image viewer, audio player, more Settings pages
 
 ---
 
