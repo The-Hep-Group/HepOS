@@ -22,30 +22,24 @@ const IR:       usize = 0x64; // u32 – Immediate Response
 const IRS:      usize = 0x68; // u16 – Immediate Response Status
 
 // ── Stream descriptor register offsets (relative to stream base) ─────────────
-const SD_CTL:   usize = 0x00; // u32 – Control + Status (bytes 0-3)
-const SD_CBL:   usize = 0x08; // u32 – Cyclic Buffer Length
-const SD_LVI:   usize = 0x0C; // u16 – Last Valid Index (= BDL entries - 1)
-const SD_FMT:   usize = 0x10; // u16 – Stream Format
-const SD_BDPL:  usize = 0x18; // u32 – BDL Lower Base Address
-const SD_BDPU:  usize = 0x1C; // u32 – BDL Upper Base Address
+const SD_CTL:  usize = 0x00;
+const SD_CBL:  usize = 0x08;
+const SD_LVI:  usize = 0x0C;
+const SD_FMT:  usize = 0x10;
+const SD_BDPL: usize = 0x18;
+const SD_BDPU: usize = 0x1C;
 
-// ── Stream descriptor control bits (byte 0 of SD_CTL) ────────────────────────
-const SD_CTL_SRST: u32 = 1 << 0; // stream reset
-const SD_CTL_RUN:  u32 = 1 << 1; // stream run
-const SD_CTL_IOCE: u32 = 1 << 2; // interrupt on completion enable
+const SD_CTL_SRST: u32 = 1 << 0;
+const SD_CTL_RUN:  u32 = 1 << 1;
+const SD_CTL_IOCE: u32 = 1 << 2;
 
-// ── BDL entry (Buffer Descriptor List) ───────────────────────────────────────
 #[repr(C)]
-struct BdlEntry {
-    addr: u64, // physical address of PCM buffer
-    len:  u32, // length in bytes
-    ioc:  u32, // bit 0 = interrupt on completion
-}
+struct BdlEntry { addr: u64, len: u32, ioc: u32 }
 
 // ── Driver state ──────────────────────────────────────────────────────────────
 struct Hda {
-    mmio:   *mut u8, // virtual MMIO base
-    sd_off: usize,   // byte offset of the output stream descriptor from mmio
+    mmio:   *mut u8,
+    sd_off: usize,
 }
 unsafe impl Send for Hda {}
 
@@ -275,10 +269,9 @@ pub fn init(devs: &[pci::PciDevice]) -> bool {
     }
     serial::print("HDA: codec detected\n");
 
-    // Read GCAP to find number of input streams (ISS)
-    let gcap  = r16(mmio, GCAP);
-    let iss   = ((gcap >> 8) & 0x0F) as usize; // input stream count
-    let sd_off = 0x80 + iss * 0x20;             // output stream 0 descriptor offset
+    let gcap   = r16(mmio, GCAP);
+    let iss    = ((gcap >> 8) & 0x0F) as usize;
+    let sd_off = 0x80 + iss * 0x20; // first output stream descriptor
 
     *HDA.lock() = Some(Hda { mmio, sd_off });
     serial::print("HDA: init OK\n");
@@ -288,131 +281,96 @@ pub fn init(devs: &[pci::PciDevice]) -> bool {
 // ── Beep ──────────────────────────────────────────────────────────────────────
 
 /// Play a square-wave beep at `freq_hz` for `duration_ms` milliseconds.
-/// Blocking: returns only after the audio DMA completes.
+///
+/// Stop strategy: after the tone duration, zero the DMA buffer IN-PLACE while
+/// the stream is still running.  QEMU's HDA timer reads guest memory each
+/// ~21 ms period, so the next read delivers silence to SDL.  We then wait
+/// 200 ms for SDL to drain before stopping the stream.  This adds 200 ms of
+/// inaudible tail but guarantees the tone stops cleanly regardless of SDL's
+/// internal buffer size.
+///
+/// The stop write preserves the stream-number field (bits [23:20]) so QEMU
+/// can match the running stream; writing 0 to those bits previously caused
+/// QEMU to look for "stream 0" (not running) and leave the stream active.
 pub fn beep(freq_hz: u32, duration_ms: u32) {
-    let guard = HDA.lock();
-    let hda = match guard.as_ref() {
-        Some(h) => h,
-        None    => return,
-    };
+    let guard  = HDA.lock();
+    let hda    = match guard.as_ref() { Some(h) => h, None => return };
     let mmio   = hda.mmio;
     let sd_off = hda.sd_off;
     drop(guard);
 
-    // Sample parameters: 48 kHz, 16-bit, stereo
-    let sample_rate: u32 = 48_000;
-    let bytes_per_sample: u32 = 4; // 2 ch × 2 bytes
-    let total_samples = (sample_rate * duration_ms) / 1000;
-    let buf_bytes = (total_samples * bytes_per_sample) as usize;
-
-    // Clamp to 1 MB (≈5.5 s at 48 kHz stereo 16-bit)
-    let buf_bytes = buf_bytes.min(1 << 20).max(4096);
+    let sample_rate:    u32 = 48_000;
+    let bytes_per_samp: u32 = 4; // stereo 16-bit
+    let total_samples = (sample_rate * duration_ms) / 1_000;
+    let buf_bytes = ((total_samples * bytes_per_samp) as usize).min(1 << 20).max(4096);
     let buf_pages = (buf_bytes + 4095) / 4096;
 
-    // Allocate physically contiguous PCM buffer
     let buf_phys = match pmm::alloc_contiguous(buf_pages) {
         Some(p) => p,
-        None    => { serial::print("HDA: OOM for PCM buffer\n"); return; }
+        None    => { serial::print("HDA: OOM\n"); return; }
     };
     let buf_virt = vmm::phys_to_virt(buf_phys) as *mut i16;
 
-    // Generate square wave: half-period at +0x7FFF, half at -0x7FFF
-    let period_samples = if freq_hz > 0 { sample_rate / freq_hz } else { 0 };
-    if period_samples > 0 {
-        let half = period_samples / 2;
-        for i in 0..(total_samples as usize).min(buf_bytes / bytes_per_sample as usize) {
-            let phase = (i as u32) % period_samples;
-            let val: i16 = if phase < half { 0x7FFF } else { -0x7FFF };
-            unsafe {
-                buf_virt.add(i * 2).write(val);       // left
-                buf_virt.add(i * 2 + 1).write(val);   // right
-            }
+    // Pre-zero so any unwritten tail is silent.
+    unsafe { core::ptr::write_bytes(buf_virt as *mut u8, 0, buf_bytes); }
+
+    // Generate square wave.
+    let period_samp = if freq_hz > 0 { sample_rate / freq_hz } else { 0 };
+    if period_samp > 0 {
+        let half = period_samp / 2;
+        let n    = (total_samples as usize).min(buf_bytes / 4);
+        for i in 0..n {
+            let val: i16 = if (i as u32) % period_samp < half { 0x7FFF } else { -0x7FFF };
+            unsafe { buf_virt.add(i*2).write(val); buf_virt.add(i*2+1).write(val); }
         }
     }
 
-    // Allocate BDL page (128-byte alignment required; page-aligned satisfies this)
     let bdl_phys = match pmm::alloc_page() {
         Some(p) => p,
-        None    => {
-            for i in 0..buf_pages as u64 { pmm::free_page(buf_phys + i * 4096); }
-            serial::print("HDA: OOM for BDL\n");
-            return;
-        }
+        None    => { for i in 0..buf_pages as u64 { pmm::free_page(buf_phys + i*4096); } return; }
     };
-    let bdl_virt = vmm::phys_to_virt(bdl_phys) as *mut BdlEntry;
-    unsafe {
-        bdl_virt.write(BdlEntry {
-            addr: buf_phys,
-            len:  buf_bytes as u32,
-            ioc:  1, // interrupt on completion
-        });
-    }
+    unsafe { (vmm::phys_to_virt(bdl_phys) as *mut BdlEntry).write(BdlEntry { addr: buf_phys, len: buf_bytes as u32, ioc: 1 }); }
 
-    // Stream number 1, format word: 48 kHz (base=0), ×1, /1, 16-bit (1), 2ch (1) = 0x0011
     let stream_id: u8 = 1;
-    let fmt: u16 = 0x0011;
-
+    let fmt: u16      = 0x0011; // 48 kHz, 16-bit, stereo
     configure_codec(mmio, stream_id, fmt);
 
-    // ── Stream descriptor setup ───────────────────────────────────────────────
-    // Reset stream — write-only, no MMIO reads (QEMU processes resets instantly).
-    w32(mmio, sd_off + SD_CTL, SD_CTL_SRST);
-    spin(5_000); // ~50 µs settle
-    w32(mmio, sd_off + SD_CTL, 0);
-    spin(5_000);
+    // Reset stream.
+    w32(mmio, sd_off + SD_CTL, SD_CTL_SRST); spin(5_000);
+    w32(mmio, sd_off + SD_CTL, 0);           spin(5_000);
 
-    // Clear any pending status bits in SDnSTS (W1C).
-    // BCIS=bit26, FIFOE=bit27, DESE=bit28 in the 32-bit read of the 4-byte CTL+STS block.
-    w32(mmio, sd_off + SD_CTL, 0x1C00_0000);
-
-    // BDL address
+    // Program stream descriptor.
     w32(mmio, sd_off + SD_BDPL, bdl_phys as u32);
     w32(mmio, sd_off + SD_BDPU, (bdl_phys >> 32) as u32);
+    w32(mmio, sd_off + SD_CBL,  buf_bytes as u32);
+    w16(mmio, sd_off + SD_LVI,  0);
+    w16(mmio, sd_off + SD_FMT,  fmt);
 
-    // Cyclic buffer length = total bytes in all BDL entries
-    w32(mmio, sd_off + SD_CBL, buf_bytes as u32);
-
-    // Last Valid Index = number of BDL entries - 1
-    w16(mmio, sd_off + SD_LVI, 0);
-
-    // Stream format
-    w16(mmio, sd_off + SD_FMT, fmt);
-
-    // Write stream number into CTL[23:20]; also enable IOCE
+    // ctl_base keeps stream_id in bits [23:20] — must be preserved in every
+    // subsequent SD_CTL write so QEMU can identify the running stream.
     let ctl_base = ((stream_id as u32) << 20) | SD_CTL_IOCE;
-    w32(mmio, sd_off + SD_CTL, ctl_base);
-
-    // Start stream
     w32(mmio, sd_off + SD_CTL, ctl_base | SD_CTL_RUN);
 
-    // Wait using TSC — no MMIO reads, no interrupt dependency.
-    // TSC advances monotonically regardless of IF flag or HDA DMA activity.
-    // TSC_PER_MS was calibrated against PIT timer 2 during init().
-    {
-        let tsc_per_ms = TSC_PER_MS.load(core::sync::atomic::Ordering::Relaxed);
-        let deadline = rdtsc().wrapping_add(tsc_per_ms.saturating_mul(duration_ms as u64));
-        while rdtsc().wrapping_sub(deadline) > u64::MAX / 2 {
-            core::hint::spin_loop();
-        }
-    }
+    let tsc_per_ms = TSC_PER_MS.load(core::sync::atomic::Ordering::Relaxed);
 
-    // Stop stream: write-only sequence, no polling reads.
-    // RUN=0 tells QEMU to stop DMA. SRST flushes the codec FIFO.
-    // spin() gives QEMU a moment to process each write before the next.
-    w32(mmio, sd_off + SD_CTL, 0);           // clear RUN
-    spin(50_000);
-    w32(mmio, sd_off + SD_CTL, SD_CTL_SRST); // assert stream reset
-    spin(50_000);
-    w32(mmio, sd_off + SD_CTL, 0);           // deassert stream reset
-    spin(50_000);
+    // Wait for the tone to play.
+    let tone_end = rdtsc().wrapping_add(tsc_per_ms.saturating_mul(duration_ms as u64));
+    while rdtsc().wrapping_sub(tone_end) > u64::MAX / 2 { core::hint::spin_loop(); }
 
-    // Zero the PCM buffer so any audio QEMU has already queued to the SDL
-    // backend plays as silence rather than repeating the tone.
-    unsafe { core::ptr::write_bytes(vmm::phys_to_virt(buf_phys), 0, buf_bytes); }
+    // Zero the DMA buffer while the stream is still running.
+    // QEMU's HDA timer will read zeros on the next ~21 ms tick → SDL receives
+    // silence.  The stream keeps running (reading zeros) during the drain wait.
+    unsafe { core::ptr::write_bytes(buf_virt as *mut u8, 0, buf_bytes); }
 
-    // Free buffers
+    // Wait 200 ms for SDL to drain its internal queue to silence.
+    let drain_end = rdtsc().wrapping_add(tsc_per_ms.saturating_mul(200));
+    while rdtsc().wrapping_sub(drain_end) > u64::MAX / 2 { core::hint::spin_loop(); }
+
+    // Stop stream — preserve stream_id so QEMU matches the running stream.
+    w32(mmio, sd_off + SD_CTL, ctl_base);                spin(50_000); // RUN=0
+    w32(mmio, sd_off + SD_CTL, ctl_base | SD_CTL_SRST);  spin(50_000); // SRST=1
+    w32(mmio, sd_off + SD_CTL, ctl_base);                spin(50_000); // SRST=0
+
     pmm::free_page(bdl_phys);
-    for i in 0..buf_pages as u64 {
-        pmm::free_page(buf_phys + i * 4096);
-    }
+    for i in 0..buf_pages as u64 { pmm::free_page(buf_phys + i*4096); }
 }

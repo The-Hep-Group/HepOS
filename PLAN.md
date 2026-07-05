@@ -392,7 +392,7 @@ Range 0–32767 scaled to framebuffer size.
 | NVMe size reported as 0 MB | Identify Namespace command hangs; workaround: hardcoded 512B/block |
 | ACPI shutdown only on QEMU | Hardcoded port 0x604 — real hardware needs FADT parsing |
 | Terminal text doesn't reflow on resize | Existing output stays at old column width; new input uses current width |
-| `beep` audio doesn't stop | HDA DMA keeps looping the PCM buffer after beep() returns; writing SD_CTL=0/SRST doesn't reliably stop QEMU's HDA engine; buffer is zeroed (silence) but stream stays active |
+| ~~`beep` audio doesn't stop~~ | Fixed: after tone duration, zero DMA buffer in-place while stream still runs → QEMU next-period read returns silence → 200 ms SDL drain wait → stop with stream_id preserved in bits[23:20] so QEMU matches the running stream. |
 
 ---
 
@@ -401,7 +401,7 @@ Range 0–32767 scaled to framebuffer size.
 1. ~~**`std` shim**~~ ✓ done — `userspace/` workspace: `hepos-rt` (allocator/panic/syscalls), `hepos-std` (println!, String/Vec re-exports), `hello` demo; kernel bakes hello ELF via build.rs; `runhello` terminal command
 2. ~~**Preemptive ring-3**~~ ✓ done (scoped) — timer unmasked during `run_elf` so ring-3 is preemptible by the scheduler; `sys_write` output buffered in `PROC_OUT` and flushed to the terminal window after exec; `swapgs` GS-state bug fixed (was freezing on 2nd run); full multi-process scheduling (fork/waitpid) remains future work
 3. ~~**Networking RX**~~ ✓ works — e1000 RX confirmed working on QEMU/Windows (user confirmed ping 10.0.2.2 replies); previously thought to be Windows-only broken but appears to work
-4. ~~**Intel HDA audio**~~ ✓ done (partial) — PCI detect (class 04/03), MMIO BAR map, immediate-cmd codec config (QEMU hda-duplex), output stream DMA + BDL, square-wave PCM generation, `beep [hz] [ms]` terminal command; TSC/PIT-calibrated timing so beep() returns correctly. **Known issue:** audio continues looping after beep() returns — DMA stop sequence (SD_CTL=0 / SRST / 0) not reliably halting QEMU's HDA engine; needs investigation.
+4. ~~**Intel HDA audio**~~ ✓ done — HDA DMA stream, `beep [hz] [ms]` via PCM square wave. Stop fix: zero buffer in-place while running, 200 ms SDL drain, stop with stream_id preserved in SD_CTL bits[23:20].
 5. ~~**TCP/UDP stack**~~ ✓ TCP + DNS done — 3-way handshake, HTTP GET (`wget <host>[:<port>]`), DNS A-record resolver via SLiRP 10.0.2.3:53, TSC timeouts, rotating source ports. General UDP stack remains.
 6. ~~**Window maximize / snap**~~ ✓ done
 7. ~~**Multiple terminal windows**~~ ✓ done
