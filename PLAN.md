@@ -11,7 +11,7 @@ HepOS is a custom x86\_64 operating system written in Rust using an **exokernel 
 
 **Language:** Rust (nightly, `no_std` + `alloc`)  
 **Target:** x86\_64, bare metal  
-**Bootloader:** Limine v9.x (BIOS + UEFI)  
+**Bootloader:** HepBL v0.1 — our own, written from scratch in Rust (UEFI)  
 **Dev machine:** Windows 11, QEMU 11.x  
 **License:** MIT  
 **Repository:** https://github.com/The-Hep-Group/HepOS
@@ -23,7 +23,7 @@ HepOS is a custom x86\_64 operating system written in Rust using an **exokernel 
 ```
 kernel/
   build.rs       Emits linker script path via CARGO_MANIFEST_DIR (cross-platform)
-  linker.ld      Custom linker script (Limine protocol sections)
+  linker.ld      Custom linker script (higher-half at 0xffffffff80000000, ENTRY(kmain))
   src/
     main.rs        kmain entry, global state, task_blink, window rendering, HepFS click handler
     framebuffer.rs GOP pixel/rect/text renderer — 8×8 bitmap font, double-buffered (backbuf flush)
@@ -62,16 +62,18 @@ userspace/             Rust userspace workspace (builds before kernel; output ba
   hepos-std/       std facade: re-exports alloc types + println!/print! macros backed by sys_write
   hello/           Demo binary: exercises String, Vec, println!, sys_getpid — runs via `runhello`
 
-bootloader/
-  limine.conf    Boot entry: timeout 0, loads /boot/hepos-kernel
+hepbl/           HepBL — our own UEFI bootloader, written from scratch (replaced Limine)
+  src/main.rs    Pure Rust UEFI app: hand-written UEFI FFI (no external crates), GOP mode
+                 select, loads \kernel.elf from boot volume, ELF64 loader, builds page
+                 tables (identity + HHDM 0..4GiB in 4K pages + kernel high-half),
+                 ExitBootServices, asm handoff (CR3/RSP/jmp, RDI = &BootInfo)
 
-limine/          Limine v9.x binary release (committed to repo)
-  limine.exe     Windows installer tool
-  limine.c       Installer source (compiled on Linux by build.sh via make)
-  limine-bios.sys, limine-bios-cd.bin, limine-uefi-cd.bin, BOOTX64.EFI
+kernel/src/bootinfo.rs   HepBL boot protocol structs (BootInfo, MemRegion) — kept in
+                         sync with hepbl/src/main.rs
 
-build.ps1        Windows: build + ISO + QEMU launch
-build.sh         Linux:   build + ISO + QEMU launch
+esp/             Boot volume dir — QEMU exposes as FAT disk (VVFAT): EFI/BOOT/BOOTX64.EFI + kernel.elf
+build.ps1        Windows: build userspace + kernel + HepBL, assemble ESP, QEMU launch (OVMF)
+build.sh         Linux:   same
 ```
 
 ---
@@ -83,8 +85,10 @@ qemu-system-x86_64
   -M q35
   -cpu qemu64,+x2apic      # x2APIC via MSR
   -m 256M
-  -cdrom hepos.iso
-  -boot d
+  -drive if=pflash,format=raw,readonly=on,file=edk2-x86_64-code.fd   # OVMF UEFI firmware
+  -drive if=pflash,format=raw,file=hepbl_vars.fd                     # writable NVRAM
+  -drive format=raw,file=fat:rw:esp                                  # boot volume (VVFAT)
+  -fw_cfg name=opt/ovmf/X-PciMmio64Mb,string=0   # keep PCI BARs below 4GiB
   -drive file=hepos_disk.img,if=none,id=nvme0,format=raw
   -device nvme,serial=heposv1,drive=nvme0
   -netdev user,id=net0
@@ -105,9 +109,16 @@ qemu-system-x86_64
 ## Boot Sequence
 
 ```
-Limine → kmain()
- 1. serial, GDT, IDT
- 2. VMM (HHDM offset), PMM (pages >1MB)
+OVMF (UEFI) → HepBL (\EFI\BOOT\BOOTX64.EFI)
+ a. GOP mode select (prefers 1280x800 / 1024x768)
+ b. Load + parse \kernel.elf (ELF64, PT_LOAD → allocated pages)
+ c. Page tables: identity 0..4GiB (transitional) + HHDM at 0xffff800000000000
+    (4K pages so kernel's map_page/map_mmio can walk them) + kernel high-half
+ d. GetMemoryMap → ExitBootServices → asm handoff (CR3, RSP, jmp kmain, RDI=&BootInfo)
+
+kmain(BootInfo)
+ 1. serial, magic check, GDT, IDT
+ 2. VMM (HHDM offset from BootInfo), PMM (usable regions >1MB), clear identity PML4[0]
  3. Heap (bump, 256 PMM pages = 1MB)
  4. Display + splash screen
  5. Desktop + all windows created (ids 0-4, editor+sysmon minimized)
@@ -302,7 +313,7 @@ Range 0–32767 scaled to framebuffer size.
 ### Kernel / Low-level
 | ✓/○ | Feature |
 |-----|---------|
-| ✓ | Boot (Limine), Framebuffer, GDT, IDT |
+| ✓ | Boot (HepBL — own from-scratch UEFI bootloader), Framebuffer, GDT, IDT |
 | ✓ | PMM (bitmap, >1MB), HHDM, Paging |
 | ✓ | Bump heap (1MB), GlobalAlloc |
 | ✓ | x2APIC timer, ACPI shutdown/reboot, CMOS RTC |
@@ -413,6 +424,7 @@ Range 0–32767 scaled to framebuffer size.
 12. **`std` shim** — implement enough of `std` (alloc, io, fs stubs) so external Rust crates can link
 13. ~~**Desktop icons**~~ ✓ done — 5 coloured icons on desktop left edge (Welcome, Files, Terminal, Editor, Sysmon); click opens/focuses the window
 14. **RTL8169 / real hardware NIC** — for running on physical machines
+15. ~~**HepBL — own bootloader**~~ ✓ done — from-scratch UEFI bootloader in pure Rust (hepbl/), no Limine, no external crates; hand-written UEFI FFI, ELF64 loader, own page tables + HHDM, BootInfo protocol; only asm is the final CR3/RSP/jmp handoff
 
 ---
 
@@ -496,7 +508,8 @@ Lines stored as `[Cell; MAX_COLS]` — no per-line allocation. `self.cols` is up
 - **PMM above 1MB only** — avoids VGA/BIOS hole 0xA0000–0xFFFFF
 - **Slab allocator** — 10 size classes (8B–4KB), large allocs via PMM `alloc_contiguous`, full `dealloc` (push to free list or return page to PMM)
 - **Scheduler starts last** — APIC timer fires → context switch kmain → task_blink. If started early, task_blink runs before NVMe/XHCI init
-- **x2APIC via MSR** — xAPIC MMIO at 0xFEE00000 is outside Limine's HHDM; MSR mode avoids needing to map it
+- **x2APIC via MSR** — avoids mapping xAPIC MMIO at 0xFEE00000 (works under both Limine and HepBL)
+- **HepBL page tables live on** — the kernel keeps running on the bootloader's PML4; `map_page`/`map_mmio` walk it (all 4K pages, no huge pages), user PML4s copy entries 256–511 from it; the transitional identity map in PML4[0] is cleared during kmain init
 - **PS/2 poll order** — `ps2::poll()` before `mouse::poll()`; both read port 0x60; mouse bytes get eaten if order is wrong
 - **XHCI ring wrap** — Link TRB TC must be 1 on every wrap. If only set on odd wraps, XHC stops toggling PCS and transfers freeze after wrap 2
 - **Double-buffered rendering** — all drawing targets a PMM-backed backbuffer (`width×height u32`, ~3.5 MB at 1280×720); `flush()` copies each row to the physical framebuffer in one shot at the end of the frame, eliminating tearing and flicker
@@ -534,7 +547,7 @@ Lines stored as `[Cell; MAX_COLS]` — no per-line allocation. `self.cols` is up
 | e1000 MAC | 52:54:00:12:34:56 |
 | SLiRP gateway | 10.0.2.2, MAC 52:55:0a:00:02:02 |
 | Static IP | 10.0.2.15 / 255.255.255.0 |
-| HHDM offset | 0xFFFF800000000000 (Limine default) |
+| HHDM offset | 0xFFFF800000000000 (HepBL, covers phys 0..4GiB in 4K pages) |
 | XHCI | PCI 1B36:000D, usb-tablet on xhci.0 |
 
 ---
@@ -542,9 +555,8 @@ Lines stored as `[Cell; MAX_COLS]` — no per-line allocation. `self.cols` is up
 ## Crate Dependencies
 
 ```toml
-limine = "0.6"   # Boot protocol structs — MIT
 spin   = "0.9"   # Mutex without std — MIT
 # core, alloc, compiler_builtins from rust-src (MIT/Apache-2)
 ```
 
-All drivers, filesystem, networking, desktop, and apps written from scratch.
+All drivers, filesystem, networking, desktop, apps — and now the bootloader (HepBL) — written from scratch.

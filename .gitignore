@@ -3,3 +3,7 @@ hepos.iso
 hepos_disk.img
 kernel/target/
 limine/
+hepbl/target/
+esp/
+hepbl_vars.fd
+userspace/target/

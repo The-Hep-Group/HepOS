@@ -21,47 +21,34 @@ Pop-Location
 $kernel_elf = "$root\kernel\target\x86_64-unknown-none\release\hepos-kernel"
 if (-not (Test-Path $kernel_elf)) { Write-Error "kernel build failed"; exit 1 }
 
-# ── 2. Fetch Limine if missing ───────────────────────────────────────────────
-$limine_dir = "$root\limine"
-if (-not (Test-Path $limine_dir)) {
-    Write-Host "Cloning Limine..."
-    git clone https://github.com/limine-bootloader/limine.git --branch=v9.x-binary --depth=1 $limine_dir
+# ── 3. Build HepBL (our UEFI bootloader, written from scratch) ───────────────
+rustup target add x86_64-unknown-uefi --toolchain nightly 2>$null | Out-Null
+Push-Location "$root\hepbl"
+cargo +nightly build --release
+Pop-Location
+
+$hepbl_efi = "$root\hepbl\target\x86_64-unknown-uefi\release\hepbl.efi"
+if (-not (Test-Path $hepbl_efi)) { Write-Error "HepBL build failed"; exit 1 }
+Write-Host "HepBL built: $hepbl_efi"
+
+# ── 4. Assemble ESP directory (QEMU exposes it as a FAT disk via VVFAT) ──────
+$esp = "$root\esp"
+New-Item -ItemType Directory -Force "$esp\EFI\BOOT" | Out-Null
+Copy-Item $hepbl_efi  "$esp\EFI\BOOT\BOOTX64.EFI"
+Copy-Item $kernel_elf "$esp\kernel.elf"
+Write-Host "ESP assembled: $esp (HepBL + kernel.elf)"
+
+# ── 5. UEFI firmware (OVMF/edk2, ships with QEMU) ────────────────────────────
+$qemu_share = "C:\Program Files\qemu\share"
+$code_fd = "$qemu_share\edk2-x86_64-code.fd"
+if (-not (Test-Path $code_fd)) { Write-Error "UEFI firmware not found: $code_fd"; exit 1 }
+# Writable NVRAM copy (template ships as edk2-i386-vars.fd, valid for x86_64)
+$vars_fd = "$root\hepbl_vars.fd"
+if (-not (Test-Path $vars_fd)) {
+    Copy-Item "$qemu_share\edk2-i386-vars.fd" $vars_fd
 }
 
-# ── 3. Build ISO image ───────────────────────────────────────────────────────
-$iso_root  = "$root\iso_root"
-$iso_boot  = "$iso_root\boot"
-$iso_limine = "$iso_boot\limine"
-
-Remove-Item -Recurse -Force $iso_root -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force $iso_limine | Out-Null
-New-Item -ItemType Directory -Force "$iso_root\EFI\BOOT" | Out-Null
-
-Copy-Item $kernel_elf         "$iso_boot\hepos-kernel"
-Copy-Item "$root\bootloader\limine.conf" "$iso_limine\limine.conf"
-Copy-Item "$limine_dir\limine-bios.sys"        "$iso_limine\"
-Copy-Item "$limine_dir\limine-bios-cd.bin"     "$iso_limine\"
-Copy-Item "$limine_dir\limine-uefi-cd.bin"     "$iso_limine\"
-Copy-Item "$limine_dir\BOOTX64.EFI"            "$iso_root\EFI\BOOT\"
-
-$iso = "$root\hepos.iso"
-
-# Convert Windows paths to Unix paths for xorriso (MSYS2 tool)
-$unix_iso_root = & C:\msys64\usr\bin\cygpath.exe -u $iso_root
-$unix_iso      = & C:\msys64\usr\bin\cygpath.exe -u $iso
-
-& "C:\msys64\usr\bin\xorriso.exe" -as mkisofs -b boot/limine/limine-bios-cd.bin `
-    -no-emul-boot -boot-load-size 4 -boot-info-table `
-    --efi-boot boot/limine/limine-uefi-cd.bin `
-    -efi-boot-part --efi-boot-image --protective-msdos-label `
-    $unix_iso_root -o $unix_iso
-
-# Install Limine BIOS stage
-& "$limine_dir\limine.exe" bios-install $iso
-
-Write-Host "ISO built: $iso"
-
-# ── 4. Create NVMe disk image if needed ─────────────────────────────────────
+# ── 6. Create NVMe disk image if needed ─────────────────────────────────────
 $disk = "$root\hepos_disk.img"
 $qemu_img = "C:\Program Files\qemu\qemu-img.exe"
 if (-not (Test-Path $disk)) {
@@ -69,14 +56,18 @@ if (-not (Test-Path $disk)) {
     & $qemu_img create -f raw $disk 512M
 }
 
-# ── 5. Run in QEMU ──────────────────────────────────────────────────────────
+# ── 7. Run in QEMU (UEFI boot via HepBL) ─────────────────────────────────────
+# X-PciMmio64Mb=0 keeps all PCI BARs below 4 GiB (kernel reads 32-bit BARs,
+# and HepBL's HHDM covers 0..4 GiB).
 $qemu = "C:\Program Files\qemu\qemu-system-x86_64.exe"
 & $qemu `
     -M q35 `
     -cpu qemu64,+x2apic `
     -m 256M `
-    -cdrom $iso `
-    -boot d `
+    -drive if=pflash,format=raw,readonly=on,file=$code_fd `
+    -drive if=pflash,format=raw,file=$vars_fd `
+    -drive format=raw,file=fat:rw:$esp `
+    -fw_cfg name=opt/ovmf/X-PciMmio64Mb,string=0 `
     -drive file=$disk,if=none,id=nvme0,format=raw `
     -device nvme,serial=heposv1,drive=nvme0 `
     -netdev user,id=net0 `

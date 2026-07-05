@@ -562,7 +562,7 @@ impl Terminal {
                 self.print_colored("Kernel:    ", DIM); self.print("HepOS v0.1\n");
                 self.print_colored("Arch:      ", DIM); self.print("x86_64\n");
                 self.print_colored("Type:      ", DIM); self.print("Exokernel (Rust)\n");
-                self.print_colored("Boot:      ", DIM); self.print("Limine v9 (BIOS)\n");
+                self.print_colored("Boot:      ", DIM); self.print("HepBL v0.1 (UEFI)\n");
                 self.print_colored("Language:  ", DIM); self.print("Rust (no_std + alloc)\n");
                 self.print_colored("Heap:      ", DIM); self.print("Bump allocator 1MB\n");
                 self.print_colored("Sched:     ", DIM); self.print("Preemptive round-robin\n");

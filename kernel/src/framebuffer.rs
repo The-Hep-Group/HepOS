@@ -1,4 +1,4 @@
-use limine::framebuffer::Framebuffer;
+use crate::bootinfo::BootInfo;
 
 #[derive(Clone, Copy)]
 pub struct Color {
@@ -38,16 +38,16 @@ pub struct Display {
 unsafe impl Send for Display {}
 
 impl Display {
-    pub fn new(fb: &Framebuffer) -> Self {
+    pub fn new(bi: &BootInfo) -> Self {
         Self {
-            addr:    fb.address() as *mut u8,
-            width:   fb.width as usize,
-            height:  fb.height as usize,
-            pitch:   fb.pitch as usize,
-            bpp:     fb.bpp as usize / 8,
-            r_shift: fb.red_mask_shift,
-            g_shift: fb.green_mask_shift,
-            b_shift: fb.blue_mask_shift,
+            addr:    bi.fb_addr as *mut u8,
+            width:   bi.fb_width as usize,
+            height:  bi.fb_height as usize,
+            pitch:   bi.fb_pitch as usize,
+            bpp:     bi.fb_bpp as usize / 8,
+            r_shift: bi.fb_red_shift,
+            g_shift: bi.fb_green_shift,
+            b_shift: bi.fb_blue_shift,
             backbuf:     core::ptr::null_mut(),
             scene_buf:   core::ptr::null_mut(),
             backbuf_len: 0,

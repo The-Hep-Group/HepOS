@@ -1,9 +1,5 @@
 use core::sync::atomic::{AtomicU64, Ordering};
-use limine::memmap::MEMMAP_USABLE;
-use limine::request::MemmapRequest;
-
-#[used]
-pub static MEMORY_MAP_REQUEST: MemmapRequest = MemmapRequest::new();
+use crate::bootinfo::MemRegion;
 
 const PAGE_SIZE: usize = 4096;
 const MAX_PAGES: usize = 512 * 1024; // 2 GB max tracked = 512k pages
@@ -30,11 +26,7 @@ fn is_used(page: usize) -> bool {
     BITMAP[page / 64].load(Ordering::Relaxed) & (1 << (page % 64)) != 0
 }
 
-pub fn init(hhdm_offset: u64) {
-    let response = MEMORY_MAP_REQUEST
-        .response()
-        .expect("no memory map from Limine");
-
+pub fn init(memmap: &[MemRegion]) {
     // Start with everything marked used, then free usable regions
     for word in &BITMAP {
         word.store(u64::MAX, Ordering::Relaxed);
@@ -43,9 +35,9 @@ pub fn init(hhdm_offset: u64) {
     let mut total = 0u64;
     let mut free  = 0u64;
 
-    for entry in response.entries() {
+    for entry in memmap {
         let base  = entry.base as usize;
-        let end   = base + entry.length as usize;
+        let end   = base + entry.len as usize;
         let first = base / PAGE_SIZE;
         let last  = end  / PAGE_SIZE;
 
@@ -54,7 +46,7 @@ pub fn init(hhdm_offset: u64) {
             total += 1;
             // Only use pages above 1 MB — avoids the reserved hole at
             // 0xA0000–0xFFFFF (VGA/BIOS) which breaks contiguous heap assumptions.
-            if entry.type_ == MEMMAP_USABLE && base >= 0x10_0000 {
+            if entry.typ == 1 && base >= 0x10_0000 {
                 set_free(page);
                 free += 1;
             }
@@ -63,8 +55,6 @@ pub fn init(hhdm_offset: u64) {
 
     TOTAL_PAGES.store(total, Ordering::Relaxed);
     FREE_PAGES .store(free,  Ordering::Relaxed);
-
-    let _ = hhdm_offset; // will be used when we add virtual mapping
 }
 
 /// Allocate one 4KB physical page. Returns physical address.

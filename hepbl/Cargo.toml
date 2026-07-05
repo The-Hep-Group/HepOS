@@ -1,20 +1,15 @@
 [package]
-name = "hepos-kernel"
+name = "hepbl"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-spin = "0.9"
-
-[features]
-default = []
-
-[profile.dev]
-panic = "abort"
-opt-level = 1
 
 [profile.release]
 panic = "abort"
-opt-level = 3
+opt-level = 2
 lto = true
 codegen-units = 1
+
+[profile.dev]
+panic = "abort"

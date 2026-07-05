@@ -5,6 +5,7 @@ extern crate alloc;
 
 mod acpi;
 mod apic;
+mod bootinfo;
 mod editor;
 mod e1000;
 mod net;
@@ -35,8 +36,6 @@ mod terminal;
 mod vmm;
 
 use framebuffer::Display;
-use limine::request::{FramebufferRequest, HhdmRequest};
-use limine::BaseRevision;
 use spin::Mutex;
 
 // Global display — used by exception handler and future modules
@@ -58,14 +57,16 @@ struct HepfsNav {
 }
 static HEPFS_NAV: Mutex<Option<HepfsNav>> = Mutex::new(None);
 
-#[used] static BASE_REVISION:       BaseRevision       = BaseRevision::new();
-#[used] static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
-#[used] static HHDM_REQUEST:        HhdmRequest        = HhdmRequest::new();
-
 #[no_mangle]
-extern "C" fn kmain() -> ! {
+extern "C" fn kmain(bi_ptr: *const bootinfo::BootInfo) -> ! {
     serial::init();
-    serial::print("HepOS kmain\n");
+    serial::print("HepOS kmain (HepBL boot)\n");
+
+    let bi = unsafe { &*bi_ptr };
+    if bi.magic != bootinfo::BOOTINFO_MAGIC {
+        serial::print("FATAL: bad BootInfo magic\n");
+        loop { unsafe { core::arch::asm!("hlt"); } }
+    }
 
     gdt::init();
     serial::print("GDT loaded\n");
@@ -73,10 +74,19 @@ extern "C" fn kmain() -> ! {
     idt::init();
     serial::print("IDT loaded\n");
 
-    let hhdm = HHDM_REQUEST.response().expect("no HHDM").offset;
+    let hhdm = bi.hhdm_offset;
     vmm::init(hhdm);
-    pmm::init(hhdm);
+    pmm::init(&bi.memmap[..bi.memmap_count as usize]);
     serial::print("PMM init\n");
+
+    // Drop HepBL's transitional identity map (PML4[0]) — nothing in the kernel
+    // uses low-half virtual addresses, and user PML4s must not inherit it.
+    unsafe {
+        let cr3: u64;
+        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+        (vmm::phys_to_virt(cr3 & !0xFFF) as *mut u64).write_volatile(0);
+        core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nomem, nostack)); // TLB flush
+    }
 
     heap::HEAP.init();
     serial::print("Heap init\n");
@@ -92,12 +102,7 @@ extern "C" fn kmain() -> ! {
 
     syscall::init();
 
-    let fb = FRAMEBUFFER_REQUEST
-        .response()
-        .and_then(|r| r.framebuffers().first().copied())
-        .expect("no framebuffer");
-
-    *DISPLAY.lock() = Some(Display::new(fb));
+    *DISPLAY.lock() = Some(Display::new(bi));
 
     {
         let mut guard = DISPLAY.lock();
@@ -133,11 +138,8 @@ extern "C" fn kmain() -> ! {
 
     // Init desktop BEFORE enabling interrupts so task_blink sees it immediately
     {
-        let fb = FRAMEBUFFER_REQUEST.response()
-            .and_then(|r| r.framebuffers().first().copied())
-            .expect("no framebuffer for desktop");
-        let w = fb.width as usize;
-        let h = fb.height as usize;
+        let w = bi.fb_width as usize;
+        let h = bi.fb_height as usize;
         let mut dt = desktop::Desktop::new(w, h);
         // Window positions chosen to fit common resolutions (640×480 min)
         dt.add_window("Welcome to HepOS", 20,  50,  300, 160);
