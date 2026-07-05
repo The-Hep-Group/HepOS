@@ -356,6 +356,7 @@ impl Terminal {
                     ("echo <text>",    "print text"),
                     ("beep [hz] [ms]", "play tone via HDA audio"),
                     ("wget <host>[:<port>] [path]","HTTP GET, resolves DNS (default port 80)"),
+                    ("udp <host>:<port> <msg>","send a UDP datagram, print any reply (3s timeout)"),
                 ];
                 for (name, desc) in &cmds {
                     self.print_colored("  ", DIM);
@@ -902,6 +903,57 @@ impl Terminal {
                                         );
                                     }
                                     self.print("\n");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            "udp" => {
+                if arg1.is_empty() || arg2.is_empty() {
+                    self.print_colored("usage: udp <ip|host>[:<port>] <message>\n", ERR);
+                } else {
+                    let (host_str, port) = if let Some(colon) = arg1.rfind(':') {
+                        let p = arg1[colon+1..].parse::<u16>().unwrap_or(0);
+                        (&arg1[..colon], p)
+                    } else {
+                        (arg1, 0u16)
+                    };
+                    if port == 0 {
+                        self.print_colored("udp: missing or invalid port (use ip:port)\n", ERR);
+                    } else {
+                        let resolved = if let Some(ip) = crate::net::parse_ip(host_str) {
+                            Some(ip)
+                        } else {
+                            self.print(&alloc::format!("Resolving {}…\n", host_str));
+                            crate::net::dns_resolve(host_str)
+                        };
+                        match resolved {
+                            None => self.print_colored("udp: could not resolve host\n", ERR),
+                            Some(ip) => {
+                                let src_port = 51000u16 + (crate::hda::rdtsc() as u16 % 1000);
+                                self.print(&alloc::format!(
+                                    "Sending {} bytes to {}:{}…\n", arg2.len(), host_str, port
+                                ));
+                                match crate::net::udp_send_recv(
+                                    ip, crate::net::GW_MAC, src_port, port,
+                                    arg2.as_bytes(), 3_000,
+                                ) {
+                                    None => self.print_colored(
+                                        "udp: no reply within 3s (datagram sent either way)\n", DIM
+                                    ),
+                                    Some((data, rip, rport)) => {
+                                        self.print_colored(&alloc::format!(
+                                            "Reply from {}.{}.{}.{}:{} ({} bytes):\n",
+                                            rip[0], rip[1], rip[2], rip[3], rport, data.len()
+                                        ), OK);
+                                        let limit = data.len().min(4096);
+                                        let s = core::str::from_utf8(&data[..limit])
+                                            .unwrap_or("(non-UTF-8 reply)");
+                                        self.print(s);
+                                        self.print("\n");
+                                    }
                                 }
                             }
                         }

@@ -217,6 +217,7 @@ Terminal column count adapts to window width dynamically (up to 120 cols max).
 | `ifconfig` | IP / MAC / gateway |
 | `ping <ip>` | ICMP echo |
 | `wget <host>[:<port>] [/path]` | HTTP GET with DNS resolution (default port 80); prints up to 4KB |
+| `udp <host>:<port> <msg>` | Send a UDP datagram (DNS-resolved), print any reply within 3s |
 | `netstart` / `netdiag` / `netpoll` | NIC debug commands |
 | `shutdown` / `reboot` | ACPI off / PS/2 reset |
 | `echo` / `clear` | Print text / clear screen |
@@ -393,7 +394,7 @@ Range 0–32767 scaled to framebuffer size.
 | ✓ | TCP stack — 3-way handshake, data receive, FIN close, rotating ephemeral ports |
 | ✓ | HTTP GET client — `wget <host>[:<port>] [/path]`, prints up to 4KB |
 | ✓ | DNS resolver — UDP query to SLiRP's 10.0.2.3:53; `wget example.com` works |
-| ○ | UDP stack (general-purpose) |
+| ✓ | UDP stack (general-purpose) — `net::udp_send_recv()`, DNS-resolved dest, TSC timeout; `udp <host>:<port> <msg>` terminal command |
 | ✓ | Userspace — ring 3, SYSCALL/SYSRET, ELF loader, exec from HepFS, process table |
 | ✓ | `hepos-std` shim — `hepos-rt` (bump allocator, panic, sys_write/exit/getpid) + `hepos-std` (println!, String, Vec); `runhello` demo command |
 
@@ -416,7 +417,7 @@ Range 0–32767 scaled to framebuffer size.
 2. ~~**Preemptive ring-3**~~ ✓ done (scoped) — timer unmasked during `run_elf` so ring-3 is preemptible by the scheduler; `sys_write` output buffered in `PROC_OUT` and flushed to the terminal window after exec; `swapgs` GS-state bug fixed (was freezing on 2nd run); full multi-process scheduling (fork/waitpid) remains future work
 3. ~~**Networking RX**~~ ✓ works — e1000 RX confirmed working on QEMU/Windows (user confirmed ping 10.0.2.2 replies); previously thought to be Windows-only broken but appears to work
 4. ~~**Intel HDA audio**~~ ✓ done — HDA DMA stream, `beep [hz] [ms]` via PCM square wave. Stop fix: zero buffer in-place while running, 200 ms SDL drain, stop with stream_id preserved in SD_CTL bits[23:20].
-5. ~~**TCP/UDP stack**~~ ✓ TCP + DNS done — 3-way handshake, HTTP GET (`wget <host>[:<port>]`), DNS A-record resolver via SLiRP 10.0.2.3:53, TSC timeouts, rotating source ports. General UDP stack remains.
+5. ~~**TCP/UDP stack**~~ ✓ done — 3-way handshake, HTTP GET (`wget <host>[:<port>]`), DNS A-record resolver via SLiRP 10.0.2.3:53, TSC timeouts, rotating source ports; general-purpose `udp_send_recv()` + `udp <host>:<port> <msg>` terminal command
 6. ~~**Window maximize / snap**~~ ✓ done
 7. ~~**Multiple terminal windows**~~ ✓ done
 8. ~~**Full-edge resize + directional cursors**~~ ✓ done

@@ -193,6 +193,53 @@ pub fn udp_send(dst_ip: [u8; 4], dst_mac: [u8; 6], src_port: u16, dst_port: u16,
 
 fn handle_udp(_data: &[u8]) {
     // Placeholder — incoming UDP is not yet dispatched to any service.
+    // (dns_resolve / udp_send_recv poll the NIC directly for their own reply.)
+}
+
+/// Route a destination IP the same way ping/wget/DNS do: everything goes via
+/// the SLiRP gateway MAC, since QEMU's user-mode networking doesn't ARP-reply
+/// for anything but the gateway itself.
+pub const GW_MAC: [u8; 6] = [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02];
+
+/// Send one UDP datagram to `dst_ip:dst_port` from `src_port`, then block
+/// waiting for a UDP reply addressed back to `src_port` (from any sender),
+/// up to `timeout_ms`. Returns `(payload, reply_src_ip, reply_src_port)`.
+///
+/// General-purpose counterpart to the UDP send/receive already hand-rolled
+/// inside `dns_resolve` — usable for any UDP service (echo, syslog, custom
+/// protocols), not just DNS.
+pub fn udp_send_recv(
+    dst_ip: [u8; 4], dst_mac: [u8; 6],
+    src_port: u16, dst_port: u16,
+    data: &[u8], timeout_ms: u64,
+) -> Option<(Vec<u8>, [u8; 4], u16)> {
+    udp_send(dst_ip, dst_mac, src_port, dst_port, data);
+
+    let tsc_per_ms = crate::hda::TSC_PER_MS.load(core::sync::atomic::Ordering::Relaxed);
+    let deadline = crate::hda::rdtsc().wrapping_add(tsc_per_ms.saturating_mul(timeout_ms));
+
+    loop {
+        if crate::hda::rdtsc().wrapping_sub(deadline) < u64::MAX / 2 { return None; }
+
+        let frame = with_nic(|n| n.recv()).flatten();
+        if let Some(f) = frame {
+            if f.len() < 14 { continue; }
+            if u16::from_be_bytes([f[12], f[13]]) != 0x0800 { continue; }
+            let ip = &f[14..];
+            if ip.len() < 20 || ip[9] != 17 { continue; }
+            let ihl = ((ip[0] & 0x0F) as usize) * 4;
+            if ip.len() < ihl + 8 { continue; }
+            let udp = &ip[ihl..];
+            let dp = u16::from_be_bytes([udp[2], udp[3]]);
+            if dp != src_port { continue; } // not addressed to our listening port
+            let ulen = u16::from_be_bytes([udp[4], udp[5]]) as usize;
+            if ulen < 8 || udp.len() < ulen { continue; }
+            let sp = u16::from_be_bytes([udp[0], udp[1]]);
+            let src_ip: [u8; 4] = ip[12..16].try_into().unwrap_or([0; 4]);
+            return Some((udp[8..ulen].to_vec(), src_ip, sp));
+        }
+        for _ in 0..10_000u32 { core::hint::spin_loop(); }
+    }
 }
 
 // ── TCP ───────────────────────────────────────────────────────────────────────
