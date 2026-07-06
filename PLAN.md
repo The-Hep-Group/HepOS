@@ -283,7 +283,9 @@ Blocks 38+   : Data blocks  (4KB each)
 - `flags` (file/dir/free), `size`, `nblocks`, `ctime`, `mtime`
 - `direct[12]` — 12 × 4KB = 48KB direct
 - `indirect` — points to a block of 1024 × u32 pointers → 1024 × 4KB = 4MB indirect
-- **Max file size: ~4.1MB** (48KB + 4MB)
+- `dindirect` — points to a block of 1024 × u32 pointers, each to another 1024-pointer indirect block → 1024×1024 × 4KB = 4GB double-indirect
+- **Max file size: ~4GB** (48KB + 4MB + 4GB), bounded in practice by disk capacity (512MB image)
+- Backward compatible: on-disk inodes written before `dindirect` existed have zero bytes at that offset (it was padding), so they decode as `dindirect=0` — no migration needed
 
 `/kernel.txt` written at every boot as a kernel manifest.
 
@@ -358,7 +360,7 @@ Range 0–32767 scaled to framebuffer size.
 | ✓ | Path resolution (`/a/b/c`), kernel manifest `/kernel.txt` |
 | ✓ | Indirect blocks — files up to ~4.1MB |
 | ✓ | `cp`, `mv` terminal commands |
-| ○ | Double-indirect blocks (files up to ~4GB) |
+| ✓ | Double-indirect blocks — files up to ~4GB (bounded in practice by disk capacity); verified with a 5MB round-trip (`dindirect` block allocated, byte-exact read-back) |
 | ○ | VFS abstraction layer |
 
 ### Desktop / WM
@@ -439,6 +441,7 @@ Range 0–32767 scaled to framebuffer size.
 16. ~~**General UDP stack**~~ ✓ done — `net::udp_send_recv()` + `udp <host>:<port> <msg>` terminal command
 17. ~~**Image viewer**~~ ✓ done — `image.rs`: uncompressed 24/32-bit BMP decoder, `view <file>` command, click `.bmp` in HepFS to open; `/demo.bmp` checkerboard generated at boot for testing
 19. ~~**Audio player**~~ ✓ done — `audio.rs`: 16-bit PCM WAV decoder (48kHz, mono/stereo), `play <file>` command; `hda::play_pcm()` reuses beep()'s validated DMA stop sequence (zero buffer in-place, drain, stream_id-preserving stop) for arbitrary sample playback, truncated to a 1MB buffer (~5.4s); `/demo.wav` generated at boot for testing
+20. ~~**Double-indirect blocks**~~ ✓ done — added `dindirect` field to the on-disk inode (backward-compatible: old padding bytes there were already zero); `write_file`/`read_file`/`remove` all extended with a Phase 3 that walks the 1024×1024 double-indirect tree; verified with a 5MB file (`dindirect` allocated, byte-exact round-trip)
 
 ---
 
