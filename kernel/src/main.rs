@@ -50,14 +50,41 @@ pub static PCI_DEVS: Mutex<alloc::vec::Vec<pci::PciDevice>> = Mutex::new(alloc::
 // Frame counter for uptime (~60 fps → divide by 60 for seconds)
 static UPTIME_FRAMES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-// HepFS navigator state (current directory + back/forward history)
+// HepFS navigator state (current directory + back/forward history).
+// One entry per Files window, keyed by window id — same pattern as
+// `editor::EXTRA_EDITORS` — so multiple Files windows browse independently.
 struct HepfsNav {
     ino:  u32,
     path: alloc::string::String,
     back: alloc::vec::Vec<(u32, alloc::string::String)>,
     fwd:  alloc::vec::Vec<(u32, alloc::string::String)>,
 }
-static HEPFS_NAV: Mutex<Option<HepfsNav>> = Mutex::new(None);
+static HEPFS_NAVS: Mutex<alloc::vec::Vec<(usize, HepfsNav)>> = Mutex::new(alloc::vec::Vec::new());
+
+fn hepfs_nav_new() -> HepfsNav {
+    HepfsNav {
+        ino:  hepfs::ROOT_INO,
+        path: alloc::string::String::from("/"),
+        back: alloc::vec::Vec::new(),
+        fwd:  alloc::vec::Vec::new(),
+    }
+}
+
+/// Spawn a brand-new Files window with its own independent navigator (starts at root).
+fn spawn_files() -> usize {
+    let win_id = {
+        let mut dt = desktop::DESKTOP.lock();
+        if let Some(dt) = dt.as_mut() {
+            let id = dt.add_window(desktop::AppKind::Files, "HepFS", 160, 90, 260, 160);
+            dt.dirty = true;
+            id
+        } else {
+            return usize::MAX;
+        }
+    };
+    HEPFS_NAVS.lock().push((win_id, hepfs_nav_new()));
+    win_id
+}
 
 #[no_mangle]
 extern "C" fn kmain(bi_ptr: *const bootinfo::BootInfo) -> ! {
@@ -166,13 +193,8 @@ extern "C" fn kmain(bi_ptr: *const bootinfo::BootInfo) -> ! {
     terminal::init();
     serial::print("Terminal init\n");
 
-    // HepFS navigator starts at root
-    *HEPFS_NAV.lock() = Some(HepfsNav {
-        ino:  hepfs::ROOT_INO,
-        path: alloc::string::String::from("/"),
-        back: alloc::vec::Vec::new(),
-        fwd:  alloc::vec::Vec::new(),
-    });
+    // Main Files window (id=1) navigator starts at root
+    HEPFS_NAVS.lock().push((1, hepfs_nav_new()));
 
     // Minimize editor, sysmon, settings, and image viewer until explicitly opened; focus terminal (id=2)
     {
@@ -476,10 +498,7 @@ fn task_blink() -> ! {
                     desktop::AppKind::Sysmon      => spawn_stateless_window(desktop::AppKind::Sysmon, "Sysmon", 340, 260),
                     desktop::AppKind::Settings    => spawn_stateless_window(desktop::AppKind::Settings, "Settings", 480, 320),
                     desktop::AppKind::AudioPlayer => spawn_stateless_window(desktop::AppKind::AudioPlayer, "Audio Player", 380, 160),
-                    // Files/HepFS has global nav state — not offered as a context-menu
-                    // option (app_supports_new_window returns false), but handle
-                    // gracefully if ever reached.
-                    desktop::AppKind::Files       => usize::MAX,
+                    desktop::AppKind::Files       => spawn_files(),
                 };
                 if win_id != usize::MAX {
                     let mut dt = desktop::DESKTOP.lock();
@@ -507,15 +526,20 @@ fn task_blink() -> ! {
             }
         }
 
-        // HepFS window: navigate directories and open files on click
+        // HepFS window: navigate directories and open files on click.
+        // Any Files window can be clicked (not just id=1) — each has its own
+        // independent navigator entry in HEPFS_NAVS.
         if fresh_click {
-            // Determine where in the HepFS window was clicked
+            // Determine which Files window (if any) and where within it was clicked
             let hepfs_click = {
                 let dt = desktop::DESKTOP.lock();
                 dt.as_ref().and_then(|d| {
-                    let win = d.windows.iter().find(|w| w.id == 1 && !w.minimized)?;
-                    if mx < win.x || mx >= win.x + win.w as i32 { return None; }
-                    if my < win.y || my >= win.y + win.h as i32  { return None; }
+                    let win = d.windows.iter().rev().find(|w| {
+                        w.app_kind == desktop::AppKind::Files && !w.minimized
+                            && mx >= w.x && mx < w.x + w.w as i32
+                            && my >= w.y && my < w.y + w.h as i32
+                    })?;
+                    let win_id = win.id;
                     let rel_x = (mx - win.x) as usize;
                     let rel_y = my - win.y;
                     if rel_y < 22 {
@@ -523,20 +547,20 @@ fn task_blink() -> ! {
                         let zone = if rel_x < 22 { 0usize }
                                    else if rel_x < 44 { 1 }
                                    else { 2 };
-                        Some((0i32, zone)) // rel_y sentinel 0 = nav bar
+                        Some((win_id, 0i32, zone)) // sentinel 0 = nav bar
                     } else {
                         // File list (entries start at row y=23)
                         let entry_idx = (rel_y - 23).max(0) as usize / 14;
-                        Some((1, entry_idx))
+                        Some((win_id, 1, entry_idx))
                     }
                 })
             };
 
             match hepfs_click {
-                Some((0, 0)) => {
+                Some((win_id, 0, 0)) => {
                     // Back button
-                    let mut nav = HEPFS_NAV.lock();
-                    if let Some(nav) = nav.as_mut() {
+                    let mut navs = HEPFS_NAVS.lock();
+                    if let Some((_, nav)) = navs.iter_mut().find(|(id, _)| *id == win_id) {
                         if let Some((pino, ppath)) = nav.back.pop() {
                             let cur_ino  = nav.ino;
                             let cur_path = nav.path.clone();
@@ -545,13 +569,14 @@ fn task_blink() -> ! {
                             nav.path = ppath;
                         }
                     }
+                    drop(navs);
                     let mut dt = desktop::DESKTOP.lock();
                     if let Some(dt) = dt.as_mut() { dt.dirty = true; }
                 }
-                Some((0, 1)) => {
+                Some((win_id, 0, 1)) => {
                     // Forward button
-                    let mut nav = HEPFS_NAV.lock();
-                    if let Some(nav) = nav.as_mut() {
+                    let mut navs = HEPFS_NAVS.lock();
+                    if let Some((_, nav)) = navs.iter_mut().find(|(id, _)| *id == win_id) {
                         if let Some((nino, npath)) = nav.fwd.pop() {
                             let cur_ino  = nav.ino;
                             let cur_path = nav.path.clone();
@@ -560,19 +585,22 @@ fn task_blink() -> ! {
                             nav.path = npath;
                         }
                     }
+                    drop(navs);
                     let mut dt = desktop::DESKTOP.lock();
                     if let Some(dt) = dt.as_mut() { dt.dirty = true; }
                 }
-                Some((1, idx)) => {
+                Some((win_id, 1, idx)) => {
                     // File list entry click
-                    let cur_ino = HEPFS_NAV.lock().as_ref().map(|n| n.ino).unwrap_or(hepfs::ROOT_INO);
+                    let cur_ino = HEPFS_NAVS.lock().iter()
+                        .find(|(id, _)| *id == win_id).map(|(_, n)| n.ino)
+                        .unwrap_or(hepfs::ROOT_INO);
                     let at_root = cur_ino == hepfs::ROOT_INO;
 
                     // ".." row (only shown when not at root)
                     if !at_root && idx == 0 {
                         // Navigate up: back button behaviour
-                        let mut nav = HEPFS_NAV.lock();
-                        if let Some(nav) = nav.as_mut() {
+                        let mut navs = HEPFS_NAVS.lock();
+                        if let Some((_, nav)) = navs.iter_mut().find(|(id, _)| *id == win_id) {
                             if let Some((pino, ppath)) = nav.back.pop() {
                                 let ci = nav.ino;
                                 let cp = nav.path.clone();
@@ -581,6 +609,7 @@ fn task_blink() -> ! {
                                 nav.path = ppath;
                             }
                         }
+                        drop(navs);
                         let mut dt = desktop::DESKTOP.lock();
                         if let Some(dt) = dt.as_mut() { dt.dirty = true; }
                     } else {
@@ -599,8 +628,8 @@ fn task_blink() -> ! {
                         if let Some((ino, name, flags)) = entry {
                             if flags == hepfs::F_DIR {
                                 // Navigate into directory
-                                let mut nav = HEPFS_NAV.lock();
-                                if let Some(nav) = nav.as_mut() {
+                                let mut navs = HEPFS_NAVS.lock();
+                                if let Some((_, nav)) = navs.iter_mut().find(|(id, _)| *id == win_id) {
                                     let cur_ino2 = nav.ino;
                                     let cur_path = nav.path.clone();
                                     nav.back.push((cur_ino2, cur_path));
@@ -612,11 +641,13 @@ fn task_blink() -> ! {
                                         alloc::format!("{}/{}", nav.path, name)
                                     };
                                 }
+                                drop(navs);
                                 let mut dt = desktop::DESKTOP.lock();
                                 if let Some(dt) = dt.as_mut() { dt.dirty = true; }
                             } else {
                                 // Open file in editor, or in the image viewer for .bmp
-                                let cur_path = HEPFS_NAV.lock().as_ref().map(|n| n.path.clone())
+                                let cur_path = HEPFS_NAVS.lock().iter()
+                                    .find(|(id, _)| *id == win_id).map(|(_, n)| n.path.clone())
                                     .unwrap_or_else(|| alloc::string::String::from("/"));
                                 let file_path = if cur_path == "/" {
                                     alloc::format!("/{}", name)
@@ -828,7 +859,7 @@ fn task_blink() -> ! {
                     // (or how many) are open.
                     match kind {
                         desktop::AppKind::Welcome => render_welcome_window(display, wx, wy, *ww, *wh),
-                        desktop::AppKind::Files   => render_hepfs_window(display, wx, wy, *ww, *wh),
+                        desktop::AppKind::Files   => render_hepfs_window(display, wx, wy, *ww, *wh, *id),
                         desktop::AppKind::Terminal => {
                             if *id == 2 {
                                 let mut tg = terminal::TERMINAL.lock();
@@ -961,7 +992,7 @@ fn spawn_stateless_window(kind: desktop::AppKind, title: &str, w: usize, h: usiz
     }
 }
 
-fn render_hepfs_window(display: &mut framebuffer::Display, wx: usize, wy: usize, ww: usize, wh: usize) {
+fn render_hepfs_window(display: &mut framebuffer::Display, wx: usize, wy: usize, ww: usize, wh: usize, win_id: usize) {
     let bg   = framebuffer::Color::from_hex(0x0C0C0C);
     let acc  = framebuffer::Color::from_hex(0x6C8EFF);
     let text = framebuffer::Color::from_hex(0xE8E8E8);
@@ -979,11 +1010,10 @@ fn render_hepfs_window(display: &mut framebuffer::Display, wx: usize, wy: usize,
     display.fill_rect(wx, wy, ww, nav_h, nav_bg);
 
     let (has_back, has_fwd, cur_path, cur_ino) = {
-        let nav = HEPFS_NAV.lock();
-        if let Some(n) = nav.as_ref() {
-            (!n.back.is_empty(), !n.fwd.is_empty(), n.path.clone(), n.ino)
-        } else {
-            (false, false, alloc::string::String::from("/"), hepfs::ROOT_INO)
+        let navs = HEPFS_NAVS.lock();
+        match navs.iter().find(|(id, _)| *id == win_id) {
+            Some((_, n)) => (!n.back.is_empty(), !n.fwd.is_empty(), n.path.clone(), n.ino),
+            None => (false, false, alloc::string::String::from("/"), hepfs::ROOT_INO),
         }
     };
 

@@ -61,10 +61,10 @@ pub fn app_label(kind: AppKind) -> &'static str {
     }
 }
 
-/// Files/HepFS keeps a single global navigation state (current dir, back/forward
-/// history) — a second window would just show the same coupled state, not an
-/// independent one, so it's excluded from "spawn another instance".
-pub fn app_supports_new_window(kind: AppKind) -> bool { !matches!(kind, AppKind::Files) }
+/// All app kinds support spawning another independent instance. Files/HepFS
+/// used to be excluded (its nav state was a single global), but each Files
+/// window now gets its own navigator entry, so it works like everything else.
+pub fn app_supports_new_window(_kind: AppKind) -> bool { true }
 
 struct IconDef { win_id: usize, label: &'static str, color: Color }
 const ICONS: &[IconDef] = &[
@@ -291,8 +291,18 @@ impl Desktop {
     /// Group non-minimized windows by app kind, in order of first appearance.
     /// Returns (kind, ids-of-that-kind) — ids in the same z-order as `self.windows`.
     pub fn grouped_taskbar_entries(&self) -> Vec<(AppKind, Vec<usize>)> {
+        Self::group_by_kind(self.windows.iter().filter(|w| !w.minimized))
+    }
+
+    /// Group ALL windows (regardless of minimized state) by app kind — used by
+    /// the Start Menu, which lists every program, not just open ones.
+    pub fn grouped_all_entries(&self) -> Vec<(AppKind, Vec<usize>)> {
+        Self::group_by_kind(self.windows.iter())
+    }
+
+    fn group_by_kind<'a>(iter: impl Iterator<Item = &'a Window>) -> Vec<(AppKind, Vec<usize>)> {
         let mut groups: Vec<(AppKind, Vec<usize>)> = Vec::new();
-        for w in self.windows.iter().filter(|w| !w.minimized) {
+        for w in iter {
             if let Some(g) = groups.iter_mut().find(|(k, _)| *k == w.app_kind) {
                 g.1.push(w.id);
             } else {
@@ -411,14 +421,15 @@ impl Desktop {
                 groups.get(slot).map(|(k, _)| *k)
             } else { None };
 
-            let menu_h   = self.windows.len() * MENU_ENTRY_H + 8;
+            let start_groups = self.grouped_all_entries();
+            let menu_h   = start_groups.len() * MENU_ENTRY_H + 8;
             let menu_top = (self.fb_h - TASKBAR_H).saturating_sub(menu_h);
             let in_menu  = self.start_menu_open
                 && mx >= 0 && (mx as usize) < MENU_W
                 && my >= menu_top as i32 && my < self.fb_h as i32 - TASKBAR_H as i32;
             let startmenu_kind = if in_menu {
                 let entry = (my as usize - menu_top) / MENU_ENTRY_H;
-                self.windows.get(entry).map(|w| w.app_kind)
+                start_groups.get(entry).map(|(k, _)| *k)
             } else { None };
 
             if let Some(kind) = taskbar_kind.or(startmenu_kind) {
@@ -466,7 +477,7 @@ impl Desktop {
         // — e.g. clicking a different taskbar button both closes this popup and works.
         let mut jumplist_just_closed_for: Option<AppKind> = None;
         if let Some((jl_kind, jl_x)) = self.taskbar_jumplist {
-            let ids = self.grouped_taskbar_entries().into_iter()
+            let ids = self.grouped_all_entries().into_iter()
                 .find(|(k, _)| *k == jl_kind).map(|(_, ids)| ids).unwrap_or_default();
             let hit = self.jumplist_item_at(jl_x, &ids, mx, my);
             self.taskbar_jumplist = None;
@@ -482,23 +493,29 @@ impl Desktop {
         // Double-click tracking: clear pending unless we land on the same title bar again
         let prev_dbl = self.dbl_click_pending.take();
 
-        let in_taskbar = my >= self.fb_h as i32 - TASKBAR_H as i32;
-        let menu_h     = self.windows.len() * MENU_ENTRY_H + 8;
-        let menu_top   = (self.fb_h - TASKBAR_H).saturating_sub(menu_h);
-        let in_menu    = self.start_menu_open
+        let in_taskbar   = my >= self.fb_h as i32 - TASKBAR_H as i32;
+        let start_groups = self.grouped_all_entries();
+        let menu_h       = start_groups.len() * MENU_ENTRY_H + 8;
+        let menu_top     = (self.fb_h - TASKBAR_H).saturating_sub(menu_h);
+        let in_menu      = self.start_menu_open
             && mx >= 0 && (mx as usize) < MENU_W
             && my >= menu_top as i32 && my < self.fb_h as i32 - TASKBAR_H as i32;
 
-        // Start-menu item click
+        // Start-menu item click — one program per row; >1 open instance opens
+        // a jump list (same picker the taskbar uses) instead of guessing which to focus.
         if in_menu {
             let entry = (my as usize - menu_top) / MENU_ENTRY_H;
-            if entry < self.windows.len() {
-                let id = self.windows[entry].id;
-                if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
-                    w.minimized = false;
-                }
-                self.bring_to_front(id);
+            if let Some((kind, ids)) = start_groups.get(entry) {
                 self.start_menu_open = false;
+                if ids.len() == 1 {
+                    let id = ids[0];
+                    if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+                        w.minimized = false;
+                    }
+                    self.bring_to_front(id);
+                } else {
+                    self.taskbar_jumplist = Some((*kind, 0));
+                }
                 self.dirty = true;
             }
             return false;
@@ -855,7 +872,9 @@ impl Desktop {
     /// with >1 window is clicked) — one row per instance of that app kind.
     pub fn draw_taskbar_jumplist(&self, display: &mut Display) {
         let Some((kind, btn_x)) = self.taskbar_jumplist else { return; };
-        let ids = match self.grouped_taskbar_entries().into_iter().find(|(k, _)| *k == kind) {
+        // Uses ALL instances (not just non-minimized) so a jump list opened from
+        // the Start Menu still works when every instance happens to be minimized.
+        let ids = match self.grouped_all_entries().into_iter().find(|(k, _)| *k == kind) {
             Some((_, ids)) => ids,
             None => return,
         };
@@ -939,11 +958,14 @@ impl Desktop {
     }
 
     /// Draw the start menu popup. Call BEFORE draw_taskbar so taskbar renders on top.
+    /// Lists one row per *program* (grouped by app kind), not one per window —
+    /// several open instances of the same app still show as a single entry.
     pub fn draw_start_menu(&self, display: &mut Display) {
         if !self.start_menu_open { return; }
 
-        let menu_h  = self.windows.len() * MENU_ENTRY_H + 8;
-        let menu_y  = (self.fb_h - TASKBAR_H).saturating_sub(menu_h);
+        let groups = self.grouped_all_entries();
+        let menu_h = groups.len() * MENU_ENTRY_H + 8;
+        let menu_y = (self.fb_h - TASKBAR_H).saturating_sub(menu_h);
 
         // Background + border
         display.fill_rect(0, menu_y, MENU_W, menu_h, pal::MENU_BG);
@@ -954,18 +976,24 @@ impl Desktop {
         display.draw_text(8, menu_y + 4, "Programs", pal::ACCENT, 1);
         display.fill_rect(0, menu_y + 18, MENU_W, 1, pal::MENU_BORDER);
 
-        // Entries — all windows, regardless of minimized state
-        for (i, win) in self.windows.iter().enumerate() {
+        for (i, (kind, ids)) in groups.iter().enumerate() {
             let ey = menu_y + 8 + i * MENU_ENTRY_H;
-            let active = self.focused == Some(win.id) && !win.minimized;
-            if active {
+            let any_open   = ids.iter().any(|&id| self.windows.iter().any(|w| w.id == id && !w.minimized));
+            let any_focused = ids.iter().any(|&id| self.focused == Some(id))
+                && self.windows.iter().any(|w| ids.contains(&w.id) && self.focused == Some(w.id) && !w.minimized);
+            if any_focused {
                 display.fill_rect(2, ey, MENU_W - 4, MENU_ENTRY_H - 2, pal::MENU_HOVER);
             }
-            let label = if win.title.len() > 18 { &win.title[..18] } else { &win.title };
-            let col = if active { pal::ACCENT } else { pal::TEXT };
+            let label = if ids.len() > 1 {
+                alloc::format!("{} ({})", app_label(*kind), ids.len())
+            } else {
+                String::from(app_label(*kind))
+            };
+            let label = if label.len() > 18 { &label[..18] } else { &label };
+            let col = if any_focused { pal::ACCENT } else { pal::TEXT };
             display.draw_text(10, ey + 6, label, col, 1);
-            // Minimized badge
-            if win.minimized {
+            // "--" badge when no instance of this program is currently open
+            if !any_open {
                 display.draw_text(MENU_W - 24, ey + 6, "--", pal::TEXT_DIM, 1);
             }
         }
