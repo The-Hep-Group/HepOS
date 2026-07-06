@@ -43,6 +43,29 @@ const ICON_SIZE:   usize = 48;
 const ICON_STRIDE: usize = 80; // vertical spacing between icon tops
 const ICON_X:      usize = 16; // left edge
 
+// ── App kinds — used to group taskbar/start-menu entries and to know what
+// "spawn another instance" means for a given program. ──────────────────────
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AppKind { Welcome, Files, Terminal, Editor, Sysmon, Settings, ImageViewer, AudioPlayer }
+
+pub fn app_label(kind: AppKind) -> &'static str {
+    match kind {
+        AppKind::Welcome     => "Welcome",
+        AppKind::Files       => "Files",
+        AppKind::Terminal    => "Terminal",
+        AppKind::Editor      => "Editor",
+        AppKind::Sysmon      => "Sysmon",
+        AppKind::Settings    => "Settings",
+        AppKind::ImageViewer => "Image Viewer",
+        AppKind::AudioPlayer => "Audio Player",
+    }
+}
+
+/// Files/HepFS keeps a single global navigation state (current dir, back/forward
+/// history) — a second window would just show the same coupled state, not an
+/// independent one, so it's excluded from "spawn another instance".
+pub fn app_supports_new_window(kind: AppKind) -> bool { !matches!(kind, AppKind::Files) }
+
 struct IconDef { win_id: usize, label: &'static str, color: Color }
 const ICONS: &[IconDef] = &[
     IconDef { win_id: 0, label: "Welcome",  color: Color::from_hex(0xE8A020) },
@@ -71,6 +94,7 @@ const MENU_W:         usize = 160;
 // ── Window ───────────────────────────────────────────────────────────────────
 pub struct Window {
     pub id:          usize,
+    pub app_kind:    AppKind,
     pub title:       String,
     pub x:           i32,
     pub y:           i32,
@@ -97,9 +121,9 @@ pub struct Window {
 }
 
 impl Window {
-    pub fn new(id: usize, title: &str, x: i32, y: i32, w: usize, h: usize) -> Self {
+    pub fn new(id: usize, app_kind: AppKind, title: &str, x: i32, y: i32, w: usize, h: usize) -> Self {
         Window {
-            id, title: String::from(title),
+            id, app_kind, title: String::from(title),
             x, y, w, h, minimized: false, maximized: false, is_terminal: false,
             saved_x: x, saved_y: y, saved_w: w, saved_h: h,
             drag_off_x: 0, drag_off_y: 0, dragging: false,
@@ -200,9 +224,15 @@ pub struct Desktop {
     pub start_menu_open:  bool,
     dbl_click_pending:    Option<usize>,
     pub snap_zone:        Option<SnapZone>,
-    pub context_menu:     Option<(i32, i32)>, // Some(x,y) = right-click menu position
+    pub context_menu:      Option<(i32, i32)>, // Some(x,y) = right-click menu position
+    pub context_menu_kind: ContextMenuKind,
     pub open_settings_requested: bool,
+    pub new_window_requested:   Option<AppKind>,
+    pub taskbar_jumplist:  Option<(AppKind, usize)>, // (kind, button left-x) — open when count>1
 }
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum ContextMenuKind { Background, App(AppKind) }
 
 impl Desktop {
     pub fn new(fb_w: usize, fb_h: usize) -> Self {
@@ -211,14 +241,16 @@ impl Desktop {
             fb_w, fb_h, prev_btn: 0, dirty: true, mouse_dirty: false,
             prev_cx: 0, prev_cy: 0, start_menu_open: false,
             dbl_click_pending: None, snap_zone: None,
-            context_menu: None, open_settings_requested: false,
+            context_menu: None, context_menu_kind: ContextMenuKind::Background,
+            open_settings_requested: false, new_window_requested: None,
+            taskbar_jumplist: None,
         }
     }
 
-    pub fn add_window(&mut self, title: &str, x: i32, y: i32, w: usize, h: usize) -> usize {
+    pub fn add_window(&mut self, app_kind: AppKind, title: &str, x: i32, y: i32, w: usize, h: usize) -> usize {
         let id = self.next_id;
         self.next_id += 1;
-        self.windows.push(Window::new(id, title, x, y, w, h));
+        self.windows.push(Window::new(id, app_kind, title, x, y, w, h));
         self.focused = Some(id);
         id
     }
@@ -253,6 +285,34 @@ impl Desktop {
             3     => CursorType::ResizeNWSE,   // bottom-right corner
             6     => CursorType::ResizeNESW,   // bottom-left corner
             _     => CursorType::ResizeNS,
+        }
+    }
+
+    /// Group non-minimized windows by app kind, in order of first appearance.
+    /// Returns (kind, ids-of-that-kind) — ids in the same z-order as `self.windows`.
+    pub fn grouped_taskbar_entries(&self) -> Vec<(AppKind, Vec<usize>)> {
+        let mut groups: Vec<(AppKind, Vec<usize>)> = Vec::new();
+        for w in self.windows.iter().filter(|w| !w.minimized) {
+            if let Some(g) = groups.iter_mut().find(|(k, _)| *k == w.app_kind) {
+                g.1.push(w.id);
+            } else {
+                groups.push((w.app_kind, alloc::vec![w.id]));
+            }
+        }
+        groups
+    }
+
+    /// Display label for one window inside a jump-list / grouped context — if the
+    /// window's title is just the generic app label (e.g. every Terminal window is
+    /// literally titled "Terminal"), number it ("Terminal 1", "Terminal 2", ...);
+    /// otherwise the title already differentiates instances (e.g. "Editor: foo.txt").
+    fn instance_label(&self, kind: AppKind, ids: &[usize], id: usize) -> String {
+        let win = match self.windows.iter().find(|w| w.id == id) { Some(w) => w, None => return String::new() };
+        if win.title == app_label(kind) {
+            let n = ids.iter().position(|&i| i == id).unwrap_or(0) + 1;
+            alloc::format!("{} {}", app_label(kind), n)
+        } else {
+            win.title.clone()
         }
     }
 
@@ -340,18 +400,47 @@ impl Desktop {
             }
         }
 
-        // Right-click on desktop (not on a window or taskbar) → open context menu
+        // Right-click: taskbar button → New Window; start-menu row → New Window;
+        // empty desktop → Change background. Priority in that order.
         if right_clicked {
             let in_taskbar = my >= self.fb_h as i32 - TASKBAR_H as i32;
-            let on_window  = !in_taskbar && self.windows.iter().rev().any(|w| {
-                !w.minimized && (w.close_hit(mx, my) || w.maximize_hit(mx, my)
-                    || w.newterm_hit(mx, my) || w.title_hit(mx, my)
-                    || w.resize_hit(mx, my) || w.content_hit(mx, my))
-            });
-            if !on_window && !in_taskbar {
-                self.context_menu     = Some((mx, my));
-                self.start_menu_open  = false;
-                self.dirty            = true;
+
+            let taskbar_kind = if in_taskbar && mx as usize >= START_W {
+                let groups = self.grouped_taskbar_entries();
+                let slot   = (mx as usize - START_W) / TASK_BTN_W;
+                groups.get(slot).map(|(k, _)| *k)
+            } else { None };
+
+            let menu_h   = self.windows.len() * MENU_ENTRY_H + 8;
+            let menu_top = (self.fb_h - TASKBAR_H).saturating_sub(menu_h);
+            let in_menu  = self.start_menu_open
+                && mx >= 0 && (mx as usize) < MENU_W
+                && my >= menu_top as i32 && my < self.fb_h as i32 - TASKBAR_H as i32;
+            let startmenu_kind = if in_menu {
+                let entry = (my as usize - menu_top) / MENU_ENTRY_H;
+                self.windows.get(entry).map(|w| w.app_kind)
+            } else { None };
+
+            if let Some(kind) = taskbar_kind.or(startmenu_kind) {
+                if app_supports_new_window(kind) {
+                    self.context_menu      = Some((mx, my));
+                    self.context_menu_kind = ContextMenuKind::App(kind);
+                    self.taskbar_jumplist   = None;
+                    self.dirty              = true;
+                }
+            } else if !in_taskbar {
+                let on_window = self.windows.iter().rev().any(|w| {
+                    !w.minimized && (w.close_hit(mx, my) || w.maximize_hit(mx, my)
+                        || w.newterm_hit(mx, my) || w.title_hit(mx, my)
+                        || w.resize_hit(mx, my) || w.content_hit(mx, my))
+                });
+                if !on_window {
+                    self.context_menu      = Some((mx, my));
+                    self.context_menu_kind = ContextMenuKind::Background;
+                    self.start_menu_open    = false;
+                    self.taskbar_jumplist   = None;
+                    self.dirty               = true;
+                }
             }
         }
 
@@ -360,12 +449,34 @@ impl Desktop {
         // Left-click dismisses context menu; handle the item first if clicked on it.
         if self.context_menu.is_some() {
             let item = self.context_menu_item_at(mx, my);
+            let kind = self.context_menu_kind;
             self.context_menu = None;
             self.dirty = true;
             if item == Some(0) {
-                self.open_settings_requested = true;
+                match kind {
+                    ContextMenuKind::Background => self.open_settings_requested = true,
+                    ContextMenuKind::App(k)     => self.new_window_requested = Some(k),
+                }
             }
             return false;
+        }
+
+        // Left-click while a taskbar jump list is open: pick an entry, or dismiss it.
+        // Falls through (doesn't return) so the same click can still register normally
+        // — e.g. clicking a different taskbar button both closes this popup and works.
+        let mut jumplist_just_closed_for: Option<AppKind> = None;
+        if let Some((jl_kind, jl_x)) = self.taskbar_jumplist {
+            let ids = self.grouped_taskbar_entries().into_iter()
+                .find(|(k, _)| *k == jl_kind).map(|(_, ids)| ids).unwrap_or_default();
+            let hit = self.jumplist_item_at(jl_x, &ids, mx, my);
+            self.taskbar_jumplist = None;
+            self.dirty = true;
+            if let Some(id) = hit {
+                if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) { w.minimized = false; }
+                self.bring_to_front(id);
+                return false;
+            }
+            jumplist_just_closed_for = Some(jl_kind);
         }
 
         // Double-click tracking: clear pending unless we land on the same title bar again
@@ -400,23 +511,29 @@ impl Desktop {
                 self.start_menu_open = !self.start_menu_open;
                 self.dirty = true;
             } else {
-                // Window button — find the N-th visible (non-minimized) window
+                // Window button — grouped by app kind; a group with >1 window opens
+                // a jump list instead of directly toggling a single window.
                 self.start_menu_open = false;
-                let btn_x = mx as usize - START_W;
-                let slot  = btn_x / TASK_BTN_W;
-                let ids: Vec<usize> = self.windows.iter()
-                    .filter(|w| !w.minimized)
-                    .map(|w| w.id)
-                    .collect();
-                if let Some(&wid) = ids.get(slot) {
-                    if self.focused == Some(wid) {
-                        // Click focused window button = minimize it
-                        if let Some(w) = self.windows.iter_mut().find(|w| w.id == wid) {
-                            w.minimized = true;
+                let groups = self.grouped_taskbar_entries();
+                let btn_x  = mx as usize - START_W;
+                let slot   = btn_x / TASK_BTN_W;
+                if let Some((kind, ids)) = groups.get(slot) {
+                    if ids.len() == 1 {
+                        let wid = ids[0];
+                        if self.focused == Some(wid) {
+                            // Click focused window button = minimize it
+                            if let Some(w) = self.windows.iter_mut().find(|w| w.id == wid) {
+                                w.minimized = true;
+                            }
+                            self.focused = None;
+                        } else {
+                            self.bring_to_front(wid);
                         }
-                        self.focused = None;
+                    } else if jumplist_just_closed_for == Some(*kind) {
+                        // This click just dismissed this exact jump list — leave it closed.
                     } else {
-                        self.bring_to_front(wid);
+                        let btn_left = START_W + slot * TASK_BTN_W;
+                        self.taskbar_jumplist = Some((*kind, btn_left));
                     }
                     self.dirty = true;
                 }
@@ -705,18 +822,24 @@ impl Desktop {
         // Separator
         display.fill_rect(START_W, ty + 4, 1, TASKBAR_H - 8, pal::BORDER);
 
-        // Open (non-minimized) window buttons
+        // Open (non-minimized) window buttons — grouped by app kind, "(N)" suffix if >1
         let mut bx = START_W + 4;
-        for win in self.windows.iter().filter(|w| !w.minimized) {
+        for (kind, ids) in self.grouped_taskbar_entries() {
             if bx + TASK_BTN_W > self.fb_w - 80 { break; }
-            let active = self.focused == Some(win.id);
+            let active = ids.len() == 1 && self.focused == Some(ids[0])
+                || (ids.len() > 1 && ids.iter().any(|&i| self.focused == Some(i)));
             let bc = if active { pal::TASKBAR_ACT } else { pal::TASKBAR_BTN };
             display.fill_rect(bx, ty + 4, TASK_BTN_W - 4, TASKBAR_H - 8, bc);
-            // Active indicator bar
             if active {
                 display.fill_rect(bx, ty + TASKBAR_H - 5, TASK_BTN_W - 4, 2, pal::ACCENT);
             }
-            let label = if win.title.len() > 13 { &win.title[..13] } else { &win.title };
+            let full_label = if ids.len() > 1 {
+                alloc::format!("{} ({})", app_label(kind), ids.len())
+            } else {
+                let win = self.windows.iter().find(|w| w.id == ids[0]);
+                win.map(|w| w.title.clone()).unwrap_or_else(|| String::from(app_label(kind)))
+            };
+            let label = if full_label.len() > 13 { &full_label[..13] } else { &full_label };
             display.draw_text(bx + 6, ty + 10, label, pal::TEXT, 1);
             bx += TASK_BTN_W;
         }
@@ -726,6 +849,50 @@ impl Desktop {
         let time = crate::rtc::fmt_time(&mut tbuf);
         let tw   = time.len() * 9;
         display.draw_text(self.fb_w.saturating_sub(tw + 8), ty + 10, time, pal::TEXT, 1);
+    }
+
+    /// Draw the jump-list popup (opens above the taskbar when a grouped button
+    /// with >1 window is clicked) — one row per instance of that app kind.
+    pub fn draw_taskbar_jumplist(&self, display: &mut Display) {
+        let Some((kind, btn_x)) = self.taskbar_jumplist else { return; };
+        let ids = match self.grouped_taskbar_entries().into_iter().find(|(k, _)| *k == kind) {
+            Some((_, ids)) => ids,
+            None => return,
+        };
+        const JL_W: usize = 180;
+        let item_h = MENU_ENTRY_H;
+        let jl_h   = ids.len() * item_h + 8;
+        let x = btn_x.min(self.fb_w.saturating_sub(JL_W));
+        let y = (self.fb_h - TASKBAR_H).saturating_sub(jl_h);
+
+        display.fill_rect(x, y, JL_W, jl_h, pal::MENU_BG);
+        display.fill_rect(x, y, JL_W, 1, pal::MENU_BORDER);
+        display.fill_rect(x, y, 1, jl_h, pal::MENU_BORDER);
+        display.fill_rect(x + JL_W - 1, y, 1, jl_h, pal::MENU_BORDER);
+        display.fill_rect(x, y + jl_h - 1, JL_W, 1, pal::MENU_BORDER);
+
+        for (i, &id) in ids.iter().enumerate() {
+            let ey = y + 4 + i * item_h;
+            let active = self.focused == Some(id);
+            if active {
+                display.fill_rect(x + 2, ey, JL_W - 4, item_h - 2, pal::MENU_HOVER);
+            }
+            let label = self.instance_label(kind, &ids, id);
+            let label = if label.len() > 22 { &label[..22] } else { &label };
+            display.draw_text(x + 8, ey + 6, label, if active { pal::ACCENT } else { pal::TEXT }, 1);
+        }
+    }
+
+    /// Hit-test for the jump-list popup. Returns the window id clicked, if any.
+    pub fn jumplist_item_at(&self, btn_x: usize, ids: &[usize], mx: i32, my: i32) -> Option<usize> {
+        const JL_W: usize = 180;
+        let item_h = MENU_ENTRY_H;
+        let jl_h   = ids.len() * item_h + 8;
+        let x = btn_x.min(self.fb_w.saturating_sub(JL_W)) as i32;
+        let y = (self.fb_h - TASKBAR_H).saturating_sub(jl_h) as i32;
+        if mx < x || mx >= x + JL_W as i32 || my < y + 4 || my >= y + jl_h as i32 - 4 { return None; }
+        let row = (my - y - 4) as usize / item_h;
+        ids.get(row).copied()
     }
 
     /// Draw right-click context menu if one is open.
@@ -748,8 +915,11 @@ impl Desktop {
         display.fill_rect(x, y + CM_H - 1, CM_W, 1, pal::MENU_BORDER);
         display.fill_rect(x, y, 1, CM_H, pal::MENU_BORDER);
         display.fill_rect(x + CM_W - 1, y, 1, CM_H, pal::MENU_BORDER);
-        // Item: "Change background"
-        display.draw_text(x + 10, y + 8, "Change background", pal::TEXT, 1);
+        let label = match self.context_menu_kind {
+            ContextMenuKind::Background => "Change background",
+            ContextMenuKind::App(_)     => "New Window",
+        };
+        display.draw_text(x + 10, y + 8, label, pal::TEXT, 1);
     }
 
     /// Context-menu item hit-test.  Returns Some(item_index) if (mx,my) is inside

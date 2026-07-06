@@ -144,20 +144,21 @@ extern "C" fn kmain(bi_ptr: *const bootinfo::BootInfo) -> ! {
         let h = bi.fb_height as usize;
         let mut dt = desktop::Desktop::new(w, h);
         // Window positions chosen to fit common resolutions (640×480 min)
-        dt.add_window("Welcome to HepOS", 20,  50,  300, 160);
-        dt.add_window("HepFS",            340, 50,  260, 160);
-        dt.add_window("Terminal",         20,  240, 580, 200);
+        use desktop::AppKind;
+        dt.add_window(AppKind::Welcome, "Welcome to HepOS", 20,  50,  300, 160);
+        dt.add_window(AppKind::Files,   "HepFS",            340, 50,  260, 160);
+        dt.add_window(AppKind::Terminal,"Terminal",         20,  240, 580, 200);
         dt.set_terminal_window(2);
         // Editor window (id=3) — hidden until `edit` command opens a file
-        dt.add_window("Editor",           60,  40,  580, 380);
+        dt.add_window(AppKind::Editor, "Editor",           60,  40,  580, 380);
         // Sysmon window (id=4) — hidden until opened from start menu
-        dt.add_window("Sysmon",           80,  60,  340, 260);
+        dt.add_window(AppKind::Sysmon, "Sysmon",           80,  60,  340, 260);
         // Settings window (id=5) — hidden until opened from icon or right-click menu
-        dt.add_window("Settings",         120, 80,  480, 320);
+        dt.add_window(AppKind::Settings, "Settings",         120, 80,  480, 320);
         // Image Viewer window (id=6) — hidden until a .bmp is opened
-        dt.add_window("Image Viewer",     100, 60,  420, 340);
+        dt.add_window(AppKind::ImageViewer, "Image Viewer",     100, 60,  420, 340);
         // Audio Player window (id=7) — hidden until a .wav is played
-        dt.add_window("Audio Player",     140, 100, 380, 160);
+        dt.add_window(AppKind::AudioPlayer, "Audio Player",     140, 100, 380, 160);
         *desktop::DESKTOP.lock() = Some(dt);
     }
 
@@ -352,7 +353,7 @@ fn task_blink() -> ! {
             let focused = *FOCUSED_WIN.lock();
 
             if focused == Some(3) {
-                // Editor has focus — route all keys
+                // Main Editor window has focus — route all keys
                 let mut eg = editor::EDITOR.lock();
                 if let Some(ed) = eg.as_mut() {
                     ed.on_key(c);
@@ -370,8 +371,33 @@ fn task_blink() -> ! {
                 }
             } else {
                 let focused = *FOCUSED_WIN.lock();
+                // Route to a focused extra editor window, if one is focused
+                let routed_editor = {
+                    let (matched, should_close, target_wid) = {
+                        let mut ee = editor::EXTRA_EDITORS.lock();
+                        match ee.iter_mut().find(|(wid, _)| Some(*wid) == focused) {
+                            Some((wid, ed)) => {
+                                let wid = *wid;
+                                ed.on_key(c);
+                                (true, !ed.open, wid)
+                            }
+                            None => (false, false, 0),
+                        }
+                    }; // extra-editors lock released here
+                    if matched && should_close {
+                        let mut dt = desktop::DESKTOP.lock();
+                        if let Some(dt) = dt.as_mut() {
+                            if let Some(w) = dt.windows.iter_mut().find(|w| w.id == target_wid) {
+                                w.minimized = true;
+                            }
+                            dt.dirty = true;
+                        }
+                        *FOCUSED_WIN.lock() = Some(2);
+                    }
+                    matched
+                };
                 // Route to the focused extra terminal if one is focused
-                let routed_extra = {
+                let routed_extra = routed_editor || {
                     let mut et = terminal::EXTRA_TERMINALS.lock();
                     if let Some((_, t)) = et.iter_mut().find(|(wid, _)| Some(*wid) == focused) {
                         t.on_key(c);
@@ -425,6 +451,46 @@ fn task_blink() -> ! {
                     dt.bring_to_front(5);
                     *FOCUSED_WIN.lock() = Some(5);
                     dt.dirty = true;
+                }
+            }
+        }
+
+        // Handle new_window_requested — "New Window" from a taskbar/start-menu right-click
+        {
+            let requested = {
+                let mut dt = desktop::DESKTOP.lock();
+                if let Some(dt) = dt.as_mut() {
+                    let r = dt.new_window_requested;
+                    dt.new_window_requested = None;
+                    r
+                } else { None }
+            };
+            if let Some(kind) = requested {
+                let win_id = match kind {
+                    desktop::AppKind::Terminal    => terminal::spawn_terminal(),
+                    desktop::AppKind::Editor      => editor::spawn_editor_blank(),
+                    desktop::AppKind::ImageViewer => image::spawn_viewer_blank(),
+                    // Welcome/Sysmon/Settings/AudioPlayer show pure global state — a
+                    // duplicate window just needs to exist, no per-instance data.
+                    desktop::AppKind::Welcome     => spawn_stateless_window(desktop::AppKind::Welcome, "Welcome to HepOS", 300, 160),
+                    desktop::AppKind::Sysmon      => spawn_stateless_window(desktop::AppKind::Sysmon, "Sysmon", 340, 260),
+                    desktop::AppKind::Settings    => spawn_stateless_window(desktop::AppKind::Settings, "Settings", 480, 320),
+                    desktop::AppKind::AudioPlayer => spawn_stateless_window(desktop::AppKind::AudioPlayer, "Audio Player", 380, 160),
+                    // Files/HepFS has global nav state — not offered as a context-menu
+                    // option (app_supports_new_window returns false), but handle
+                    // gracefully if ever reached.
+                    desktop::AppKind::Files       => usize::MAX,
+                };
+                if win_id != usize::MAX {
+                    let mut dt = desktop::DESKTOP.lock();
+                    if let Some(dt) = dt.as_mut() {
+                        if let Some(w) = dt.windows.iter_mut().find(|w| w.id == win_id) {
+                            w.minimized = false;
+                        }
+                        dt.bring_to_front(win_id);
+                        dt.dirty = true;
+                    }
+                    *FOCUSED_WIN.lock() = Some(win_id);
                 }
             }
         }
@@ -558,27 +624,25 @@ fn task_blink() -> ! {
                                     alloc::format!("{}/{}", cur_path, name)
                                 };
                                 let lower = name.to_lowercase();
-                                let win_id = if lower.ends_with(".bmp") {
-                                    image::open(&file_path);
-                                    6usize
+                                if lower.ends_with(".bmp") {
+                                    image::open_smart(&file_path);
                                 } else if lower.ends_with(".wav") {
+                                    // All Audio Player windows show the same global "now playing"
+                                    // state, so just bring the main one (id=7) forward.
                                     audio::play(&file_path);
-                                    7usize
-                                } else {
-                                    editor::open(&file_path);
-                                    3usize
-                                };
-                                {
                                     let mut dt = desktop::DESKTOP.lock();
                                     if let Some(dt) = dt.as_mut() {
-                                        if let Some(w) = dt.windows.iter_mut().find(|w| w.id == win_id) {
+                                        if let Some(w) = dt.windows.iter_mut().find(|w| w.id == 7) {
                                             w.minimized = false;
                                         }
-                                        dt.bring_to_front(win_id);
+                                        dt.bring_to_front(7);
                                         dt.dirty = true;
                                     }
+                                    drop(dt);
+                                    *FOCUSED_WIN.lock() = Some(7);
+                                } else {
+                                    editor::open_smart(&file_path);
                                 }
-                                *FOCUSED_WIN.lock() = Some(win_id);
                             }
                         }
                     }
@@ -738,15 +802,15 @@ fn task_blink() -> ! {
                   if let Some(dt) = dt.as_mut() { dt.dirty = false; } }
 
                 // 2. Windows in z-order
-                let win_order: alloc::vec::Vec<(usize, bool, i32, i32, usize, usize)> = {
+                let win_order: alloc::vec::Vec<(usize, desktop::AppKind, bool, i32, i32, usize, usize)> = {
                     let dt = desktop::DESKTOP.lock();
                     dt.as_ref().map(|d| d.windows.iter()
                         .filter(|w| !w.minimized)
-                        .map(|w| (w.id, d.focused == Some(w.id), w.x, w.y, w.w, w.h))
+                        .map(|w| (w.id, w.app_kind, d.focused == Some(w.id), w.x, w.y, w.w, w.h))
                         .collect()
                     ).unwrap_or_default()
                 };
-                for (id, focused, wx, wy, ww, wh) in &win_order {
+                for (id, kind, focused, wx, wy, ww, wh) in &win_order {
                     { let dt = desktop::DESKTOP.lock();
                       if let Some(dt) = dt.as_ref() {
                           if let Some(win) = dt.windows.iter().find(|w| w.id == *id) {
@@ -756,45 +820,72 @@ fn task_blink() -> ! {
                     }
                     let wx = (*wx).max(0) as usize;
                     let wy = (*wy).max(0) as usize;
-                    match id {
-                        0 => render_welcome_window(display),
-                        1 => render_hepfs_window(display),
-                        2 => { let mut tg = terminal::TERMINAL.lock();
-                               if let Some(t) = tg.as_mut() {
-                                   t.render(display, wx, wy, *ww, *wh);
-                                   t.dirty = false;
-                               } }
-                        3 => { let mut eg = editor::EDITOR.lock();
-                               if let Some(ed) = eg.as_mut() {
-                                   ed.render(display, wx, wy, *ww, *wh);
-                               } }
-                        4 => render_sysmon_window(display),
-                        5 => render_settings_window(display),
-                        6 => { let vg = image::VIEWER.lock();
-                               if let Some(v) = vg.as_ref() {
-                                   v.render(display, wx, wy, *ww, *wh);
-                               } else {
-                                   display.fill_rect(wx, wy, *ww, *wh, framebuffer::Color::from_hex(0x0A0A14));
-                                   display.draw_text(wx + 8, wy + 8, "No image open - try `view <file>.bmp`",
-                                       framebuffer::Color::from_hex(0x888888), 1);
-                               } }
-                        7 => audio::render(display, wx, wy, *ww, *wh),
-                        _ => {
-                            // Extra terminals spawned via `newterm`
-                            let mut et = terminal::EXTRA_TERMINALS.lock();
-                            if let Some((_, t)) = et.iter_mut().find(|(wid, _)| *wid == *id) {
-                                t.render(display, wx, wy, *ww, *wh);
-                                t.dirty = false;
+                    // Dispatch by app kind, not raw id — the "main" window of each
+                    // kind (fixed id 2/3/6) reads its dedicated static; any other
+                    // window of that kind is looked up in its EXTRA_* list. Kinds
+                    // with no per-instance state (Welcome/Files/Sysmon/Settings/
+                    // AudioPlayer) render identically regardless of which window
+                    // (or how many) are open.
+                    match kind {
+                        desktop::AppKind::Welcome => render_welcome_window(display, wx, wy, *ww, *wh),
+                        desktop::AppKind::Files   => render_hepfs_window(display, wx, wy, *ww, *wh),
+                        desktop::AppKind::Terminal => {
+                            if *id == 2 {
+                                let mut tg = terminal::TERMINAL.lock();
+                                if let Some(t) = tg.as_mut() {
+                                    t.render(display, wx, wy, *ww, *wh);
+                                    t.dirty = false;
+                                }
+                            } else {
+                                let mut et = terminal::EXTRA_TERMINALS.lock();
+                                if let Some((_, t)) = et.iter_mut().find(|(wid, _)| *wid == *id) {
+                                    t.render(display, wx, wy, *ww, *wh);
+                                    t.dirty = false;
+                                }
                             }
                         }
+                        desktop::AppKind::Editor => {
+                            if *id == 3 {
+                                let mut eg = editor::EDITOR.lock();
+                                if let Some(ed) = eg.as_mut() {
+                                    ed.render(display, wx, wy, *ww, *wh);
+                                }
+                            } else {
+                                let mut ee = editor::EXTRA_EDITORS.lock();
+                                if let Some((_, ed)) = ee.iter_mut().find(|(wid, _)| *wid == *id) {
+                                    ed.render(display, wx, wy, *ww, *wh);
+                                }
+                            }
+                        }
+                        desktop::AppKind::Sysmon   => render_sysmon_window(display, wx, wy, *ww, *wh),
+                        desktop::AppKind::Settings => render_settings_window(display, wx, wy, *ww, *wh),
+                        desktop::AppKind::ImageViewer => {
+                            let no_image = |display: &mut framebuffer::Display| {
+                                display.fill_rect(wx, wy, *ww, *wh, framebuffer::Color::from_hex(0x0A0A14));
+                                display.draw_text(wx + 8, wy + 8, "No image open - try `view <file>.bmp`",
+                                    framebuffer::Color::from_hex(0x888888), 1);
+                            };
+                            if *id == 6 {
+                                let vg = image::VIEWER.lock();
+                                match vg.as_ref() {
+                                    Some(v) => v.render(display, wx, wy, *ww, *wh),
+                                    None => no_image(display),
+                                }
+                            } else {
+                                let ve = image::EXTRA_VIEWERS.lock();
+                                match ve.iter().find(|(wid, _)| *wid == *id) {
+                                    Some((_, v)) => v.render(display, wx, wy, *ww, *wh),
+                                    None => no_image(display),
+                                }
+                            }
+                        }
+                        desktop::AppKind::AudioPlayer => audio::render(display, wx, wy, *ww, *wh),
                     }
                 }
 
                 // 3. Overlays
                 { let dt = desktop::DESKTOP.lock();
                   if let Some(dt) = dt.as_ref() { dt.draw_start_menu(display); } }
-                { let dt = desktop::DESKTOP.lock();
-                  if let Some(dt) = dt.as_ref() { dt.draw_context_menu(display); } }
                 // 3a. Snap preview — outlined rect showing where window will snap
                 { let dt = desktop::DESKTOP.lock();
                   if let Some(dt) = dt.as_ref() {
@@ -811,6 +902,12 @@ fn task_blink() -> ! {
                 }
                 { let dt = desktop::DESKTOP.lock();
                   if let Some(dt) = dt.as_ref() { dt.draw_taskbar(display); } }
+                // 3b. Taskbar jump list + context menu — drawn last so they float above
+                // the taskbar (both can now be triggered by a taskbar right-click).
+                { let dt = desktop::DESKTOP.lock();
+                  if let Some(dt) = dt.as_ref() { dt.draw_taskbar_jumplist(display); } }
+                { let dt = desktop::DESKTOP.lock();
+                  if let Some(dt) = dt.as_ref() { dt.draw_context_menu(display); } }
 
                 // 4. Save scene (no cursor yet) so cursor-only path can erase later
                 display.save_scene();
@@ -849,17 +946,22 @@ fn task_blink() -> ! {
     }
 }
 
-fn window_rect(title: &str) -> Option<(usize, usize, usize, usize)> {
-    let dt = desktop::DESKTOP.lock();
-    dt.as_ref().and_then(|d| {
-        d.windows.iter()
-            .find(|w| !w.minimized && w.title.as_str() == title)
-            .map(|w| (w.x.max(0) as usize, w.y.max(0) as usize, w.w, w.h))
-    })
+/// Spawn a new window for an app kind whose render function reads pure global
+/// state (Welcome/Sysmon/Settings/AudioPlayer) — no per-instance data needed,
+/// the new window just needs to exist; the render dispatch already handles any
+/// window of that kind identically regardless of id.
+fn spawn_stateless_window(kind: desktop::AppKind, title: &str, w: usize, h: usize) -> usize {
+    let mut dt = desktop::DESKTOP.lock();
+    if let Some(dt) = dt.as_mut() {
+        let count = dt.windows.iter().filter(|win| win.app_kind == kind).count();
+        let off = (count as i32) * 24;
+        dt.add_window(kind, title, 100 + off, 60 + off, w, h)
+    } else {
+        usize::MAX
+    }
 }
 
-fn render_hepfs_window(display: &mut framebuffer::Display) {
-    let Some((wx, wy, ww, wh)) = window_rect("HepFS") else { return; };
+fn render_hepfs_window(display: &mut framebuffer::Display, wx: usize, wy: usize, ww: usize, wh: usize) {
     let bg   = framebuffer::Color::from_hex(0x0C0C0C);
     let acc  = framebuffer::Color::from_hex(0x6C8EFF);
     let text = framebuffer::Color::from_hex(0xE8E8E8);
@@ -974,8 +1076,7 @@ fn write_num(n: u64, buf: &mut [u8; 12], suffix: &str) {
     for b in suffix.bytes() { if pos < 12 { buf[pos] = b; pos += 1; } }
 }
 
-fn render_sysmon_window(display: &mut framebuffer::Display) {
-    let Some((wx, wy, ww, wh)) = window_rect("Sysmon") else { return; };
+fn render_sysmon_window(display: &mut framebuffer::Display, wx: usize, wy: usize, ww: usize, wh: usize) {
     let bg     = framebuffer::Color::from_hex(0x0C0C0C);
     let acc    = framebuffer::Color::from_hex(0x6C8EFF);
     let text   = framebuffer::Color::from_hex(0xE8E8E8);
@@ -1075,8 +1176,7 @@ fn fmt_hms<'a>(h: u64, m: u64, s: u64, buf: &'a mut [u8; 32]) -> &'a str {
     core::str::from_utf8(&buf[..8]).unwrap_or("00:00:00")
 }
 
-fn render_welcome_window(display: &mut framebuffer::Display) {
-    let Some((wx, wy, ww, wh)) = window_rect("Welcome to HepOS") else { return; };
+fn render_welcome_window(display: &mut framebuffer::Display, wx: usize, wy: usize, ww: usize, wh: usize) {
     let bg   = framebuffer::Color::from_hex(0x0C0C0C);
     let acc  = framebuffer::Color::from_hex(0x6C8EFF);
     let text = framebuffer::Color::from_hex(0xE8E8E8);
@@ -1202,8 +1302,7 @@ fn make_demo_wav() -> alloc::vec::Vec<u8> {
     buf
 }
 
-fn render_settings_window(display: &mut framebuffer::Display) {
-    let Some((wx, wy, ww, wh)) = window_rect("Settings") else { return; };
+fn render_settings_window(display: &mut framebuffer::Display, wx: usize, wy: usize, ww: usize, wh: usize) {
     use framebuffer::Color;
     let bg       = Color::from_hex(0x0C0C0C);
     let sidebar  = Color::from_hex(0x111122);

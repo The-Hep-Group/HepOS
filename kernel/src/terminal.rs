@@ -974,20 +974,17 @@ impl Terminal {
                     } else {
                         alloc::format!("{}/{}", self.cwd_path, arg1)
                     };
-                    crate::editor::open(&full);
-                    // Un-minimize editor window (id=3), bring to front, focus it
-                    {
+                    let win_id = crate::editor::open_smart(&full);
+                    // Only the main editor window (id=3) has a fixed generic title to update —
+                    // spawned instances already get "Editor: <name>" titles from open_smart.
+                    if win_id == 3 {
                         let mut dt = crate::desktop::DESKTOP.lock();
                         if let Some(dt) = dt.as_mut() {
                             if let Some(w) = dt.windows.iter_mut().find(|w| w.id == 3) {
-                                w.minimized = false;
                                 w.title = alloc::format!("Editor: {}", arg1);
                             }
-                            dt.bring_to_front(3);
-                            dt.dirty = true;
                         }
                     }
-                    *crate::FOCUSED_WIN.lock() = Some(3);
                     self.print_colored("Editor opened  Ctrl+S=save  Ctrl+Q=close\n", OK);
                 }
             }
@@ -1003,21 +1000,17 @@ impl Terminal {
                     } else {
                         alloc::format!("{}/{}", self.cwd_path, arg1)
                     };
-                    crate::image::open(&full);
-                    // Un-minimize image viewer window (id=6), bring to front, focus it
-                    {
-                        let mut dt = crate::desktop::DESKTOP.lock();
-                        if let Some(dt) = dt.as_mut() {
-                            if let Some(w) = dt.windows.iter_mut().find(|w| w.id == 6) {
-                                w.minimized = false;
-                            }
-                            dt.bring_to_front(6);
-                            dt.dirty = true;
-                        }
-                    }
-                    *crate::FOCUSED_WIN.lock() = Some(6);
-                    let has_err = crate::image::VIEWER.lock().as_ref()
-                        .map(|v| v.error.is_some()).unwrap_or(false);
+                    // Reuses the main viewer window if free, else spawns a new one —
+                    // lets several images be open side by side.
+                    let win_id = crate::image::open_smart(&full);
+                    let has_err = if win_id == 6 {
+                        crate::image::VIEWER.lock().as_ref().map(|v| v.error.is_some()).unwrap_or(false)
+                    } else {
+                        crate::image::EXTRA_VIEWERS.lock().iter()
+                            .find(|(wid, _)| *wid == win_id)
+                            .map(|(_, v)| v.error.is_some())
+                            .unwrap_or(false)
+                    };
                     if has_err {
                         self.print_colored("view: unsupported or unreadable BMP\n", ERR);
                     } else {
@@ -1187,7 +1180,7 @@ pub fn spawn_terminal() -> usize {
     let win_id = {
         let mut dt = crate::desktop::DESKTOP.lock();
         if let Some(dt) = dt.as_mut() {
-            let id = dt.add_window("Terminal", 80 + off, 80 + off, 520, 320);
+            let id = dt.add_window(crate::desktop::AppKind::Terminal, "Terminal", 80 + off, 80 + off, 520, 320);
             dt.dirty = true;
             id
         } else {

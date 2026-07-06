@@ -446,16 +446,98 @@ impl Editor {
 
 pub static EDITOR: Mutex<Option<Editor>> = Mutex::new(None);
 
-/// Open a file for editing (called from terminal `edit` command).
+/// Additional editor instances keyed by their window ID — lets multiple
+/// files be open for editing simultaneously (window IDs assigned by the
+/// desktop when spawned), the same pattern as `terminal::EXTRA_TERMINALS`.
+pub static EXTRA_EDITORS: Mutex<alloc::vec::Vec<(usize, Editor)>> = Mutex::new(alloc::vec::Vec::new());
+
+fn read_content(path: &str) -> Vec<u8> {
+    let mut ctrl = crate::nvme::CONTROLLER.lock();
+    if let Some(ctrl) = ctrl.as_mut() {
+        match crate::hepfs::lookup(ctrl, path) {
+            Some(ino) => crate::hepfs::read_file(ctrl, ino),
+            None      => alloc::vec![],
+        }
+    } else { alloc::vec![] }
+}
+
+/// Open a file in the main Editor window (id=3) — called from terminal
+/// `edit` command / HepFS click when the main editor is free to reuse.
 pub fn open(path: &str) {
-    let content = {
-        let mut ctrl = crate::nvme::CONTROLLER.lock();
-        if let Some(ctrl) = ctrl.as_mut() {
-            match crate::hepfs::lookup(ctrl, path) {
-                Some(ino) => crate::hepfs::read_file(ctrl, ino),
-                None      => alloc::vec![],
-            }
-        } else { alloc::vec![] }
-    };
+    let content = read_content(path);
     *EDITOR.lock() = Some(Editor::new(path, &content));
+}
+
+/// Open a file in a brand-new floating editor window (used when the main
+/// Editor window is already showing something else). Returns the new window ID.
+pub fn spawn_editor(path: &str) -> usize {
+    let content = read_content(path);
+    let count = EXTRA_EDITORS.lock().len();
+    let off   = (count + 1) as i32 * 24;
+    let win_id = {
+        let mut dt = crate::desktop::DESKTOP.lock();
+        if let Some(dt) = dt.as_mut() {
+            let id = dt.add_window(crate::desktop::AppKind::Editor,
+                &alloc::format!("Editor: {}", path.trim_start_matches('/')),
+                140 + off, 60 + off, 580, 380);
+            dt.dirty = true;
+            id
+        } else {
+            return usize::MAX;
+        }
+    };
+    EXTRA_EDITORS.lock().push((win_id, Editor::new(path, &content)));
+    win_id
+}
+
+/// Spawn a brand-new blank/untitled editor window — used by the taskbar/start-menu
+/// "New Window" context-menu action, which has no specific file to open.
+pub fn spawn_editor_blank() -> usize {
+    let count = EXTRA_EDITORS.lock().len();
+    let off   = (count + 1) as i32 * 24;
+    let win_id = {
+        let mut dt = crate::desktop::DESKTOP.lock();
+        if let Some(dt) = dt.as_mut() {
+            let id = dt.add_window(crate::desktop::AppKind::Editor, "Editor",
+                140 + off, 60 + off, 580, 380);
+            dt.dirty = true;
+            id
+        } else {
+            return usize::MAX;
+        }
+    };
+    EXTRA_EDITORS.lock().push((win_id, Editor::new("/untitled.txt", &[])));
+    win_id
+}
+
+/// Open `path` for editing: reuses the main Editor window (id=3) if it's
+/// currently minimized (free), otherwise spawns a brand-new editor window —
+/// this is how multiple files end up open for editing at once. Un-minimizes,
+/// focuses, and brings the target window to front. Returns the window ID used.
+pub fn open_smart(path: &str) -> usize {
+    let main_free = {
+        let dt = crate::desktop::DESKTOP.lock();
+        dt.as_ref()
+            .and_then(|d| d.windows.iter().find(|w| w.id == 3))
+            .map(|w| w.minimized)
+            .unwrap_or(true)
+    };
+    let win_id = if main_free {
+        open(path);
+        3
+    } else {
+        spawn_editor(path)
+    };
+    {
+        let mut dt = crate::desktop::DESKTOP.lock();
+        if let Some(dt) = dt.as_mut() {
+            if let Some(w) = dt.windows.iter_mut().find(|w| w.id == win_id) {
+                w.minimized = false;
+            }
+            dt.bring_to_front(win_id);
+            dt.dirty = true;
+        }
+    }
+    *crate::FOCUSED_WIN.lock() = Some(win_id);
+    win_id
 }

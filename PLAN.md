@@ -178,8 +178,28 @@ All windows:
 ## Taskbar & Start Menu
 
 - **HepOS button** (left): popup listing ALL programs regardless of state; click to open/focus
-- **Window buttons**: only non-minimized windows shown; click focused → minimize, click other → focus
+- **Window buttons**: only non-minimized windows shown, grouped by app kind (see below); click focused → minimize, click other → focus; group with >1 window opens a jump list instead
+- **Right-click** a taskbar button or a Start Menu row → "New Window" (spawns another instance of that program; not offered for Files)
 - **Clock** (far right): live RTC time
+
+---
+
+## Multi-instance windowing
+
+Every `Window` carries an `app_kind: desktop::AppKind` tag (`Welcome`, `Files`, `Terminal`, `Editor`, `Sysmon`, `Settings`, `ImageViewer`, `AudioPlayer`). This tag drives three things:
+
+1. **Render dispatch** — `main.rs`'s window-render loop matches on `app_kind`, not raw window id. For kinds with per-instance state (`Terminal`, `Editor`, `ImageViewer`), the *main* window (fixed id 2/3/6) reads its dedicated static (`terminal::TERMINAL`, `editor::EDITOR`, `image::VIEWER`); any other window of that kind is looked up by id in an `EXTRA_*` list (`terminal::EXTRA_TERMINALS`, `editor::EXTRA_EDITORS`, `image::EXTRA_VIEWERS` — all `Mutex<Vec<(usize, T)>>`, same pattern, keyed by window id). Kinds with **no** per-instance state (`Welcome`, `Sysmon`, `Settings`, `AudioPlayer`) render identically no matter which window shows them or how many are open — a "new instance" is just another window pointed at the same stateless render function.
+2. **Taskbar/Start Menu grouping** — `Desktop::grouped_taskbar_entries()` buckets non-minimized windows by `app_kind`; the taskbar shows one button per bucket, "(N)" suffixed if N>1. Clicking a bucket with exactly one window behaves like before (focus/minimize toggle); clicking a bucket with >1 opens `taskbar_jumplist: Option<(AppKind, button_x)>`, a popup listing each instance — numbered ("Terminal 1", "Terminal 2", ...) if the window's title is still the generic app label, or the real title if it already differentiates (e.g. "Editor: foo.txt").
+3. **"New Window" spawning** — right-click on a taskbar button or Start Menu row sets `Desktop::new_window_requested: Option<AppKind>` (consumed once per frame in `main.rs`, same pattern as `open_settings_requested`), which dispatches to:
+   - `Terminal` → `terminal::spawn_terminal()`
+   - `Editor` → `editor::spawn_editor_blank()` (blank buffer, path defaults to `/untitled.txt` for Ctrl+S)
+   - `ImageViewer` → `image::spawn_viewer_blank()` (empty until a `view` command targets it)
+   - `Welcome`/`Sysmon`/`Settings`/`AudioPlayer` → `spawn_stateless_window()` in main.rs (just a new window, no per-instance data)
+   - `Files` → not offered (`app_supports_new_window()` returns false — HepFS keeps one global nav state; a second window would just show the same coupled directory, not an independent one)
+
+`editor::open_smart(path)` / `image::open_smart(path)` reuse the main window if it's minimized/free, else spawn a new one — this is how opening a second file/image ends up in its own window instead of clobbering the first (used by `edit`/`view` and the HepFS click handlers).
+
+**Verification note:** all of the above compiles clean and passes a full boot regression, but the actual mouse-driven interactions (right-click a taskbar button, open a jump list, click a jump-list row) are keyboard/mouse-driven and weren't scripted through the serial-log testing used elsewhere in this project — worth a manual check.
 
 ---
 
@@ -380,7 +400,9 @@ Range 0–32767 scaled to framebuffer size.
 | ✓ | Desktop icons — 5 icons (Welcome/Files/Terminal/Editor/Sysmon), click to open/focus |
 | ✓ | Desktop wallpaper — vertical gradient (navy → near-black) + deterministic LCG star field |
 | ✓ | Settings app — left sidebar ("Background" page), wallpaper thumbnails, click to switch; right-click desktop → context menu → "Change background" opens Settings |
-| ○ | Multiple instances of the same app |
+| ✓ | Multiple instances of every app (except Files) — see "Multi-instance windowing" below |
+| ✓ | Taskbar grouping + jump list — windows of the same app kind collapse into one taskbar button with a "(N)" count; clicking it with N>1 opens a jump-list popup listing each instance ("Terminal 1", "Terminal 2", ... or the real title if distinguishing, e.g. "Editor: foo.txt") to pick which to focus |
+| ✓ | Right-click "New Window" — right-click a taskbar button or a Start Menu entry to spawn another instance of that program (not offered for Files, whose nav state is global) |
 
 ### Apps
 | ✓/○ | Feature |
@@ -442,6 +464,8 @@ Range 0–32767 scaled to framebuffer size.
 17. ~~**Image viewer**~~ ✓ done — `image.rs`: uncompressed 24/32-bit BMP decoder, `view <file>` command, click `.bmp` in HepFS to open; `/demo.bmp` checkerboard generated at boot for testing
 19. ~~**Audio player**~~ ✓ done — `audio.rs`: 16-bit PCM WAV decoder (48kHz, mono/stereo), `play <file>` command; `hda::play_pcm()` reuses beep()'s validated DMA stop sequence (zero buffer in-place, drain, stream_id-preserving stop) for arbitrary sample playback, truncated to a 1MB buffer (~5.4s); `/demo.wav` generated at boot for testing
 20. ~~**Double-indirect blocks**~~ ✓ done — added `dindirect` field to the on-disk inode (backward-compatible: old padding bytes there were already zero); `write_file`/`read_file`/`remove` all extended with a Phase 3 that walks the 1024×1024 double-indirect tree; verified with a 5MB file (`dindirect` allocated, byte-exact round-trip)
+21. ~~**Multiple instances of the same app**~~ ✓ done (Editor) — `editor::open_smart()` reuses the main Editor window (id=3) if minimized/free, else spawns a new window via `editor::spawn_editor()` + `EXTRA_EDITORS` (mirrors `terminal::EXTRA_TERMINALS`); keyboard routing and render dispatch in main.rs extended accordingly. Verified via clean build + full boot regression; interactive multi-window behavior not scripted/tested (keyboard-driven, no automated GUI test harness) — worth a manual check.
+22. ~~**Multi-instance for every app + taskbar grouping + right-click "New Window"**~~ ✓ done — generalized #21 to all apps via `Window.app_kind: AppKind` (see "Multi-instance windowing" section above): `image.rs` gained the same `EXTRA_VIEWERS`/`open_smart` treatment as Editor; Welcome/Sysmon/Settings/AudioPlayer got trivial multi-instance since they're stateless; Files excluded (global nav state). Taskbar buttons now group by app kind with a "(N)" jump-list popup; right-click a taskbar button or Start Menu row → "New Window". Verified via clean build + full boot regression; interactive behavior (right-click, jump list) not scripted-tested — worth a manual check.
 
 ---
 

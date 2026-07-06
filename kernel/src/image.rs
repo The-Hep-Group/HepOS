@@ -108,17 +108,96 @@ impl ImageViewer {
 
 pub static VIEWER: Mutex<Option<ImageViewer>> = Mutex::new(None);
 
-/// Open `path` for viewing (called from the terminal `view` command or a
-/// HepFS `.bmp` click). Reads the file from HepFS itself, mirroring `editor::open`.
+/// Additional viewer instances keyed by their window ID — same pattern as
+/// `editor::EXTRA_EDITORS`, letting several images be viewed side by side.
+pub static EXTRA_VIEWERS: Mutex<alloc::vec::Vec<(usize, ImageViewer)>> = Mutex::new(alloc::vec::Vec::new());
+
+fn read_content(path: &str) -> Vec<u8> {
+    let mut ctrl = crate::nvme::CONTROLLER.lock();
+    if let Some(ctrl) = ctrl.as_mut() {
+        match crate::hepfs::lookup(ctrl, path) {
+            Some(ino) => crate::hepfs::read_file(ctrl, ino),
+            None      => alloc::vec![],
+        }
+    } else { alloc::vec![] }
+}
+
+/// Open `path` in the main Image Viewer window (id=6) — called from the
+/// terminal `view` command or a HepFS `.bmp` click when the main viewer is free.
 pub fn open(path: &str) {
-    let content = {
-        let mut ctrl = crate::nvme::CONTROLLER.lock();
-        if let Some(ctrl) = ctrl.as_mut() {
-            match crate::hepfs::lookup(ctrl, path) {
-                Some(ino) => crate::hepfs::read_file(ctrl, ino),
-                None      => alloc::vec![],
-            }
-        } else { alloc::vec![] }
-    };
+    let content = read_content(path);
     *VIEWER.lock() = Some(ImageViewer::from_bytes(path, &content));
+}
+
+/// Open `path` in a brand-new floating viewer window. Returns the new window ID.
+pub fn spawn_viewer(path: &str) -> usize {
+    let content = read_content(path);
+    let count = EXTRA_VIEWERS.lock().len();
+    let off   = (count + 1) as i32 * 24;
+    let win_id = {
+        let mut dt = crate::desktop::DESKTOP.lock();
+        if let Some(dt) = dt.as_mut() {
+            let id = dt.add_window(crate::desktop::AppKind::ImageViewer,
+                &alloc::format!("Image Viewer: {}", path.trim_start_matches('/')),
+                140 + off, 60 + off, 420, 340);
+            dt.dirty = true;
+            id
+        } else {
+            return usize::MAX;
+        }
+    };
+    EXTRA_VIEWERS.lock().push((win_id, ImageViewer::from_bytes(path, &content)));
+    win_id
+}
+
+/// Spawn a brand-new blank viewer window (no image loaded yet) — used by the
+/// taskbar/start-menu "New Window" action, which has no file to open.
+pub fn spawn_viewer_blank() -> usize {
+    let count = EXTRA_VIEWERS.lock().len();
+    let off   = (count + 1) as i32 * 24;
+    let win_id = {
+        let mut dt = crate::desktop::DESKTOP.lock();
+        if let Some(dt) = dt.as_mut() {
+            let id = dt.add_window(crate::desktop::AppKind::ImageViewer, "Image Viewer",
+                140 + off, 60 + off, 420, 340);
+            dt.dirty = true;
+            id
+        } else {
+            return usize::MAX;
+        }
+    };
+    EXTRA_VIEWERS.lock().push((win_id, ImageViewer::from_bytes("", &[])));
+    win_id
+}
+
+/// Open `path`: reuses the main viewer window (id=6) if it's minimized/free or
+/// has nothing loaded yet, otherwise spawns a new window. Un-minimizes, focuses,
+/// and brings the target window to front. Returns the window ID used.
+pub fn open_smart(path: &str) -> usize {
+    let main_free = {
+        let dt = crate::desktop::DESKTOP.lock();
+        let minimized = dt.as_ref()
+            .and_then(|d| d.windows.iter().find(|w| w.id == 6))
+            .map(|w| w.minimized)
+            .unwrap_or(true);
+        minimized || VIEWER.lock().is_none()
+    };
+    let win_id = if main_free {
+        open(path);
+        6
+    } else {
+        spawn_viewer(path)
+    };
+    {
+        let mut dt = crate::desktop::DESKTOP.lock();
+        if let Some(dt) = dt.as_mut() {
+            if let Some(w) = dt.windows.iter_mut().find(|w| w.id == win_id) {
+                w.minimized = false;
+            }
+            dt.bring_to_front(win_id);
+            dt.dirty = true;
+        }
+    }
+    *crate::FOCUSED_WIN.lock() = Some(win_id);
+    win_id
 }
