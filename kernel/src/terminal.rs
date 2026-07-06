@@ -1039,6 +1039,18 @@ impl Terminal {
                     };
                     self.print_colored(&alloc::format!("Playing {}…\n", arg1), DIM);
                     let result = crate::audio::play(&full);
+                    // Un-minimize Audio Player window (id=7), bring to front, focus it
+                    {
+                        let mut dt = crate::desktop::DESKTOP.lock();
+                        if let Some(dt) = dt.as_mut() {
+                            if let Some(w) = dt.windows.iter_mut().find(|w| w.id == 7) {
+                                w.minimized = false;
+                            }
+                            dt.bring_to_front(7);
+                            dt.dirty = true;
+                        }
+                    }
+                    *crate::FOCUSED_WIN.lock() = Some(7);
                     match result.error {
                         Some(e) => self.print_colored(&alloc::format!("play: {}\n", e), ERR),
                         None => {

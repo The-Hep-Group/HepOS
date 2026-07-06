@@ -156,6 +156,8 @@ extern "C" fn kmain(bi_ptr: *const bootinfo::BootInfo) -> ! {
         dt.add_window("Settings",         120, 80,  480, 320);
         // Image Viewer window (id=6) — hidden until a .bmp is opened
         dt.add_window("Image Viewer",     100, 60,  420, 340);
+        // Audio Player window (id=7) — hidden until a .wav is played
+        dt.add_window("Audio Player",     140, 100, 380, 160);
         *desktop::DESKTOP.lock() = Some(dt);
     }
 
@@ -175,7 +177,7 @@ extern "C" fn kmain(bi_ptr: *const bootinfo::BootInfo) -> ! {
     {
         let mut dt = desktop::DESKTOP.lock();
         if let Some(dt) = dt.as_mut() {
-            for id in [3usize, 4, 5, 6] {
+            for id in [3usize, 4, 5, 6, 7] {
                 if let Some(w) = dt.windows.iter_mut().find(|w| w.id == id) {
                     w.minimized = true;
                 }
@@ -555,10 +557,13 @@ fn task_blink() -> ! {
                                 } else {
                                     alloc::format!("{}/{}", cur_path, name)
                                 };
-                                let is_bmp = name.to_lowercase().ends_with(".bmp");
-                                let win_id = if is_bmp {
+                                let lower = name.to_lowercase();
+                                let win_id = if lower.ends_with(".bmp") {
                                     image::open(&file_path);
                                     6usize
+                                } else if lower.ends_with(".wav") {
+                                    audio::play(&file_path);
+                                    7usize
                                 } else {
                                     editor::open(&file_path);
                                     3usize
@@ -773,6 +778,7 @@ fn task_blink() -> ! {
                                    display.draw_text(wx + 8, wy + 8, "No image open - try `view <file>.bmp`",
                                        framebuffer::Color::from_hex(0x888888), 1);
                                } }
+                        7 => audio::render(display, wx, wy, *ww, *wh),
                         _ => {
                             // Extra terminals spawned via `newterm`
                             let mut et = terminal::EXTRA_TERMINALS.lock();

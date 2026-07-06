@@ -166,6 +166,7 @@ Key routing in task_blink:
 | 4 | Sysmon | minimized | RAM bar, uptime, PCI list, storage/net status |
 | 5 | Settings | minimized | Background picker (dark gradient / Bliss) |
 | 6 | Image Viewer | minimized | Decoded BMP, opened via `view <file>` or clicking a `.bmp` in HepFS |
+| 7 | Audio Player | minimized | Last-played WAV: path, format, duration/error — opened via `play <file>` or clicking a `.wav` in HepFS |
 
 All windows:
 - **Drag** title bar to move
@@ -389,7 +390,7 @@ Range 0–32767 scaled to framebuffer size.
 | ✓ | Sysmon window — RAM bar, uptime, PCI list, storage/net status |
 | ✓ | Multiple terminal windows — `newterm` spawns additional floating terminals, each independently focusable |
 | ✓ | Image viewer — decodes uncompressed 24/32-bit BMP (`view <file.bmp>`, or click a `.bmp` in HepFS); `/demo.bmp` checkerboard generated at boot |
-| ✓ | Audio player — decodes 16-bit PCM WAV (48kHz, mono/stereo) via `hda::play_pcm()`; `play <file.wav>`; `/demo.wav` (440Hz tone) generated at boot |
+| ✓ | Audio player — decodes 16-bit PCM WAV (48kHz, mono/stereo) via `hda::play_pcm()`; `play <file.wav>` or click a `.wav` in HepFS opens the Audio Player window (id=7) showing path/format/duration/error; `/demo.wav` (440Hz tone) generated at boot |
 
 ### Networking / Ecosystem
 | ✓/○ | Feature |
@@ -413,6 +414,7 @@ Range 0–32767 scaled to framebuffer size.
 | ACPI shutdown only on QEMU | Hardcoded port 0x604 — real hardware needs FADT parsing |
 | Terminal text doesn't reflow on resize | Existing output stays at old column width; new input uses current width |
 | ~~`beep` audio doesn't stop~~ | Fixed: after tone duration, zero DMA buffer in-place while stream still runs → QEMU next-period read returns silence → 200 ms SDL drain wait → stop with stream_id preserved in bits[23:20] so QEMU matches the running stream. |
+| Audio Player window shows no live "playing" indicator | `hda::play_pcm()` blocks the whole `play` command (no preemption during terminal commands, same as `beep()`) — the render loop never runs mid-playback, so the window can only show the *last* play result once the call returns, not real-time progress |
 
 ---
 

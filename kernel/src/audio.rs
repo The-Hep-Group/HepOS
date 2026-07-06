@@ -1,8 +1,10 @@
 //! Minimal audio player — decodes uncompressed PCM WAV (16-bit, 48kHz,
 //! mono or stereo) and plays it via the Intel HDA DMA stream.
-//! Open with `play <file>` in the terminal.
+//! Open with `play <file>` in the terminal, or click a `.wav` in HepFS.
 
 use alloc::{string::String, vec::Vec};
+use spin::Mutex;
+use crate::framebuffer::{Color, Display};
 
 /// Parse a RIFF/WAVE PCM file. Returns (sample_rate, channels, bits_per_sample, pcm_bytes).
 /// Only PCM (audioFormat=1) is supported — no compressed WAV variants.
@@ -47,9 +49,37 @@ pub struct PlayResult {
     pub truncated:        bool,
 }
 
+/// State shown by the Audio Player window. Since `hda::play_pcm()` blocks the
+/// whole call (no preemption during terminal commands), the render loop never
+/// observes playback "in progress" — this reflects the *last* play attempt.
+pub struct NowPlaying {
+    pub path:        String,
+    pub sample_rate:  u32,
+    pub channels:     u16,
+    pub duration_ms:  u64,
+    pub truncated:    bool,
+    pub error:        Option<String>,
+}
+
+pub static NOW_PLAYING: Mutex<Option<NowPlaying>> = Mutex::new(None);
+
 /// Decode and play `path` from HepFS. Blocks until playback (+ drain) finishes.
 /// Only 16-bit PCM WAV at 48 kHz (mono or stereo) is supported — no resampler.
+/// Updates `NOW_PLAYING` so the Audio Player window can show the result.
 pub fn play(path: &str) -> PlayResult {
+    let result = play_inner(path);
+    *NOW_PLAYING.lock() = Some(NowPlaying {
+        path:        String::from(path),
+        sample_rate: 48_000,
+        channels:    2,
+        duration_ms: result.duration_ms,
+        truncated:   result.truncated,
+        error:       result.error.clone(),
+    });
+    result
+}
+
+fn play_inner(path: &str) -> PlayResult {
     let content = {
         let mut ctrl = crate::nvme::CONTROLLER.lock();
         if let Some(ctrl) = ctrl.as_mut() {
@@ -104,4 +134,59 @@ pub fn play(path: &str) -> PlayResult {
     let duration_ms = (played as u64 / 2) * 1000 / 48_000;
 
     PlayResult { error: None, duration_ms, truncated }
+}
+
+/// Render the Audio Player window: last-played file, format, duration, or error.
+pub fn render(display: &mut Display, wx: usize, wy: usize, ww: usize, wh: usize) {
+    const BG:   Color = Color::from_hex(0x0A0A14);
+    const ACC:  Color = Color::from_hex(0x6C8EFF);
+    const TEXT: Color = Color::from_hex(0xE8E8E8);
+    const DIM:  Color = Color::from_hex(0x888888);
+    const OK:   Color = Color::from_hex(0x6BFF8E);
+    const ERR:  Color = Color::from_hex(0xFF6B6B);
+
+    display.fill_rect(wx, wy, ww, wh, BG);
+
+    // Speaker icon (simple triangle-ish box, drawn with rects — no font glyph needed)
+    let icon_x = wx + 16;
+    let icon_y = wy + 16;
+    display.fill_rect(icon_x, icon_y + 8, 10, 16, ACC);
+    display.fill_rect(icon_x + 10, icon_y, 14, 32, ACC);
+
+    let now = NOW_PLAYING.lock();
+    let text_x = icon_x + 40;
+    let mut y = wy + 16;
+    match now.as_ref() {
+        None => {
+            display.draw_text(text_x, y, "No audio played yet", DIM, 1);
+            y += 16;
+            display.draw_text(wx + 8, y + 4, "Try: play /demo.wav", DIM, 1);
+        }
+        Some(np) => {
+            display.draw_text(text_x, y, &np.path, TEXT, 1); y += 16;
+            match &np.error {
+                Some(e) => {
+                    display.draw_text(text_x, y, "Error:", ERR, 1); y += 14;
+                    display.draw_text(text_x, y, e, ERR, 1);
+                }
+                None => {
+                    display.draw_text(text_x, y, &alloc::format!(
+                        "{} Hz, {}-ch PCM16", np.sample_rate,
+                        if np.channels == 1 { "1" } else { "2" }
+                    ), DIM, 1);
+                    y += 14;
+                    display.draw_text(text_x, y, &alloc::format!(
+                        "Played {} ms{}", np.duration_ms,
+                        if np.truncated { " (truncated)" } else { "" }
+                    ), OK, 1);
+                }
+            }
+        }
+    }
+    drop(now);
+
+    if wh > 60 {
+        display.draw_text(wx + 8, wy + wh.saturating_sub(16),
+            "play <file.wav> in the terminal to load another track", DIM, 1);
+    }
 }
