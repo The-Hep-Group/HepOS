@@ -45,6 +45,11 @@ pub static DISPLAY: Mutex<Option<Display>> = Mutex::new(None);
 
 // Focus: Some(id) = that window has keyboard focus; defaults to terminal (id=2)
 pub static FOCUSED_WIN: Mutex<Option<usize>> = Mutex::new(None);
+
+/// Window ID currently being drag-selected in an editor (mouse button held
+/// since the click landed in that editor's content area). `None` when no
+/// drag-selection is in progress.
+static TEXT_DRAG_WIN: Mutex<Option<usize>> = Mutex::new(None);
 pub static PCI_DEVS: Mutex<alloc::vec::Vec<pci::PciDevice>> = Mutex::new(alloc::vec::Vec::new());
 
 // Frame counter for uptime (~60 fps → divide by 60 for seconds)
@@ -453,6 +458,61 @@ fn task_blink() -> ! {
             dt_guard.as_mut().map(|dt| dt.update_mouse(mx, my, btn)).unwrap_or(false)
         };
         if spawn_terminal { crate::terminal::spawn_terminal(); }
+
+        // Text selection: drag-to-select in editor windows. `fresh_click`
+        // anchors the selection (mouse_down); subsequent frames with the
+        // button still held extend it (mouse_drag) against the same window
+        // even if the cursor later leaves its bounds.
+        {
+            let btn_held = btn & 1 != 0;
+            if !btn_held {
+                *TEXT_DRAG_WIN.lock() = None;
+            } else {
+                let win_info: Option<(usize, i32, i32, usize, usize)> = {
+                    let dt = desktop::DESKTOP.lock();
+                    dt.as_ref().and_then(|d| {
+                        if fresh_click {
+                            d.windows.iter().rev()
+                                .find(|w| !w.minimized && w.app_kind == desktop::AppKind::Editor
+                                    && w.content_hit(mx, my))
+                                .map(|w| (w.id, w.x, w.y, w.w, w.h))
+                        } else {
+                            let wid = *TEXT_DRAG_WIN.lock();
+                            wid.and_then(|id| d.windows.iter().find(|w| w.id == id)
+                                .map(|w| (w.id, w.x, w.y, w.w, w.h)))
+                        }
+                    })
+                };
+                if let Some((id, wwx, wwy, www, wwh)) = win_info {
+                    if fresh_click { *TEXT_DRAG_WIN.lock() = Some(id); }
+                    let wxu = wwx.max(0) as usize;
+                    let wyu = wwy.max(0) as usize;
+                    let hit = if id == 3 {
+                        let mut eg = editor::EDITOR.lock();
+                        eg.as_mut().and_then(|ed| {
+                            let h = ed.hit_test(wxu, wyu, www, wwh, mx, my);
+                            if let Some((row, col)) = h {
+                                if fresh_click { ed.mouse_down(row, col); } else { ed.mouse_drag(row, col); }
+                            }
+                            h
+                        })
+                    } else {
+                        let mut ee = editor::EXTRA_EDITORS.lock();
+                        ee.iter_mut().find(|(wid, _)| *wid == id).and_then(|(_, ed)| {
+                            let h = ed.hit_test(wxu, wyu, www, wwh, mx, my);
+                            if let Some((row, col)) = h {
+                                if fresh_click { ed.mouse_down(row, col); } else { ed.mouse_drag(row, col); }
+                            }
+                            h
+                        })
+                    };
+                    if hit.is_some() {
+                        let mut dt = desktop::DESKTOP.lock();
+                        if let Some(dt) = dt.as_mut() { dt.dirty = true; }
+                    }
+                }
+            }
+        }
 
         // Handle open_settings_requested from right-click context menu
         {

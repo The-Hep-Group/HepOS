@@ -1,0 +1,5 @@
+The Hep Group Security Policy:
+
+Please do not report vulnerabilities to the public issues tab of the specific Repo. Contact The Hep Group directly from the contact info listed in the front page.
+
+Also, this is especially true for higher vulnerability code, such as low level programs, please do not open public issues.

@@ -21,6 +21,16 @@ const CURSOR: Color = Color::from_hex(0x6C8EFF);
 const ERR:    Color = Color::from_hex(0xFF6B6B);
 const OK:     Color = Color::from_hex(0x6BFF8E);
 
+// Known command verbs — shared by tab-completion and live input highlighting
+// (reuses editor.rs's generic tokenizer with these as the "keyword" list).
+const COMMAND_NAMES: &[&str] = &[
+    "help", "clear", "pwd", "ls", "cd", "cat", "mkdir", "touch",
+    "rm", "cp", "mv", "write", "edit", "uname", "mem", "date",
+    "history", "lspci", "netdiag", "netstart", "netpoll", "ifconfig",
+    "ping", "wget", "udp", "view", "play", "shutdown", "reboot", "echo",
+    "sysinfo", "syscallinfo", "runtest", "runhello", "exec", "ps", "newterm", "beep",
+];
+
 #[derive(Clone, Copy)]
 struct Cell {
     ch:    u8,
@@ -244,7 +254,24 @@ impl Terminal {
             }
             _ => {}
         }
+        // Re-tokenize and recolor the input line on every keystroke that could
+        // have changed it — cheap (short line, no allocation beyond one Vec).
+        self.recolor_input();
         self.dirty = true;
+    }
+
+    /// Recolor the current input line in place, live as the user types —
+    /// command name / known verbs, quoted strings, and numbers get distinct
+    /// colors (reuses editor.rs's generic per-line tokenizer with
+    /// `COMMAND_NAMES` standing in for language keywords).
+    fn recolor_input(&mut self) {
+        let colors = crate::editor::highlight_line_kw(self.cmd_buf.as_bytes(), COMMAND_NAMES, TEXT);
+        let row = self.prompt_row;
+        for (i, color) in colors.iter().enumerate() {
+            let col = self.prompt_col + i;
+            if col >= self.cols || row >= self.lines.len() { break; }
+            self.lines[row][col].color = *color;
+        }
     }
 
     fn replace_input(&mut self, new: &str) {
@@ -263,13 +290,6 @@ impl Terminal {
     }
 
     fn tab_complete(&mut self) {
-        const CMDS: &[&str] = &[
-            "help", "clear", "pwd", "ls", "cd", "cat", "mkdir", "touch",
-            "rm", "cp", "mv", "write", "edit", "uname", "mem", "date",
-            "history", "lspci", "netdiag", "netstart", "netpoll", "ifconfig",
-            "ping", "wget", "shutdown", "reboot", "echo", "sysinfo", "syscallinfo", "runtest", "runhello", "exec", "ps", "newterm", "beep",
-        ];
-
         let partial = self.cmd_buf.clone();
 
         // Split into the word-before-last-space and the word being completed
@@ -280,7 +300,7 @@ impl Terminal {
 
         let matches: alloc::vec::Vec<alloc::string::String> = if prefix.is_empty() {
             // Completing command name
-            CMDS.iter()
+            COMMAND_NAMES.iter()
                 .filter(|c| c.starts_with(word))
                 .map(|c| alloc::string::String::from(*c))
                 .collect()

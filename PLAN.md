@@ -1,7 +1,7 @@
 # HepOS — Design Reference & Roadmap
 
 > **Purpose:** Authoritative reference for HepOS. Survives context compaction.
-> **Last updated:** 2026-07-05
+> **Last updated:** 2026-07-06
 
 ---
 
@@ -15,6 +15,78 @@ HepOS is a custom x86\_64 operating system written in Rust using an **exokernel 
 **Dev machine:** Windows 11, QEMU 11.x  
 **License:** MIT  
 **Repository:** https://github.com/The-Hep-Group/HepOS
+
+---
+
+## Original Design Plan vs. Current Reality
+
+The project started from a design doc with a specific target shape (libOS-in-userspace, wide file-format support, animated desktop, IDE-grade editor, etc). This section is an honest audit of that plan against what's actually implemented today — updated 2026-07-06. ✅ = done, 🟡 = partial/deviates, ❌ = not implemented.
+
+**Kernel: Exokernel (Rust, x86\_64)** — ✅ done.
+
+**LibOS layer**
+| Item | Status | Notes |
+|---|---|---|
+| Memory allocator | ✅ | Slab allocator (`heap.rs`) |
+| Scheduler (round-robin) | 🟡 | Structure exists (`scheduler.rs`), but **real preemption is currently broken** — traced to a bug in the interrupt/context-switch mechanism (EOI ordering + missing `sti` on fresh tasks + a resume-time interrupt-frame corruption once a task that was genuinely interrupted gets resumed via `iretq`). Attempted a full fix in one session; found and fixed two of the three bugs, but the third (GPF on resume) wasn't safely resolved, so **all the fixes were reverted** rather than ship a kernel that crashes on its first natural preemption. `task_blink` runs the whole OS today effectively as a single always-scheduled task. |
+| Custom filesystem supporting SATA **and** NVMe | 🟡 | HepFS only works over **NVMe**. No AHCI/SATA driver exists at all. |
+| Thin `std` shim (e.g. so Symphonia links unmodified) | ❌ | `hepos-std` only re-exports `println!`/`String`/`Vec` for a tiny demo binary — nowhere near enough surface (`std::io`, error traits, etc.) for an unmodified real-world crate to link. |
+
+**Drivers (plan: "all in libOS userspace except where HW forces kernel")**
+| Item | Status | Notes |
+|---|---|---|
+| XHCI → USB HID (keyboard/mouse) | 🟡 | XHCI drives a USB HID **mouse** only (tablet). Keyboard is PS/2, not USB HID. |
+| Intel HDA (audio out) | ✅ | Non-blocking playback (`hda::play_pcm()` + `poll()`) |
+| NVMe (storage) | ✅ | |
+| PCI enumeration | ✅ | |
+| ACPI (shutdown/reboot) | 🟡 | QEMU-only (hardcoded port 0x604); no real FADT parsing for physical hardware |
+| GOP framebuffer (display) | ✅ | Via HepBL's BootInfo |
+| **Drivers live in userspace libOS** | ❌ | **Not true.** Every driver (XHCI, HDA, NVMe, PCI, ACPI, GOP) runs in the kernel (ring 0). `userspace/` only contains `hepos-rt`/`hepos-std`/the `hello` demo — no actual drivers have been moved out. This is the single biggest architectural gap versus the original plan. |
+
+**Custom Filesystem (HepFS)**
+| Item | Status | Notes |
+|---|---|---|
+| Flat inode table | ✅ | |
+| No permissions | ✅ | |
+| Files + directories | ✅ | |
+| Large blocks, designed for NVMe | ✅ | 4KB blocks |
+| No journaling | ✅ | Matches the plan's "keep it simple, maybe add later" |
+| SATA support | ❌ | NVMe only |
+
+**File Format Support** — the biggest gap versus the plan; almost nothing beyond TXT/WAV exists, and the thin `std` shim that would unlock real codec crates isn't there either.
+| Format | Status |
+|---|---|
+| TXT | ✅ |
+| MD (rendered) | ❌ editor is plain text, no markdown rendering |
+| PNG, JPG | ❌ image viewer only decodes uncompressed BMP |
+| WAV | ✅ 16-bit PCM |
+| MP3, FLAC, OGG | ❌ no codecs |
+| MP4/H.264 | ❌ no video support at all |
+| PDF | ❌ |
+| ZIP, TAR | ❌ |
+
+**Desktop Environment**
+| Item | Status | Notes |
+|---|---|---|
+| Software rendered, GOP, 60fps | ✅ | |
+| Dirty rect tracking + double buffer | 🟡 | Close but not literal per-widget dirty rects — a two-tier scheme instead (full-scene redraw on any dirty flag vs. a ~20-row partial flush for cursor-only movement). Same goal, different mechanism. |
+| Floating WM, opaque windows, flat design | ✅ | |
+| Dark color scheme hardcoded | 🟡 | Dark by default, but Settings now lets you switch to a Bliss-style wallpaper (blue sky/green hills) — window chrome stays dark, background is no longer strictly one hardcoded scheme |
+| Simple 150–200ms ease-out animations (open/close/minimize) | ❌ | Not implemented — windows snap instantly, no easing |
+| Taskbar: open apps, clock, volume control | 🟡 | Apps + clock yes; **no volume control** anywhere (HDA has no adjustable gain/UI) |
+| Desktop icons | ✅ | |
+
+**Programs**
+| Program | Status | Notes |
+|---|---|---|
+| Terminal emulator (VT100 subset) | ✅ | 30+ commands |
+| File manager, **two-pane** | 🟡 | Single-pane with back/forward nav, not two-pane |
+| Text editor | ✅ | |
+| IDE (syntax highlighting, Rust/C) | ✅ | Basic keyword/string/comment/number highlighting added — see Text Editor section below |
+| Image viewer | 🟡 | Exists, BMP-only |
+| Audio/video player | 🟡 | Audio yes (WAV only); **no video player at all** |
+| PDF/MD viewer | ❌ | Neither implemented |
+| Settings (volume, resolution) | 🟡 | Settings app exists but only has a wallpaper picker — no volume or resolution control |
 
 ---
 
@@ -45,7 +117,7 @@ kernel/
     hepfs.rs       HepFS: flat inode, 4KB blocks, 12 direct + 1 indirect block per file
     desktop.rs     Compositor, WM, start menu, taskbar, resize handles, RTC clock
     terminal.rs    Full shell: history, left/right cursor, tab completion, 30+ commands
-    editor.rs      Text editor: Ctrl+F find, PgUp/Dn, Ctrl+Home/End, F2=save, F10=close
+    editor.rs      Text editor: Ctrl+F find, PgUp/Dn, Ctrl+Home/End, F2=save, F10=close, basic Rust/C syntax highlighting
     net.rs         ARP, ICMP, IP, TCP (hand-written stack), HTTP GET client (wget), ping
     e1000.rs       Intel 82540EM driver (TX works, RX pending)
     rtl8139.rs     RTL8139 driver (flat ring, TX works, RX broken on QEMU Windows)
@@ -283,6 +355,8 @@ Terminal column count adapts to window width dynamically (up to 120 cols max).
 
 Find mode: highlights all matches (blue bg), current match (yellow bg), shows `[N/M]` count in status bar.
 
+**Syntax highlighting:** basic, per-line, no real lexer — `editor::highlight_line()` colors keywords (Rust + C/C++ combined list), string/char literals, numeric literals, and `//` line comments. Enabled automatically for `.rs`, `.c`, `.h`, `.cpp`, `.hpp`, `.cc`, `.cxx` files (`supports_highlighting()`); everything else renders plain. Known limitation: comments/strings don't span lines (no `/* */` block-comment tracking) — each line is colored independently. Verified with a temporary boot-time test asserting exact highlighted-character counts for keywords/numbers/comments/strings against known sample lines, then removed.
+
 ---
 
 ## HepFS File Manager
@@ -355,7 +429,7 @@ Range 0–32767 scaled to framebuffer size.
 | ✓ | PMM (bitmap, >1MB), HHDM, Paging |
 | ✓ | Bump heap (1MB), GlobalAlloc |
 | ✓ | x2APIC timer, ACPI shutdown/reboot, CMOS RTC |
-| ✓ | Preemptive round-robin scheduler (naked-asm context switch) |
+| 🟡 | Round-robin scheduler (naked-asm context switch) — structure exists, but **real preemption is currently broken** (see Known Issues); `task_blink` effectively runs the whole OS as a single always-scheduled task today |
 | ✓ | PCI config-space enumeration |
 | ✓ | Serial debug (panic prints file:line:message) |
 | ✓ | Cross-platform build (build.rs, build.sh, build.ps1) |
@@ -378,6 +452,9 @@ Range 0–32767 scaled to framebuffer size.
 | ✓ | Networking RX — e1000 RX confirmed working on QEMU/Windows (ping 10.0.2.2 replies) |
 | ✓ | Intel HDA audio — `beep [hz] [ms]` via hda-duplex codec, square-wave PCM, DMA stream |
 | ○ | ACPI FADT parsing (for real hardware shutdown) |
+| ○ | AHCI/SATA driver — original plan called for HepFS to work over both SATA and NVMe; only NVMe exists today |
+| ○ | USB HID keyboard — XHCI only drives the USB HID mouse (tablet) today; keyboard is PS/2 |
+| ○ | Drivers moved to userspace libOS — original plan put all drivers (XHCI/HDA/NVMe/PCI/ACPI/GOP) in userspace except where hardware forces kernel; every driver is still in-kernel (ring 0) today, `userspace/` only has the `hepos-rt`/`hepos-std`/`hello` scaffolding. Biggest architectural gap vs. the original design. |
 
 ### Storage
 | ✓/○ | Feature |
@@ -388,6 +465,7 @@ Range 0–32767 scaled to framebuffer size.
 | ✓ | `cp`, `mv` terminal commands |
 | ✓ | Double-indirect blocks — files up to ~4GB (bounded in practice by disk capacity); verified with a 5MB round-trip (`dindirect` block allocated, byte-exact read-back) |
 | ○ | VFS abstraction layer |
+| ○ | SATA support — HepFS only mounts over NVMe today; original plan called for both |
 
 ### Desktop / WM
 | ✓/○ | Feature |
@@ -410,18 +488,31 @@ Range 0–32767 scaled to framebuffer size.
 | ✓ | Taskbar grouping + jump list — windows of the same app kind collapse into one taskbar button with a "(N)" count; clicking it with N>1 opens a jump-list popup listing each instance ("Terminal 1", "Terminal 2", ... or the real title if distinguishing, e.g. "Editor: foo.txt") to pick which to focus |
 | ✓ | Start Menu lists one row per *program*, not per window — grouped the same way as the taskbar ("(N)" suffix, "--" badge only when no instance is open, opens the same jump list if N>1) |
 | ✓ | Right-click "New Window" — right-click a taskbar button or a Start Menu entry to spawn another instance of that program |
+| ○ | Window animations — original plan called for 150–200ms ease-out on open/close/minimize; windows currently snap instantly |
+| ○ | Volume control — no adjustable audio gain or taskbar volume UI exists; HDA always plays at fixed gain |
+| ○ | Dirty-rect (per-widget) tracking — current double-buffer scheme is a coarser two-tier system (full-scene redraw vs. ~20-row cursor-only partial flush), not literal per-widget dirty rectangles |
 
 ### Apps
 | ✓/○ | Feature |
 |-----|---------|
 | ✓ | Terminal — 30+ commands, history, left/right cursor, tab completion, dynamic width |
-| ✓ | Text editor — Ctrl+F find, PgUp/Dn, Ctrl+Home/End, F2/F10 |
+| ✓ | Text editor — Ctrl+F find, PgUp/Dn, Ctrl+Home/End, F2/F10, basic syntax highlighting (Rust/C: keywords/strings/numbers/comments) |
+| ✓ | Terminal live input highlighting — command name / known verbs, quoted strings, and numbers colored as you type, reusing the editor's tokenizer with `COMMAND_NAMES` as the keyword list (`terminal::recolor_input()`) |
+| ✓ | Text editor selection — drag-to-select and Shift+Arrow/Home/End/PgUp/PgDn extend a visible highlighted selection; typing, Enter, Backspace, and Delete all replace the selection like a normal editor (`Editor::select_anchor`, `selection_range()`, `delete_selection_if_any()`, `mouse_down()`/`mouse_drag()` wired from `main.rs`) |
 | ✓ | HepFS file manager — back/forward/path bar, click-to-navigate, click-to-open |
 | ✓ | Welcome window — system info |
 | ✓ | Sysmon window — RAM bar, uptime, PCI list, storage/net status |
 | ✓ | Multiple terminal windows — `newterm` spawns additional floating terminals, each independently focusable |
 | ✓ | Image viewer — decodes uncompressed 24/32-bit BMP (`view <file.bmp>`, or click a `.bmp` in HepFS); `/demo.bmp` checkerboard generated at boot |
 | ✓ | Audio player — decodes 16-bit PCM WAV (48kHz, mono/stereo) via non-blocking `hda::play_pcm()`; `play <file.wav>` or click a `.wav` in HepFS opens the Audio Player window (id=7) showing path/format/live progress bar/error; `/demo.wav` (440Hz tone) generated at boot |
+| ○ | Two-pane file manager — current HepFS file manager is single-pane with back/forward nav; original plan called for two-pane |
+| ○ | Markdown rendering — editor/viewer only handles plain TXT, no `.md` rendering |
+| ○ | PNG/JPG image support — image viewer only decodes uncompressed BMP |
+| ○ | MP3/FLAC/OGG audio codecs — audio player only decodes uncompressed WAV; no codec support (this is exactly what the planned "thin `std` shim for Symphonia" was meant to unlock) |
+| ○ | Video player (MP4/H.264) — no video playback of any kind |
+| ○ | PDF viewer — not implemented |
+| ○ | ZIP/TAR archive support — not implemented |
+| ○ | Settings: volume control, resolution — Settings app currently only has a wallpaper picker |
 
 ### Networking / Ecosystem
 | ✓/○ | Feature |
@@ -434,6 +525,7 @@ Range 0–32767 scaled to framebuffer size.
 | ✓ | UDP stack (general-purpose) — `net::udp_send_recv()`, DNS-resolved dest, TSC timeout; `udp <host>:<port> <msg>` terminal command |
 | ✓ | Userspace — ring 3, SYSCALL/SYSRET, ELF loader, exec from HepFS, process table |
 | ✓ | `hepos-std` shim — `hepos-rt` (bump allocator, panic, sys_write/exit/getpid) + `hepos-std` (println!, String, Vec); `runhello` demo command |
+| ○ | Full `std` shim (original plan: thin enough that crates like Symphonia link unmodified) — current shim only covers the tiny demo binary's needs (println!/String/Vec); no `std::io`, no error traits, nowhere near enough surface for a real-world crate |
 
 ---
 
@@ -446,6 +538,7 @@ Range 0–32767 scaled to framebuffer size.
 | Terminal text doesn't reflow on resize | Existing output stays at old column width; new input uses current width |
 | ~~`beep` audio doesn't stop~~ | Fixed: after tone duration, zero DMA buffer in-place while stream still runs → QEMU next-period read returns silence → 200 ms SDL drain wait → stop with stream_id preserved in bits[23:20] so QEMU matches the running stream. |
 | ~~Audio Player window shows no live "playing" indicator~~ | Fixed: `hda::play_pcm()` is now non-blocking — it starts the DMA stream and returns immediately; a small state machine (`hda::poll()`, called once per frame from the main render loop) advances zero-buffer → drain → stop over time instead of spin-waiting inside one call. `hda::progress_ms()`/`is_playing()` let the Audio Player window show a live "Playing... Xs / Ys" indicator + progress bar. `beep()` and `play_pcm()` both call a new `stop_now()` before starting, since the controller has only one output stream to share. Verified live: booted with a temporary instrumented test — `play()` returned immediately (target 500ms), the poll loop observed the "playing" state, then cleanly finished with no hang. |
+| **Terminal commands freeze the whole desktop while running** (network ops, etc.) | Not fixed — root-caused to a genuine scheduler bug: the timer ISR sent EOI *after* the context switch instead of before (so the very first task switch ever silently disabled all future timer interrupts), freshly-started tasks never had `RFLAGS.IF` restored (entered via a bare `ret`, not `iretq`), and — even after fixing both — resuming a task that was actually interrupted (via a real `iretq`) reliably corrupts a segment selector in the restored interrupt frame, crashing with a GPF. Attempted a full fix (background command-worker tasks pulling from a job queue) in one session; two of the three bugs were fixed, but the third wasn't safely resolved, so **all changes were reverted** rather than ship a kernel that crashes on its first natural preemption. Next attempt should probably avoid multiple OS-level preemptible tasks entirely and instead extend the pattern that already works for audio (`hda::play_pcm()`'s non-blocking poll-once-per-frame design) to network commands (`ping`/`wget`/`udp` as polled state machines checked from `task_blink`'s existing loop) — zero new context-switching risk. |
 
 ---
 
@@ -475,6 +568,16 @@ Range 0–32767 scaled to framebuffer size.
 22. ~~**Multi-instance for every app + taskbar grouping + right-click "New Window"**~~ ✓ done — generalized #21 to all apps via `Window.app_kind: AppKind` (see "Multi-instance windowing" section above): `image.rs` gained the same `EXTRA_VIEWERS`/`open_smart` treatment as Editor; Welcome/Sysmon/Settings/AudioPlayer got trivial multi-instance since they're stateless; Files converted `HEPFS_NAV` (global) → `HEPFS_NAVS` (per-window) so it's multi-instance too. Taskbar buttons group by app kind with a "(N)" jump-list popup; Start Menu groups the same way (one row per program, not per window); right-click a taskbar button or Start Menu row → "New Window". Fixed a latent title-lookup bug in 4 window renderers along the way (see section above). Verified via clean build + full boot regression; interactive behavior (right-click, jump list, independent Files browsing) not scripted-tested — worth a manual check.
 23. ~~**NVMe real disk size**~~ ✓ done — Identify Namespace (CNS=0, NSID=1) was never actually called (only Identify Controller was); added it, and fixed the `IdNs` struct's LBAF array offset (was 108, spec says 128). Verified: reports the true 512 MB instead of the old hardcoded-512-byte/0-blocks placeholder, no hang, R/W still works.
 24. ~~**Non-blocking audio playback + live Audio Player progress**~~ ✓ done — `hda::play_pcm()` now starts the DMA stream and returns immediately instead of spin-waiting for the whole clip; a new `hda::poll()` (called once per frame) advances the zero-buffer → drain → stop state machine over time. `hda::progress_ms()`/`is_playing()` feed a live "Playing... Xs / Ys" indicator + progress bar in the Audio Player window. `beep()` and `play_pcm()` each call a new `stop_now()` before starting, since there's only one HDA output stream to share between them. Verified with a temporary instrumented boot test: `play()` returned immediately, the poll loop observed the transient "playing" state, then completed cleanly with no hang.
+25. ~~**Syntax highlighting (editor + terminal)**~~ ✓ done — `editor::highlight_line_kw()`: basic per-line tokenizer (keywords/strings/numbers/`//` comments), auto-enabled for `.rs`/`.c`/`.h`/`.cpp`/`.hpp`/`.cc`/`.cxx` files. Made generic over the keyword list so `terminal.rs` reuses the exact same tokenizer for **live input highlighting** — command name/known verbs, quoted strings, and numbers colored as you type (`terminal::recolor_input()`, `COMMAND_NAMES` list shared with tab-completion). Verified with temporary boot-time tests asserting exact highlighted-character counts against known sample lines for both the editor and terminal tokenizers, then removed.
+26. **Terminal commands freezing the desktop** — attempted and reverted this session, see Known Issues for the full root-cause writeup. Next attempt: polled state machines (like `hda::play_pcm()`) for `ping`/`wget`/`udp`, not more OS-level preemptible tasks.
+27. **Move drivers to userspace libOS** — original plan's biggest deviation; XHCI/HDA/NVMe/PCI/ACPI/GOP all still run in-kernel. Large undertaking — needs a real driver-in-userspace IPC/MMIO-passthrough mechanism first.
+28. **AHCI/SATA driver** — HepFS is NVMe-only today; original plan called for both.
+29. **Full `std` shim** — enough surface (`std::io`, error traits, etc.) for an unmodified real-world crate (e.g. Symphonia) to link; current shim only covers the `hello` demo's needs. Would unlock real audio/image codec support instead of hand-rolled BMP/WAV-only decoders.
+30. **Real file format support** — PNG/JPG (image viewer), MP3/FLAC/OGG (audio player), MP4/H.264 (no video player exists at all), PDF viewer, Markdown rendering, ZIP/TAR archive support. All ❌ today; blocked in practice on #29 for the codec-heavy ones.
+31. **Two-pane file manager** — current HepFS file manager is single-pane with back/forward nav; original plan called for two-pane.
+32. **Window animations** — 150–200ms ease-out on open/close/minimize, per the original plan; windows currently snap instantly.
+33. **Volume control** — no adjustable audio gain or taskbar/Settings volume UI exists.
+34. **Settings: resolution control** — Settings app currently only has the wallpaper picker.
 
 ---
 
@@ -485,7 +588,7 @@ Range 0–32767 scaled to framebuffer size.
 pub static DISPLAY:        Mutex<Option<Display>>       // GOP framebuffer
 pub static FOCUSED_WIN:    Mutex<Option<usize>>         // Some(id) = focused window
 pub static PCI_DEVS:       Mutex<Vec<PciDevice>>        // populated at boot, used by lspci + sysmon
-static     HEPFS_NAV:      Mutex<Option<HepfsNav>>      // HepFS navigator: ino, path, back[], fwd[]
+static     HEPFS_NAVS:     Mutex<Vec<(usize, HepfsNav)>> // per-Files-window navigator: ino, path, back[], fwd[]
 static     UPTIME_FRAMES:  AtomicU64                    // incremented each frame (~60fps)
 
 // Other modules

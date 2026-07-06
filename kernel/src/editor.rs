@@ -22,6 +22,103 @@ const ERR:          Color = Color::from_hex(0xFF6B6B);
 const LINE_COL:     Color = Color::from_hex(0x333355);
 const FIND_HIT:     Color = Color::from_hex(0x2244AA); // other match background
 const FIND_CURRENT: Color = Color::from_hex(0xFFDD44); // current match background
+const SELECTION:    Color = Color::from_hex(0x264F78); // text selection background
+
+// ── Syntax highlighting (basic — Rust/C, per-line, no lexer) ─────────────────
+// Shared with terminal.rs, which reuses `highlight_line_kw` with its own
+// command-name list instead of Rust/C keywords, for live input highlighting.
+pub const KW_COLOR:  Color = Color::from_hex(0xC792EA); // keywords
+pub const STR_COLOR: Color = Color::from_hex(0xC3E88D); // string/char literals
+pub const NUM_COLOR: Color = Color::from_hex(0xF78C6C); // numeric literals
+pub const CMT_COLOR: Color = Color::from_hex(0x546E7A); // line comments
+
+const KEYWORDS: &[&str] = &[
+    // Rust
+    "fn", "let", "mut", "pub", "struct", "enum", "impl", "trait", "use", "mod", "crate",
+    "self", "Self", "if", "else", "match", "for", "while", "loop", "break", "continue",
+    "return", "true", "false", "const", "static", "unsafe", "async", "await", "move",
+    "ref", "in", "as", "dyn", "where", "type", "extern", "super", "box", "yield",
+    // C / C++
+    "int", "char", "float", "double", "void", "long", "short", "unsigned", "signed",
+    "typedef", "sizeof", "goto", "switch", "case", "default", "do", "union", "volatile",
+    "register", "auto", "include", "define", "ifdef", "ifndef", "endif", "class",
+    "public", "private", "protected", "namespace", "template", "new", "delete",
+    "virtual", "override", "nullptr", "NULL",
+];
+
+/// Only Rust/C-family files get highlighted — everything else renders plain.
+fn supports_highlighting(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    [".rs", ".c", ".h", ".cpp", ".hpp", ".cc", ".cxx"]
+        .iter().any(|ext| lower.ends_with(ext))
+}
+
+fn is_ident_start(b: u8) -> bool { b == b'_' || b.is_ascii_alphabetic() }
+fn is_ident_cont(b: u8)  -> bool { b == b'_' || b.is_ascii_alphanumeric() }
+
+/// Per-character colors for one line. Purely line-local (no cross-line block-
+/// comment tracking) — enough for basic keyword/string/number/comment coloring
+/// without a real lexer or parser.
+fn highlight_line(line: &[u8], default_col: Color) -> Vec<Color> {
+    highlight_line_kw(line, KEYWORDS, default_col)
+}
+
+/// Same tokenizer as `highlight_line`, but parametrized over the keyword list —
+/// lets `terminal.rs` reuse it for live command-line input highlighting with
+/// its own list of command names instead of Rust/C keywords.
+pub fn highlight_line_kw(line: &[u8], keywords: &[&str], default_col: Color) -> Vec<Color> {
+    let mut colors = alloc::vec![default_col; line.len()];
+    let mut i = 0usize;
+    while i < line.len() {
+        let b = line[i];
+        // Line comment — rest of the line
+        if b == b'/' && i + 1 < line.len() && line[i + 1] == b'/' {
+            for c in colors.iter_mut().skip(i) { *c = CMT_COLOR; }
+            break;
+        }
+        // String literal
+        if b == b'"' {
+            let start = i;
+            i += 1;
+            while i < line.len() && line[i] != b'"' {
+                i += if line[i] == b'\\' && i + 1 < line.len() { 2 } else { 1 };
+            }
+            i = (i + 1).min(line.len());
+            for c in &mut colors[start..i] { *c = STR_COLOR; }
+            continue;
+        }
+        // Char literal
+        if b == b'\'' {
+            let start = i;
+            i += 1;
+            while i < line.len() && line[i] != b'\'' {
+                i += if line[i] == b'\\' && i + 1 < line.len() { 2 } else { 1 };
+            }
+            i = (i + 1).min(line.len());
+            for c in &mut colors[start..i] { *c = STR_COLOR; }
+            continue;
+        }
+        // Numeric literal
+        if b.is_ascii_digit() {
+            let start = i;
+            while i < line.len() && (line[i].is_ascii_alphanumeric() || line[i] == b'.' || line[i] == b'_') { i += 1; }
+            for c in &mut colors[start..i] { *c = NUM_COLOR; }
+            continue;
+        }
+        // Identifier / keyword
+        if is_ident_start(b) {
+            let start = i;
+            while i < line.len() && is_ident_cont(line[i]) { i += 1; }
+            let word = core::str::from_utf8(&line[start..i]).unwrap_or("");
+            if keywords.contains(&word) {
+                for c in &mut colors[start..i] { *c = KW_COLOR; }
+            }
+            continue;
+        }
+        i += 1;
+    }
+    colors
+}
 
 pub struct Editor {
     pub path:    String,
@@ -34,6 +131,13 @@ pub struct Editor {
     status_ok:             bool,
     pub open:              bool,
     pub visible_rows_hint: usize,
+    highlight:             bool, // syntax highlighting on/off, set from file extension
+    // Text selection — (row, col) where the selection started. `None` = no
+    // selection. A real range only exists once this differs from the cursor
+    // position (selection_range() returns None for anchor == cursor), so a
+    // plain click or a non-extending keypress can safely leave this Some
+    // without showing a stray highlight.
+    select_anchor: Option<(usize, usize)>,
     // Find mode
     find_mode:    bool,
     find_query:   Vec<u8>,
@@ -59,6 +163,8 @@ impl Editor {
             status_ok: true,
             open: true,
             visible_rows_hint: 20,
+            highlight: supports_highlighting(path),
+            select_anchor: None,
             find_mode: false,
             find_query: Vec::new(),
             find_matches: Vec::new(),
@@ -100,6 +206,106 @@ impl Editor {
         self.cursor_row = r;
         self.cursor_col = c;
         self.ensure_visible();
+    }
+
+    // ── Selection ──────────────────────────────────────────────────────────
+
+    /// Normalized (start, end) selection range, or `None` if there's no real
+    /// selection (anchor equals cursor, or no anchor set at all).
+    fn selection_range(&self) -> Option<((usize, usize), (usize, usize))> {
+        let anchor = self.select_anchor?;
+        let cursor = (self.cursor_row, self.cursor_col);
+        if anchor == cursor { return None; }
+        Some(if anchor <= cursor { (anchor, cursor) } else { (cursor, anchor) })
+    }
+
+    /// Column range `[start, end)` selected on `line_idx`, if any.
+    fn selection_cols_for_line(&self, line_idx: usize, line_len: usize) -> Option<(usize, usize)> {
+        let (s, e) = self.selection_range()?;
+        if line_idx < s.0 || line_idx > e.0 { return None; }
+        let start = if line_idx == s.0 { s.1 } else { 0 };
+        let end   = if line_idx == e.0 { e.1 } else { line_len };
+        if start >= end { return None; }
+        Some((start, end))
+    }
+
+    /// If a real selection exists, delete it and collapse the cursor to the
+    /// selection start. Returns true if anything was deleted — callers use
+    /// this to replace-selection-on-type/backspace/delete like a normal editor.
+    fn delete_selection_if_any(&mut self) -> bool {
+        let Some((s, e)) = self.selection_range() else { return false; };
+        if s.0 == e.0 {
+            let line = &mut self.lines[s.0];
+            let end = e.1.min(line.len());
+            line.drain(s.1.min(end)..end);
+        } else {
+            let e_row = e.0.min(self.lines.len() - 1);
+            let e_col = e.1.min(self.lines[e_row].len());
+            let s_col = s.1.min(self.lines[s.0].len());
+            let tail = self.lines[e_row].split_off(e_col);
+            self.lines[s.0].truncate(s_col);
+            self.lines[s.0].extend_from_slice(&tail);
+            self.lines.drain(s.0 + 1..=e_row);
+        }
+        self.cursor_row = s.0;
+        self.cursor_col = s.1;
+        self.select_anchor = None;
+        self.modified = true;
+        true
+    }
+
+    /// Called at the top of every cursor-movement key handler: extends the
+    /// selection if Shift is held (anchoring it at the pre-move position the
+    /// first time), or clears it otherwise — same behavior as any normal editor.
+    fn update_selection_anchor(&mut self) {
+        if crate::ps2::shift_held() {
+            if self.select_anchor.is_none() {
+                self.select_anchor = Some((self.cursor_row, self.cursor_col));
+            }
+        } else {
+            self.select_anchor = None;
+        }
+    }
+
+    /// Mouse button pressed at (row, col) in the text buffer — moves the
+    /// cursor there and marks it as a potential selection anchor (only
+    /// becomes a visible selection once the mouse actually moves elsewhere).
+    pub fn mouse_down(&mut self, row: usize, col: usize) {
+        self.cursor_row = row.min(self.lines.len().saturating_sub(1));
+        self.cursor_col = col.min(self.lines[self.cursor_row].len());
+        self.select_anchor = Some((self.cursor_row, self.cursor_col));
+        self.ensure_visible();
+    }
+
+    /// Mouse dragged (button still held) to (row, col) — extends the
+    /// selection from wherever `mouse_down` anchored it.
+    pub fn mouse_drag(&mut self, row: usize, col: usize) {
+        self.cursor_row = row.min(self.lines.len().saturating_sub(1));
+        self.cursor_col = col.min(self.lines[self.cursor_row].len());
+        self.ensure_visible();
+    }
+
+    /// Pixel coordinates (window-relative) → (row, col) in the text buffer.
+    /// Mirrors `render()`'s exact layout math. Returns `None` for clicks
+    /// outside the scrollable content area (status bar / bottom bar / gutter).
+    pub fn hit_test(&self, wx: usize, wy: usize, ww: usize, wh: usize, mx: i32, my: i32) -> Option<(usize, usize)> {
+        let status_h    = CHAR_H + 4;
+        let content_y   = wy + status_h;
+        let content_h   = wh.saturating_sub(status_h);
+        let line_no_w   = 4 * CHAR_W;
+        let text_x      = wx + line_no_w;
+        let bottom_bar_y = wy + wh.saturating_sub(CHAR_H + 2);
+
+        if mx < wx as i32 || mx >= (wx + ww) as i32 { return None; }
+        if my < content_y as i32 || my >= bottom_bar_y as i32 { return None; }
+
+        let visible_rows = (content_h / CHAR_H).max(1);
+        let r = ((my - content_y as i32) as usize / CHAR_H).min(visible_rows.saturating_sub(1));
+        let line_idx = (self.scroll_row + r).min(self.lines.len().saturating_sub(1));
+
+        let rel_x = mx - (text_x as i32 + 2);
+        let col = if rel_x < 0 { 0 } else { (rel_x as usize / CHAR_W).min(self.lines[line_idx].len()) };
+        Some((line_idx, col))
     }
 
     pub fn on_key(&mut self, c: char) {
@@ -161,8 +367,9 @@ impl Editor {
             }
             b if b == ps2::KEY_F10 => { self.open = false; }
 
-            // Arrow keys
+            // Arrow keys — Shift extends the selection, otherwise it's cleared
             b if b == ps2::KEY_UP => {
+                self.update_selection_anchor();
                 if self.cursor_row > 0 {
                     self.cursor_row -= 1;
                     self.clamp_col();
@@ -170,6 +377,7 @@ impl Editor {
                 }
             }
             b if b == ps2::KEY_DOWN => {
+                self.update_selection_anchor();
                 if self.cursor_row + 1 < self.lines.len() {
                     self.cursor_row += 1;
                     self.clamp_col();
@@ -177,6 +385,7 @@ impl Editor {
                 }
             }
             b if b == ps2::KEY_LEFT => {
+                self.update_selection_anchor();
                 if self.cursor_col > 0 {
                     self.cursor_col -= 1;
                 } else if self.cursor_row > 0 {
@@ -186,6 +395,7 @@ impl Editor {
                 }
             }
             b if b == ps2::KEY_RIGHT => {
+                self.update_selection_anchor();
                 let len = self.lines[self.cursor_row].len();
                 if self.cursor_col < len {
                     self.cursor_col += 1;
@@ -196,6 +406,7 @@ impl Editor {
                 }
             }
             b if b == ps2::KEY_HOME => {
+                self.update_selection_anchor();
                 if crate::ps2::ctrl_held() {
                     // Ctrl+Home → file start
                     self.cursor_row = 0; self.cursor_col = 0; self.scroll_row = 0;
@@ -204,6 +415,7 @@ impl Editor {
                 }
             }
             b if b == ps2::KEY_END => {
+                self.update_selection_anchor();
                 if crate::ps2::ctrl_held() {
                     // Ctrl+End → file end
                     self.cursor_row = self.lines.len().saturating_sub(1);
@@ -214,20 +426,23 @@ impl Editor {
                 }
             }
             b if b == ps2::KEY_PGUP => {
+                self.update_selection_anchor();
                 let page = self.visible_rows_hint.max(1);
                 self.cursor_row = self.cursor_row.saturating_sub(page);
                 self.clamp_col();
                 self.ensure_visible();
             }
             b if b == ps2::KEY_PGDN => {
+                self.update_selection_anchor();
                 let page = self.visible_rows_hint.max(1);
                 self.cursor_row = (self.cursor_row + page).min(self.lines.len().saturating_sub(1));
                 self.clamp_col();
                 self.ensure_visible();
             }
 
-            // Enter → split line
+            // Enter → split line (replaces selection first, if any)
             b'\n' => {
+                self.delete_selection_if_any();
                 let rest = self.lines[self.cursor_row].split_off(self.cursor_col);
                 self.cursor_row += 1;
                 self.lines.insert(self.cursor_row, rest);
@@ -236,9 +451,11 @@ impl Editor {
                 self.modified = true;
             }
 
-            // Backspace
+            // Backspace — deletes the selection instead of one char, if any
             b'\x08' => {
-                if self.cursor_col > 0 {
+                if self.delete_selection_if_any() {
+                    self.ensure_visible();
+                } else if self.cursor_col > 0 {
                     self.cursor_col -= 1;
                     self.lines[self.cursor_row].remove(self.cursor_col);
                     self.modified = true;
@@ -253,21 +470,26 @@ impl Editor {
                 }
             }
 
-            // Delete (DEL key)
+            // Delete (DEL key) — deletes the selection instead of one char, if any
             b if b == ps2::KEY_DEL => {
-                let len = self.lines[self.cursor_row].len();
-                if self.cursor_col < len {
-                    self.lines[self.cursor_row].remove(self.cursor_col);
-                    self.modified = true;
-                } else if self.cursor_row + 1 < self.lines.len() {
-                    let next = self.lines.remove(self.cursor_row + 1);
-                    self.lines[self.cursor_row].extend_from_slice(&next);
-                    self.modified = true;
+                if self.delete_selection_if_any() {
+                    self.ensure_visible();
+                } else {
+                    let len = self.lines[self.cursor_row].len();
+                    if self.cursor_col < len {
+                        self.lines[self.cursor_row].remove(self.cursor_col);
+                        self.modified = true;
+                    } else if self.cursor_row + 1 < self.lines.len() {
+                        let next = self.lines.remove(self.cursor_row + 1);
+                        self.lines[self.cursor_row].extend_from_slice(&next);
+                        self.modified = true;
+                    }
                 }
             }
 
-            // Tab → 4 spaces
+            // Tab → 4 spaces (replaces selection first, if any)
             b'\t' => {
+                self.delete_selection_if_any();
                 for _ in 0..4 {
                     self.lines[self.cursor_row].insert(self.cursor_col, b' ');
                     self.cursor_col += 1;
@@ -275,8 +497,9 @@ impl Editor {
                 self.modified = true;
             }
 
-            // Printable characters
+            // Printable characters (replace selection first, if any)
             ch if ch >= 32 && ch < 128 => {
+                self.delete_selection_if_any();
                 self.lines[self.cursor_row].insert(self.cursor_col, ch);
                 self.cursor_col += 1;
                 self.modified = true;
@@ -379,6 +602,25 @@ impl Editor {
                 display.fill_rect(text_x, py, text_w, CHAR_H, Color::from_hex(0x12122A));
             }
 
+            // Draw text-selection highlight (drag / Shift+movement)
+            if let Some((sel_start, sel_end)) = self.selection_cols_for_line(line_idx, line.len()) {
+                let sel_x = text_x + 2 + sel_start * CHAR_W;
+                let sel_w = (sel_end - sel_start) * CHAR_W;
+                if sel_x < wx + ww {
+                    let sel_w = sel_w.min(wx + ww - sel_x);
+                    display.fill_rect(sel_x, py, sel_w, CHAR_H, SELECTION);
+                }
+            }
+
+            // Per-character syntax colors (plain default color if this file
+            // type isn't one we highlight — see supports_highlighting()).
+            let default_col = if line_idx == self.cursor_row { TEXT } else { Color::from_hex(0xCCCCCC) };
+            let line_colors = if self.highlight {
+                highlight_line(line, default_col)
+            } else {
+                alloc::vec![default_col; line.len()]
+            };
+
             // Draw text
             let mut px = text_x + 2;
             let qlen = self.find_query.len();
@@ -403,9 +645,7 @@ impl Editor {
                 }
                 if ch > b' ' {
                     let s = core::str::from_utf8(core::slice::from_ref(&ch)).unwrap_or("?");
-                    let col = if is_current_match { BG }
-                              else if line_idx == self.cursor_row { TEXT }
-                              else { Color::from_hex(0xCCCCCC) };
+                    let col = if is_current_match { BG } else { line_colors[ci] };
                     display.draw_text(px, py + 1, s, col, SCALE);
                 }
                 // Draw cursor underline
