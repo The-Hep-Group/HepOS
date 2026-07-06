@@ -39,7 +39,12 @@ struct CqEntry {
     status:  u16, // bit0 = phase, bits[15:1] = status code
 }
 
-// â"€â"€ Identify Namespace structure (relevant fields) â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+// ── Identify Namespace structure (relevant fields) ───────────────────────────
+// Per NVMe spec: NSZE/NCAP/NUSE/NSFEAT/NLBAF/FLBAS at offsets 0-26, then the
+// LBAF (LBA Format) array starts at byte offset 128 — not 108, which the
+// previous version of this struct had wrong (never noticed because this
+// struct was never actually populated: Identify was only ever called with
+// CNS=1 for Identify *Controller*, never CNS=0 for Identify *Namespace*).
 #[repr(C)]
 struct IdNs {
     nsze:   u64, // namespace size in blocks
@@ -48,8 +53,8 @@ struct IdNs {
     nsfeat: u8,
     nlbaf:  u8,  // number of LBA formats - 1
     flbas:  u8,  // current LBA format index (bits[3:0])
-    _pad:   [u8; 100 - 19],
-    lbaf:   [u32; 16], // LBA format descriptors
+    _pad:   [u8; 128 - 27],
+    lbaf:   [u32; 16], // LBA format descriptors — bits[23:16] of each = LBADS (2^LBADS byte size)
 }
 
 struct Queue {
@@ -310,16 +315,23 @@ pub fn init(devices: &[pci::PciDevice]) -> Option<NvmeController> {
     serial::print("NVMe: ctrl struct built\n");
 
     // Identify Controller (CNS=1, NSID=0 is valid for controller identify)
-    serial::print("NVMe: sending Identify...\n");
+    serial::print("NVMe: sending Identify Controller...\n");
     let (id_phys, _) = alloc_dma_page();
     ctrl.identify(1, 0, id_phys);
-    serial::print("NVMe: Identify OK\n");
+    serial::print("NVMe: Identify Controller OK\n");
 
-    // Hardcode 512-byte LBA size (correct for QEMU NVMe)
-    // Full namespace identify with format parsing added when needed for real HW
-    ctrl.lba_size  = 512;
-    ctrl.lba_count = ctrl.lba_count; // stays 0 for now, set after IO queues
-    serial::print("NVMe: LBA size = 512\n");
+    // Identify Namespace 1 (CNS=0, NSID=1) — gives the real block size + block
+    // count instead of the previous hardcoded 512B/0-blocks placeholder.
+    serial::print("NVMe: sending Identify Namespace...\n");
+    let (ns_phys, ns_virt) = alloc_dma_page();
+    ctrl.identify(0, 1, ns_phys);
+    let id_ns = unsafe { &*(ns_virt as *const IdNs) };
+    let lbaf_idx  = (id_ns.flbas & 0x0F) as usize;
+    let lbads     = (id_ns.lbaf[lbaf_idx] >> 16) & 0xFF;
+    ctrl.lba_size  = 1u32 << lbads;
+    ctrl.lba_count = id_ns.nsze;
+    serial::print_hex("NVMe: LBA size", ctrl.lba_size as u64);
+    serial::print_hex("NVMe: LBA count", ctrl.lba_count);
 
     // Create I/O queues (qid=1, size=QD, linked to cqid=1)
     let io_sq_phys = ctrl.io.sq_phys;

@@ -441,7 +441,7 @@ Range 0–32767 scaled to framebuffer size.
 
 | Issue | Status |
 |-------|--------|
-| NVMe size reported as 0 MB | Identify Namespace command hangs; workaround: hardcoded 512B/block |
+| ~~NVMe size reported as 0 MB~~ | Fixed: the code only ever called Identify *Controller* (CNS=1); Identify *Namespace* (CNS=0, NSID=1) was never actually issued, so `lba_count` stayed 0 and `lba_size` was hardcoded to 512. Also fixed the `IdNs` struct's field offsets — the LBAF array was placed at byte 108 instead of the correct spec offset of 128. Verified: reports the real 512 MB (0x100000 blocks × 0x200 bytes) with a correct byte-exact match to the disk image, no hang. |
 | ACPI shutdown only on QEMU | Hardcoded port 0x604 — real hardware needs FADT parsing |
 | Terminal text doesn't reflow on resize | Existing output stays at old column width; new input uses current width |
 | ~~`beep` audio doesn't stop~~ | Fixed: after tone duration, zero DMA buffer in-place while stream still runs → QEMU next-period read returns silence → 200 ms SDL drain wait → stop with stream_id preserved in bits[23:20] so QEMU matches the running stream. |
@@ -473,6 +473,7 @@ Range 0–32767 scaled to framebuffer size.
 20. ~~**Double-indirect blocks**~~ ✓ done — added `dindirect` field to the on-disk inode (backward-compatible: old padding bytes there were already zero); `write_file`/`read_file`/`remove` all extended with a Phase 3 that walks the 1024×1024 double-indirect tree; verified with a 5MB file (`dindirect` allocated, byte-exact round-trip)
 21. ~~**Multiple instances of the same app**~~ ✓ done (Editor) — `editor::open_smart()` reuses the main Editor window (id=3) if minimized/free, else spawns a new window via `editor::spawn_editor()` + `EXTRA_EDITORS` (mirrors `terminal::EXTRA_TERMINALS`); keyboard routing and render dispatch in main.rs extended accordingly. Verified via clean build + full boot regression; interactive multi-window behavior not scripted/tested (keyboard-driven, no automated GUI test harness) — worth a manual check.
 22. ~~**Multi-instance for every app + taskbar grouping + right-click "New Window"**~~ ✓ done — generalized #21 to all apps via `Window.app_kind: AppKind` (see "Multi-instance windowing" section above): `image.rs` gained the same `EXTRA_VIEWERS`/`open_smart` treatment as Editor; Welcome/Sysmon/Settings/AudioPlayer got trivial multi-instance since they're stateless; Files converted `HEPFS_NAV` (global) → `HEPFS_NAVS` (per-window) so it's multi-instance too. Taskbar buttons group by app kind with a "(N)" jump-list popup; Start Menu groups the same way (one row per program, not per window); right-click a taskbar button or Start Menu row → "New Window". Fixed a latent title-lookup bug in 4 window renderers along the way (see section above). Verified via clean build + full boot regression; interactive behavior (right-click, jump list, independent Files browsing) not scripted-tested — worth a manual check.
+23. ~~**NVMe real disk size**~~ ✓ done — Identify Namespace (CNS=0, NSID=1) was never actually called (only Identify Controller was); added it, and fixed the `IdNs` struct's LBAF array offset (was 108, spec says 128). Verified: reports the true 512 MB instead of the old hardcoded-512-byte/0-blocks placeholder, no hang, R/W still works.
 
 ---
 
