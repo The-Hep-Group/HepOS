@@ -358,6 +358,7 @@ impl Terminal {
                     ("wget <host>[:<port>] [path]","HTTP GET, resolves DNS (default port 80)"),
                     ("udp <host>:<port> <msg>","send a UDP datagram, print any reply (3s timeout)"),
                     ("view <file.bmp>", "open an uncompressed BMP in the image viewer"),
+                    ("play <file.wav>", "play a 16-bit PCM WAV (48kHz, mono/stereo) via HDA"),
                 ];
                 for (name, desc) in &cmds {
                     self.print_colored("  ", DIM);
@@ -1021,6 +1022,31 @@ impl Terminal {
                         self.print_colored("view: unsupported or unreadable BMP\n", ERR);
                     } else {
                         self.print_colored("Image viewer opened\n", OK);
+                    }
+                }
+            }
+
+            "play" => {
+                if arg1.is_empty() {
+                    self.print_colored("usage: play <file.wav>\n", ERR);
+                } else {
+                    let full = if arg1.starts_with('/') {
+                        String::from(arg1)
+                    } else if self.cwd_path == "/" {
+                        alloc::format!("/{}", arg1)
+                    } else {
+                        alloc::format!("{}/{}", self.cwd_path, arg1)
+                    };
+                    self.print_colored(&alloc::format!("Playing {}…\n", arg1), DIM);
+                    let result = crate::audio::play(&full);
+                    match result.error {
+                        Some(e) => self.print_colored(&alloc::format!("play: {}\n", e), ERR),
+                        None => {
+                            self.print_colored(&alloc::format!(
+                                "Played {} ms{}\n", result.duration_ms,
+                                if result.truncated { " (truncated to ~5.4s buffer)" } else { "" }
+                            ), OK);
+                        }
                     }
                 }
             }

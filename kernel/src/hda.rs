@@ -374,3 +374,78 @@ pub fn beep(freq_hz: u32, duration_ms: u32) {
     pmm::free_page(bdl_phys);
     for i in 0..buf_pages as u64 { pmm::free_page(buf_phys + i*4096); }
 }
+
+/// Play raw interleaved 16-bit stereo PCM at 48 kHz. Truncates to whatever
+/// fits in a 1 MB DMA buffer (~5.4s) since the whole clip is copied into one
+/// contiguous buffer up front — no streaming/refill yet.
+///
+/// Same stream setup / stop sequence as `beep()` (validated separately):
+/// zero the buffer in-place while still running, wait for SDL to drain, then
+/// stop with the stream_id preserved in SD_CTL bits[23:20].
+///
+/// Returns `(samples_played, truncated)` — `samples_played` counts i16 words
+/// (so stereo pairs = samples_played / 2).
+pub fn play_pcm(samples_stereo: &[i16]) -> (usize, bool) {
+    let guard  = HDA.lock();
+    let hda    = match guard.as_ref() { Some(h) => h, None => return (0, false) };
+    let mmio   = hda.mmio;
+    let sd_off = hda.sd_off;
+    drop(guard);
+
+    let max_words = (1usize << 20) / 2; // i16 words that fit in a 1MB buffer
+    let n = samples_stereo.len().min(max_words) & !1; // keep an even stereo-pair count
+    let truncated = n < samples_stereo.len();
+    let buf_bytes = n * 2;
+    if buf_bytes == 0 { return (0, truncated); }
+    let buf_pages = (buf_bytes + 4095) / 4096;
+
+    let buf_phys = match pmm::alloc_contiguous(buf_pages) {
+        Some(p) => p,
+        None    => { serial::print("HDA: OOM\n"); return (0, truncated); }
+    };
+    let buf_virt = vmm::phys_to_virt(buf_phys) as *mut i16;
+    unsafe { core::ptr::copy_nonoverlapping(samples_stereo.as_ptr(), buf_virt, n); }
+
+    let bdl_phys = match pmm::alloc_page() {
+        Some(p) => p,
+        None    => { for i in 0..buf_pages as u64 { pmm::free_page(buf_phys + i*4096); } return (0, truncated); }
+    };
+    unsafe { (vmm::phys_to_virt(bdl_phys) as *mut BdlEntry).write(BdlEntry { addr: buf_phys, len: buf_bytes as u32, ioc: 1 }); }
+
+    let stream_id: u8 = 1;
+    let fmt: u16      = 0x0011; // 48 kHz, 16-bit, stereo
+    configure_codec(mmio, stream_id, fmt);
+
+    w32(mmio, sd_off + SD_CTL, SD_CTL_SRST); spin(5_000);
+    w32(mmio, sd_off + SD_CTL, 0);           spin(5_000);
+
+    w32(mmio, sd_off + SD_BDPL, bdl_phys as u32);
+    w32(mmio, sd_off + SD_BDPU, (bdl_phys >> 32) as u32);
+    w32(mmio, sd_off + SD_CBL,  buf_bytes as u32);
+    w16(mmio, sd_off + SD_LVI,  0);
+    w16(mmio, sd_off + SD_FMT,  fmt);
+
+    let ctl_base = ((stream_id as u32) << 20) | SD_CTL_IOCE;
+    w32(mmio, sd_off + SD_CTL, ctl_base | SD_CTL_RUN);
+
+    let tsc_per_ms   = TSC_PER_MS.load(core::sync::atomic::Ordering::Relaxed);
+    let stereo_pairs = (n / 2) as u64;
+    let duration_ms  = (stereo_pairs * 1000 / 48_000).max(1);
+
+    let tone_end = rdtsc().wrapping_add(tsc_per_ms.saturating_mul(duration_ms));
+    while rdtsc().wrapping_sub(tone_end) > u64::MAX / 2 { core::hint::spin_loop(); }
+
+    unsafe { core::ptr::write_bytes(buf_virt as *mut u8, 0, buf_bytes); }
+
+    let drain_end = rdtsc().wrapping_add(tsc_per_ms.saturating_mul(200));
+    while rdtsc().wrapping_sub(drain_end) > u64::MAX / 2 { core::hint::spin_loop(); }
+
+    w32(mmio, sd_off + SD_CTL, ctl_base);                spin(50_000);
+    w32(mmio, sd_off + SD_CTL, ctl_base | SD_CTL_SRST);  spin(50_000);
+    w32(mmio, sd_off + SD_CTL, ctl_base);                spin(50_000);
+
+    pmm::free_page(bdl_phys);
+    for i in 0..buf_pages as u64 { pmm::free_page(buf_phys + i*4096); }
+
+    (n, truncated)
+}

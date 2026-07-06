@@ -55,6 +55,7 @@ kernel/
     elf.rs         ELF64 parser/loader — maps PT_LOAD segments into a user PML4
     hda.rs         Intel HDA driver: PCI detect, BAR0 map, immediate-cmd codec config, stream + BDL, beep()
     image.rs       BMP decoder (24/32-bit, BI_RGB) + image viewer window; `view <file>` command
+    audio.rs       WAV decoder (16-bit PCM, 48kHz) + playback via hda::play_pcm(); `play <file>` command
     serial.rs      COM1 debug: print, print_hex
     panic.rs       Prints file:line:message to serial, then spins
 
@@ -222,6 +223,7 @@ Terminal column count adapts to window width dynamically (up to 120 cols max).
 | `wget <host>[:<port>] [/path]` | HTTP GET with DNS resolution (default port 80); prints up to 4KB |
 | `udp <host>:<port> <msg>` | Send a UDP datagram (DNS-resolved), print any reply within 3s |
 | `view <file.bmp>` | Open an uncompressed 24/32-bit BMP in the image viewer window |
+| `play <file.wav>` | Play a 16-bit PCM WAV (48kHz, mono/stereo) via the HDA DMA stream |
 | `netstart` / `netdiag` / `netpoll` | NIC debug commands |
 | `shutdown` / `reboot` | ACPI off / PS/2 reset |
 | `echo` / `clear` | Print text / clear screen |
@@ -387,7 +389,7 @@ Range 0–32767 scaled to framebuffer size.
 | ✓ | Sysmon window — RAM bar, uptime, PCI list, storage/net status |
 | ✓ | Multiple terminal windows — `newterm` spawns additional floating terminals, each independently focusable |
 | ✓ | Image viewer — decodes uncompressed 24/32-bit BMP (`view <file.bmp>`, or click a `.bmp` in HepFS); `/demo.bmp` checkerboard generated at boot |
-| ○ | Audio player |
+| ✓ | Audio player — decodes 16-bit PCM WAV (48kHz, mono/stereo) via `hda::play_pcm()`; `play <file.wav>`; `/demo.wav` (440Hz tone) generated at boot |
 
 ### Networking / Ecosystem
 | ✓/○ | Feature |
@@ -430,9 +432,11 @@ Range 0–32767 scaled to framebuffer size.
 12. **`std` shim** — implement enough of `std` (alloc, io, fs stubs) so external Rust crates can link
 13. ~~**Desktop icons**~~ ✓ done — 5 coloured icons on desktop left edge (Welcome, Files, Terminal, Editor, Sysmon); click opens/focuses the window
 14. **RTL8169 / real hardware NIC** — for running on physical machines
+18. **virtio-gpu driver** — path to real GPU acceleration. Software rendering (current) writes every pixel via the CPU into a PMM-backed backbuffer, then copies it to the linear GOP framebuffer HepBL hands off — there's no GPU involved at all. Real hardware GPU command-ring formats (Intel/AMD/Nvidia) are enormously complex and largely undocumented for modern hardware, but `virtio-gpu` is a paravirtualized, well-documented, ring-based PCI device in QEMU — the realistic first step toward accelerated blits/scanout and eventually real command submission instead of hand-drawn pixels. Comparable in scope to the NVMe/XHCI drivers, likely bigger. Not started.
 15. ~~**HepBL — own bootloader**~~ ✓ done — from-scratch UEFI bootloader in pure Rust (hepbl/), no Limine, no external crates; hand-written UEFI FFI, ELF64 loader, own page tables + HHDM, BootInfo protocol; only asm is the final CR3/RSP/jmp handoff
 16. ~~**General UDP stack**~~ ✓ done — `net::udp_send_recv()` + `udp <host>:<port> <msg>` terminal command
 17. ~~**Image viewer**~~ ✓ done — `image.rs`: uncompressed 24/32-bit BMP decoder, `view <file>` command, click `.bmp` in HepFS to open; `/demo.bmp` checkerboard generated at boot for testing
+19. ~~**Audio player**~~ ✓ done — `audio.rs`: 16-bit PCM WAV decoder (48kHz, mono/stereo), `play <file>` command; `hda::play_pcm()` reuses beep()'s validated DMA stop sequence (zero buffer in-place, drain, stream_id-preserving stop) for arbitrary sample playback, truncated to a 1MB buffer (~5.4s); `/demo.wav` generated at boot for testing
 
 ---
 

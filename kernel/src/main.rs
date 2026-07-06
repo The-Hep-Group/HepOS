@@ -5,6 +5,7 @@ extern crate alloc;
 
 mod acpi;
 mod apic;
+mod audio;
 mod bootinfo;
 mod editor;
 mod e1000;
@@ -260,6 +261,11 @@ extern "C" fn kmain(bi_ptr: *const bootinfo::BootInfo) -> ! {
                 if hepfs::lookup(ctrl, "/demo.bmp").is_none() {
                     let ino = hepfs::create_file(ctrl, hepfs::ROOT_INO, "demo.bmp");
                     hepfs::write_file(ctrl, ino, &make_demo_bmp());
+                }
+                // Demo WAV so `play /demo.wav` has something to play out of the box
+                if hepfs::lookup(ctrl, "/demo.wav").is_none() {
+                    let ino = hepfs::create_file(ctrl, hepfs::ROOT_INO, "demo.wav");
+                    hepfs::write_file(ctrl, ino, &make_demo_wav());
                 }
             }
         }
@@ -1148,6 +1154,44 @@ fn make_demo_bmp() -> alloc::vec::Vec<u8> {
             buf[px + 1] = g;
             buf[px + 2] = r;
         }
+    }
+    buf
+}
+
+/// Generate a short 16-bit PCM WAV (440Hz square wave, 0.5s, 48kHz stereo)
+/// so `play /demo.wav` has something to play without needing a way to
+/// import host audio files into HepFS.
+fn make_demo_wav() -> alloc::vec::Vec<u8> {
+    const SAMPLE_RATE: u32 = 48_000;
+    const FREQ_HZ:     u32 = 440;
+    const DURATION_MS: u32 = 500;
+
+    let total_samples = (SAMPLE_RATE * DURATION_MS / 1000) as usize; // per channel
+    let data_bytes = total_samples * 2 /* channels */ * 2 /* bytes/sample */;
+    let file_size  = 36 + data_bytes; // RIFF size field = everything after itself
+
+    let mut buf = alloc::vec![0u8; 44 + data_bytes];
+    buf[0..4].copy_from_slice(b"RIFF");
+    buf[4..8].copy_from_slice(&(file_size as u32).to_le_bytes());
+    buf[8..12].copy_from_slice(b"WAVE");
+    buf[12..16].copy_from_slice(b"fmt ");
+    buf[16..20].copy_from_slice(&16u32.to_le_bytes());   // fmt chunk size
+    buf[20..22].copy_from_slice(&1u16.to_le_bytes());    // PCM
+    buf[22..24].copy_from_slice(&2u16.to_le_bytes());    // channels
+    buf[24..28].copy_from_slice(&SAMPLE_RATE.to_le_bytes());
+    buf[28..32].copy_from_slice(&(SAMPLE_RATE * 4).to_le_bytes()); // byte rate
+    buf[32..34].copy_from_slice(&4u16.to_le_bytes());    // block align (stereo * 2 bytes)
+    buf[34..36].copy_from_slice(&16u16.to_le_bytes());   // bits per sample
+    buf[36..40].copy_from_slice(b"data");
+    buf[40..44].copy_from_slice(&(data_bytes as u32).to_le_bytes());
+
+    let period_samp = SAMPLE_RATE / FREQ_HZ;
+    let half = period_samp / 2;
+    for i in 0..total_samples {
+        let val: i16 = if (i as u32) % period_samp < half { 0x4000 } else { -0x4000 };
+        let off = 44 + i * 4;
+        buf[off..off+2].copy_from_slice(&val.to_le_bytes());   // left
+        buf[off+2..off+4].copy_from_slice(&val.to_le_bytes()); // right
     }
     buf
 }
