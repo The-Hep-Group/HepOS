@@ -49,9 +49,10 @@ pub struct PlayResult {
     pub truncated:        bool,
 }
 
-/// State shown by the Audio Player window. Since `hda::play_pcm()` blocks the
-/// whole call (no preemption during terminal commands), the render loop never
-/// observes playback "in progress" — this reflects the *last* play attempt.
+/// State shown by the Audio Player window. `hda::play_pcm()` is non-blocking —
+/// it starts the DMA stream and returns immediately, so live progress comes
+/// from `hda::progress_ms()`/`hda::is_playing()` each frame; this struct just
+/// records which file/format is (or was) playing.
 pub struct NowPlaying {
     pub path:        String,
     pub sample_rate:  u32,
@@ -63,7 +64,8 @@ pub struct NowPlaying {
 
 pub static NOW_PLAYING: Mutex<Option<NowPlaying>> = Mutex::new(None);
 
-/// Decode and play `path` from HepFS. Blocks until playback (+ drain) finishes.
+/// Decode and start playing `path` from HepFS — returns as soon as the DMA
+/// stream is started (playback continues in the background; see hda::poll()).
 /// Only 16-bit PCM WAV at 48 kHz (mono or stereo) is supported — no resampler.
 /// Updates `NOW_PLAYING` so the Audio Player window can show the result.
 pub fn play(path: &str) -> PlayResult {
@@ -175,10 +177,24 @@ pub fn render(display: &mut Display, wx: usize, wy: usize, ww: usize, wh: usize)
                         if np.channels == 1 { "1" } else { "2" }
                     ), DIM, 1);
                     y += 14;
-                    display.draw_text(text_x, y, &alloc::format!(
-                        "Played {} ms{}", np.duration_ms,
-                        if np.truncated { " (truncated)" } else { "" }
-                    ), OK, 1);
+                    if let Some((elapsed_ms, total_ms)) = crate::hda::progress_ms() {
+                        display.draw_text(text_x, y, &alloc::format!(
+                            "Playing... {}.{}s / {}.{}s",
+                            elapsed_ms / 1000, (elapsed_ms % 1000) / 100,
+                            total_ms / 1000,   (total_ms % 1000) / 100,
+                        ), ACC, 1);
+                        y += 14;
+                        // Progress bar
+                        let bar_w = ww.saturating_sub(text_x - wx + 8).max(20);
+                        let fill_w = if total_ms > 0 { (bar_w * elapsed_ms as usize / total_ms as usize).min(bar_w) } else { 0 };
+                        display.fill_rect(text_x, y, bar_w, 6, Color::from_hex(0x222244));
+                        display.fill_rect(text_x, y, fill_w, 6, ACC);
+                    } else {
+                        display.draw_text(text_x, y, &alloc::format!(
+                            "Played {} ms{}", np.duration_ms,
+                            if np.truncated { " (truncated)" } else { "" }
+                        ), OK, 1);
+                    }
                 }
             }
         }

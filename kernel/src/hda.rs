@@ -293,6 +293,11 @@ pub fn init(devs: &[pci::PciDevice]) -> bool {
 /// can match the running stream; writing 0 to those bits previously caused
 /// QEMU to look for "stream 0" (not running) and leave the stream active.
 pub fn beep(freq_hz: u32, duration_ms: u32) {
+    // The controller has exactly one output stream — if an async play_pcm()
+    // clip is mid-playback, force it to a clean stop first so we don't race
+    // on the same SD_CTL registers / free its buffer out from under it.
+    stop_now();
+
     let guard  = HDA.lock();
     let hda    = match guard.as_ref() { Some(h) => h, None => return };
     let mmio   = hda.mmio;
@@ -375,17 +380,102 @@ pub fn beep(freq_hz: u32, duration_ms: u32) {
     for i in 0..buf_pages as u64 { pmm::free_page(buf_phys + i*4096); }
 }
 
-/// Play raw interleaved 16-bit stereo PCM at 48 kHz. Truncates to whatever
-/// fits in a 1 MB DMA buffer (~5.4s) since the whole clip is copied into one
-/// contiguous buffer up front — no streaming/refill yet.
-///
-/// Same stream setup / stop sequence as `beep()` (validated separately):
-/// zero the buffer in-place while still running, wait for SDL to drain, then
-/// stop with the stream_id preserved in SD_CTL bits[23:20].
+// ── Async PCM playback ────────────────────────────────────────────────────────
+//
+// Unlike beep() (which blocks the calling command for its whole duration —
+// fine for a short UI-feedback tone), play_pcm() starts the DMA stream and
+// returns immediately. poll() (called once per frame from the main render
+// loop) advances a small state machine that zeroes the buffer once the clip
+// finishes, waits for SDL to drain, then stops the stream — the same
+// validated stop sequence beep() uses, just spread across frames instead of
+// spin-waited in one call. This lets the Audio Player window show a live
+// "Playing... Xs / Ys" indicator instead of only the result after the fact.
+
+struct ActivePlayback {
+    mmio:      *mut u8,
+    sd_off:    usize,
+    buf_virt:  *mut i16,
+    buf_bytes: usize,
+    buf_phys:  u64,
+    buf_pages: usize,
+    bdl_phys:  u64,
+    ctl_base:  u32,
+    start_at:  u64,          // TSC at playback start
+    stop_at:   u64,          // TSC when the clip finishes (start zeroing then)
+    drain_at:  Option<u64>,  // TSC when SDL should have drained (set once zeroed)
+}
+unsafe impl Send for ActivePlayback {}
+
+static ACTIVE: Mutex<Option<ActivePlayback>> = Mutex::new(None);
+
+pub fn is_playing() -> bool { ACTIVE.lock().is_some() }
+
+/// (elapsed_ms, total_ms) of the currently active clip, if any.
+pub fn progress_ms() -> Option<(u64, u64)> {
+    let guard = ACTIVE.lock();
+    let ap = guard.as_ref()?;
+    let tsc_per_ms = TSC_PER_MS.load(core::sync::atomic::Ordering::Relaxed).max(1);
+    let total_ms   = ap.stop_at.wrapping_sub(ap.start_at) / tsc_per_ms;
+    let elapsed_ms = rdtsc().wrapping_sub(ap.start_at) / tsc_per_ms;
+    Some((elapsed_ms.min(total_ms), total_ms))
+}
+
+/// Force any in-progress async playback to a clean, immediate stop. Briefly
+/// blocking (~200ms SDL drain) but only runs when something is actually
+/// playing — a no-op otherwise. Called before beep()/play_pcm() start a new
+/// clip, since the controller only has one output stream to share.
+fn stop_now() {
+    let ap = match ACTIVE.lock().take() { Some(a) => a, None => return };
+    unsafe { core::ptr::write_bytes(ap.buf_virt as *mut u8, 0, ap.buf_bytes); }
+    let tsc_per_ms = TSC_PER_MS.load(core::sync::atomic::Ordering::Relaxed);
+    let until = rdtsc().wrapping_add(tsc_per_ms.saturating_mul(200));
+    while rdtsc().wrapping_sub(until) > u64::MAX / 2 { core::hint::spin_loop(); }
+    w32(ap.mmio, ap.sd_off + SD_CTL, ap.ctl_base);               spin(50_000);
+    w32(ap.mmio, ap.sd_off + SD_CTL, ap.ctl_base | SD_CTL_SRST); spin(50_000);
+    w32(ap.mmio, ap.sd_off + SD_CTL, ap.ctl_base);               spin(50_000);
+    pmm::free_page(ap.bdl_phys);
+    for i in 0..ap.buf_pages as u64 { pmm::free_page(ap.buf_phys + i*4096); }
+}
+
+/// Advance the async-playback state machine. Call once per frame from the
+/// main render loop; a no-op when nothing is playing.
+pub fn poll() {
+    let now = rdtsc();
+    let tsc_per_ms = TSC_PER_MS.load(core::sync::atomic::Ordering::Relaxed);
+    let mut guard = ACTIVE.lock();
+    let Some(ap) = guard.as_mut() else { return };
+
+    match ap.drain_at {
+        None => {
+            if now.wrapping_sub(ap.stop_at) > u64::MAX / 2 { return; } // clip still playing
+            // Clip finished — zero the buffer in-place while the stream keeps
+            // running (same trick as beep(): QEMU's next ~21ms read delivers
+            // silence to SDL), then start the drain timer.
+            unsafe { core::ptr::write_bytes(ap.buf_virt as *mut u8, 0, ap.buf_bytes); }
+            ap.drain_at = Some(now.wrapping_add(tsc_per_ms.saturating_mul(200)));
+        }
+        Some(drain_at) => {
+            if now.wrapping_sub(drain_at) > u64::MAX / 2 { return; } // still draining
+            w32(ap.mmio, ap.sd_off + SD_CTL, ap.ctl_base);               spin(50_000);
+            w32(ap.mmio, ap.sd_off + SD_CTL, ap.ctl_base | SD_CTL_SRST); spin(50_000);
+            w32(ap.mmio, ap.sd_off + SD_CTL, ap.ctl_base);               spin(50_000);
+            pmm::free_page(ap.bdl_phys);
+            for i in 0..ap.buf_pages as u64 { pmm::free_page(ap.buf_phys + i*4096); }
+            *guard = None;
+        }
+    }
+}
+
+/// Start playing raw interleaved 16-bit stereo PCM at 48 kHz — returns
+/// immediately; playback continues in the background, advanced by poll().
+/// Truncates to whatever fits in a 1 MB DMA buffer (~5.4s) since the whole
+/// clip is copied into one contiguous buffer up front — no streaming/refill.
 ///
 /// Returns `(samples_played, truncated)` — `samples_played` counts i16 words
 /// (so stereo pairs = samples_played / 2).
 pub fn play_pcm(samples_stereo: &[i16]) -> (usize, bool) {
+    stop_now(); // only one stream — clear out any previous clip first
+
     let guard  = HDA.lock();
     let hda    = match guard.as_ref() { Some(h) => h, None => return (0, false) };
     let mmio   = hda.mmio;
@@ -431,21 +521,13 @@ pub fn play_pcm(samples_stereo: &[i16]) -> (usize, bool) {
     let tsc_per_ms   = TSC_PER_MS.load(core::sync::atomic::Ordering::Relaxed);
     let stereo_pairs = (n / 2) as u64;
     let duration_ms  = (stereo_pairs * 1000 / 48_000).max(1);
+    let start_at     = rdtsc();
+    let stop_at      = start_at.wrapping_add(tsc_per_ms.saturating_mul(duration_ms));
 
-    let tone_end = rdtsc().wrapping_add(tsc_per_ms.saturating_mul(duration_ms));
-    while rdtsc().wrapping_sub(tone_end) > u64::MAX / 2 { core::hint::spin_loop(); }
-
-    unsafe { core::ptr::write_bytes(buf_virt as *mut u8, 0, buf_bytes); }
-
-    let drain_end = rdtsc().wrapping_add(tsc_per_ms.saturating_mul(200));
-    while rdtsc().wrapping_sub(drain_end) > u64::MAX / 2 { core::hint::spin_loop(); }
-
-    w32(mmio, sd_off + SD_CTL, ctl_base);                spin(50_000);
-    w32(mmio, sd_off + SD_CTL, ctl_base | SD_CTL_SRST);  spin(50_000);
-    w32(mmio, sd_off + SD_CTL, ctl_base);                spin(50_000);
-
-    pmm::free_page(bdl_phys);
-    for i in 0..buf_pages as u64 { pmm::free_page(buf_phys + i*4096); }
+    *ACTIVE.lock() = Some(ActivePlayback {
+        mmio, sd_off, buf_virt, buf_bytes, buf_phys, buf_pages, bdl_phys, ctl_base,
+        start_at, stop_at, drain_at: None,
+    });
 
     (n, truncated)
 }

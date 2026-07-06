@@ -1047,8 +1047,11 @@ impl Terminal {
                     match result.error {
                         Some(e) => self.print_colored(&alloc::format!("play: {}\n", e), ERR),
                         None => {
+                            // Playback runs in the background now — the terminal
+                            // doesn't block, so report the target duration, not a
+                            // completed one; the Audio Player window shows live progress.
                             self.print_colored(&alloc::format!(
-                                "Played {} ms{}\n", result.duration_ms,
+                                "Playing ({} ms){}\n", result.duration_ms,
                                 if result.truncated { " (truncated to ~5.4s buffer)" } else { "" }
                             ), OK);
                         }

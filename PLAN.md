@@ -421,7 +421,7 @@ Range 0–32767 scaled to framebuffer size.
 | ✓ | Sysmon window — RAM bar, uptime, PCI list, storage/net status |
 | ✓ | Multiple terminal windows — `newterm` spawns additional floating terminals, each independently focusable |
 | ✓ | Image viewer — decodes uncompressed 24/32-bit BMP (`view <file.bmp>`, or click a `.bmp` in HepFS); `/demo.bmp` checkerboard generated at boot |
-| ✓ | Audio player — decodes 16-bit PCM WAV (48kHz, mono/stereo) via `hda::play_pcm()`; `play <file.wav>` or click a `.wav` in HepFS opens the Audio Player window (id=7) showing path/format/duration/error; `/demo.wav` (440Hz tone) generated at boot |
+| ✓ | Audio player — decodes 16-bit PCM WAV (48kHz, mono/stereo) via non-blocking `hda::play_pcm()`; `play <file.wav>` or click a `.wav` in HepFS opens the Audio Player window (id=7) showing path/format/live progress bar/error; `/demo.wav` (440Hz tone) generated at boot |
 
 ### Networking / Ecosystem
 | ✓/○ | Feature |
@@ -445,7 +445,7 @@ Range 0–32767 scaled to framebuffer size.
 | ACPI shutdown only on QEMU | Hardcoded port 0x604 — real hardware needs FADT parsing |
 | Terminal text doesn't reflow on resize | Existing output stays at old column width; new input uses current width |
 | ~~`beep` audio doesn't stop~~ | Fixed: after tone duration, zero DMA buffer in-place while stream still runs → QEMU next-period read returns silence → 200 ms SDL drain wait → stop with stream_id preserved in bits[23:20] so QEMU matches the running stream. |
-| Audio Player window shows no live "playing" indicator | `hda::play_pcm()` blocks the whole `play` command (no preemption during terminal commands, same as `beep()`) — the render loop never runs mid-playback, so the window can only show the *last* play result once the call returns, not real-time progress |
+| ~~Audio Player window shows no live "playing" indicator~~ | Fixed: `hda::play_pcm()` is now non-blocking — it starts the DMA stream and returns immediately; a small state machine (`hda::poll()`, called once per frame from the main render loop) advances zero-buffer → drain → stop over time instead of spin-waiting inside one call. `hda::progress_ms()`/`is_playing()` let the Audio Player window show a live "Playing... Xs / Ys" indicator + progress bar. `beep()` and `play_pcm()` both call a new `stop_now()` before starting, since the controller has only one output stream to share. Verified live: booted with a temporary instrumented test — `play()` returned immediately (target 500ms), the poll loop observed the "playing" state, then cleanly finished with no hang. |
 
 ---
 
@@ -474,6 +474,7 @@ Range 0–32767 scaled to framebuffer size.
 21. ~~**Multiple instances of the same app**~~ ✓ done (Editor) — `editor::open_smart()` reuses the main Editor window (id=3) if minimized/free, else spawns a new window via `editor::spawn_editor()` + `EXTRA_EDITORS` (mirrors `terminal::EXTRA_TERMINALS`); keyboard routing and render dispatch in main.rs extended accordingly. Verified via clean build + full boot regression; interactive multi-window behavior not scripted/tested (keyboard-driven, no automated GUI test harness) — worth a manual check.
 22. ~~**Multi-instance for every app + taskbar grouping + right-click "New Window"**~~ ✓ done — generalized #21 to all apps via `Window.app_kind: AppKind` (see "Multi-instance windowing" section above): `image.rs` gained the same `EXTRA_VIEWERS`/`open_smart` treatment as Editor; Welcome/Sysmon/Settings/AudioPlayer got trivial multi-instance since they're stateless; Files converted `HEPFS_NAV` (global) → `HEPFS_NAVS` (per-window) so it's multi-instance too. Taskbar buttons group by app kind with a "(N)" jump-list popup; Start Menu groups the same way (one row per program, not per window); right-click a taskbar button or Start Menu row → "New Window". Fixed a latent title-lookup bug in 4 window renderers along the way (see section above). Verified via clean build + full boot regression; interactive behavior (right-click, jump list, independent Files browsing) not scripted-tested — worth a manual check.
 23. ~~**NVMe real disk size**~~ ✓ done — Identify Namespace (CNS=0, NSID=1) was never actually called (only Identify Controller was); added it, and fixed the `IdNs` struct's LBAF array offset (was 108, spec says 128). Verified: reports the true 512 MB instead of the old hardcoded-512-byte/0-blocks placeholder, no hang, R/W still works.
+24. ~~**Non-blocking audio playback + live Audio Player progress**~~ ✓ done — `hda::play_pcm()` now starts the DMA stream and returns immediately instead of spin-waiting for the whole clip; a new `hda::poll()` (called once per frame) advances the zero-buffer → drain → stop state machine over time. `hda::progress_ms()`/`is_playing()` feed a live "Playing... Xs / Ys" indicator + progress bar in the Audio Player window. `beep()` and `play_pcm()` each call a new `stop_now()` before starting, since there's only one HDA output stream to share between them. Verified with a temporary instrumented boot test: `play()` returned immediately, the poll loop observed the transient "playing" state, then completed cleanly with no hang.
 
 ---
 

@@ -724,6 +724,10 @@ fn task_blink() -> ! {
             if let Some(tm) = tm.as_mut() { tm.dirty = true; }
         }
 
+        // Advance any in-progress async audio playback (zero-buffer/drain/stop
+        // state machine — see hda::play_pcm()/poll() docs).
+        hda::poll();
+
         // Two-tier rendering:
         //   content_dirty → full scene redraw + save_scene + cursor + full flush
         //   mouse_only    → restore scene rows near cursor + repaint cursor + partial flush
@@ -733,7 +737,7 @@ fn task_blink() -> ! {
             let dd = desktop::DESKTOP.lock().as_ref().map(|d| d.dirty).unwrap_or(false);
             let td = terminal::TERMINAL.lock().as_ref().map(|t| t.dirty).unwrap_or(false);
             let ed = terminal::EXTRA_TERMINALS.lock().iter().any(|(_, t)| t.dirty);
-            dd || td || ed || ps2_had_input
+            dd || td || ed || ps2_had_input || hda::is_playing()
         };
         let mouse_moved = {
             let md = desktop::DESKTOP.lock().as_ref().map(|d| d.mouse_dirty).unwrap_or(false);
