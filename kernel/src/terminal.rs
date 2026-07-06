@@ -357,6 +357,7 @@ impl Terminal {
                     ("beep [hz] [ms]", "play tone via HDA audio"),
                     ("wget <host>[:<port>] [path]","HTTP GET, resolves DNS (default port 80)"),
                     ("udp <host>:<port> <msg>","send a UDP datagram, print any reply (3s timeout)"),
+                    ("view <file.bmp>", "open an uncompressed BMP in the image viewer"),
                 ];
                 for (name, desc) in &cmds {
                     self.print_colored("  ", DIM);
@@ -987,6 +988,40 @@ impl Terminal {
                     }
                     *crate::FOCUSED_WIN.lock() = Some(3);
                     self.print_colored("Editor opened  Ctrl+S=save  Ctrl+Q=close\n", OK);
+                }
+            }
+
+            "view" => {
+                if arg1.is_empty() {
+                    self.print_colored("usage: view <file.bmp>\n", ERR);
+                } else {
+                    let full = if arg1.starts_with('/') {
+                        String::from(arg1)
+                    } else if self.cwd_path == "/" {
+                        alloc::format!("/{}", arg1)
+                    } else {
+                        alloc::format!("{}/{}", self.cwd_path, arg1)
+                    };
+                    crate::image::open(&full);
+                    // Un-minimize image viewer window (id=6), bring to front, focus it
+                    {
+                        let mut dt = crate::desktop::DESKTOP.lock();
+                        if let Some(dt) = dt.as_mut() {
+                            if let Some(w) = dt.windows.iter_mut().find(|w| w.id == 6) {
+                                w.minimized = false;
+                            }
+                            dt.bring_to_front(6);
+                            dt.dirty = true;
+                        }
+                    }
+                    *crate::FOCUSED_WIN.lock() = Some(6);
+                    let has_err = crate::image::VIEWER.lock().as_ref()
+                        .map(|v| v.error.is_some()).unwrap_or(false);
+                    if has_err {
+                        self.print_colored("view: unsupported or unreadable BMP\n", ERR);
+                    } else {
+                        self.print_colored("Image viewer opened\n", OK);
+                    }
                 }
             }
 

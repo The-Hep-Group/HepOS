@@ -54,6 +54,7 @@ kernel/
     process.rs     Ring-3 process: user PML4, ELF entry, process table (PID, state, exec, ps)
     elf.rs         ELF64 parser/loader — maps PT_LOAD segments into a user PML4
     hda.rs         Intel HDA driver: PCI detect, BAR0 map, immediate-cmd codec config, stream + BDL, beep()
+    image.rs       BMP decoder (24/32-bit, BI_RGB) + image viewer window; `view <file>` command
     serial.rs      COM1 debug: print, print_hex
     panic.rs       Prints file:line:message to serial, then spins
 
@@ -162,6 +163,8 @@ Key routing in task_blink:
 | 2 | Terminal | open | Full interactive shell |
 | 3 | Editor | minimized | Text editor — opened by `edit <file>` or clicking a file in HepFS |
 | 4 | Sysmon | minimized | RAM bar, uptime, PCI list, storage/net status |
+| 5 | Settings | minimized | Background picker (dark gradient / Bliss) |
+| 6 | Image Viewer | minimized | Decoded BMP, opened via `view <file>` or clicking a `.bmp` in HepFS |
 
 All windows:
 - **Drag** title bar to move
@@ -218,6 +221,7 @@ Terminal column count adapts to window width dynamically (up to 120 cols max).
 | `ping <ip>` | ICMP echo |
 | `wget <host>[:<port>] [/path]` | HTTP GET with DNS resolution (default port 80); prints up to 4KB |
 | `udp <host>:<port> <msg>` | Send a UDP datagram (DNS-resolved), print any reply within 3s |
+| `view <file.bmp>` | Open an uncompressed 24/32-bit BMP in the image viewer window |
 | `netstart` / `netdiag` / `netpoll` | NIC debug commands |
 | `shutdown` / `reboot` | ACPI off / PS/2 reset |
 | `echo` / `clear` | Print text / clear screen |
@@ -382,9 +386,8 @@ Range 0–32767 scaled to framebuffer size.
 | ✓ | Welcome window — system info |
 | ✓ | Sysmon window — RAM bar, uptime, PCI list, storage/net status |
 | ✓ | Multiple terminal windows — `newterm` spawns additional floating terminals, each independently focusable |
-| ○ | Image viewer |
+| ✓ | Image viewer — decodes uncompressed 24/32-bit BMP (`view <file.bmp>`, or click a `.bmp` in HepFS); `/demo.bmp` checkerboard generated at boot |
 | ○ | Audio player |
-| ○ | Settings panel |
 
 ### Networking / Ecosystem
 | ✓/○ | Feature |
@@ -428,6 +431,8 @@ Range 0–32767 scaled to framebuffer size.
 13. ~~**Desktop icons**~~ ✓ done — 5 coloured icons on desktop left edge (Welcome, Files, Terminal, Editor, Sysmon); click opens/focuses the window
 14. **RTL8169 / real hardware NIC** — for running on physical machines
 15. ~~**HepBL — own bootloader**~~ ✓ done — from-scratch UEFI bootloader in pure Rust (hepbl/), no Limine, no external crates; hand-written UEFI FFI, ELF64 loader, own page tables + HHDM, BootInfo protocol; only asm is the final CR3/RSP/jmp handoff
+16. ~~**General UDP stack**~~ ✓ done — `net::udp_send_recv()` + `udp <host>:<port> <msg>` terminal command
+17. ~~**Image viewer**~~ ✓ done — `image.rs`: uncompressed 24/32-bit BMP decoder, `view <file>` command, click `.bmp` in HepFS to open; `/demo.bmp` checkerboard generated at boot for testing
 
 ---
 

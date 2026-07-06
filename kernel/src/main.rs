@@ -20,6 +20,7 @@ mod hda;
 mod heap;
 mod hepfs;
 mod idt;
+mod image;
 mod mouse;
 mod nvme;
 mod paging;
@@ -152,6 +153,8 @@ extern "C" fn kmain(bi_ptr: *const bootinfo::BootInfo) -> ! {
         dt.add_window("Sysmon",           80,  60,  340, 260);
         // Settings window (id=5) — hidden until opened from icon or right-click menu
         dt.add_window("Settings",         120, 80,  480, 320);
+        // Image Viewer window (id=6) — hidden until a .bmp is opened
+        dt.add_window("Image Viewer",     100, 60,  420, 340);
         *desktop::DESKTOP.lock() = Some(dt);
     }
 
@@ -167,11 +170,11 @@ extern "C" fn kmain(bi_ptr: *const bootinfo::BootInfo) -> ! {
         fwd:  alloc::vec::Vec::new(),
     });
 
-    // Minimize editor, sysmon, and settings until explicitly opened; focus terminal (id=2)
+    // Minimize editor, sysmon, settings, and image viewer until explicitly opened; focus terminal (id=2)
     {
         let mut dt = desktop::DESKTOP.lock();
         if let Some(dt) = dt.as_mut() {
-            for id in [3usize, 4, 5] {
+            for id in [3usize, 4, 5, 6] {
                 if let Some(w) = dt.windows.iter_mut().find(|w| w.id == id) {
                     w.minimized = true;
                 }
@@ -252,6 +255,11 @@ extern "C" fn kmain(bi_ptr: *const bootinfo::BootInfo) -> ! {
                         date
                     );
                     hepfs::write_file(ctrl, ino, content.as_bytes());
+                }
+                // Demo BMP so `view /demo.bmp` has something to show out of the box
+                if hepfs::lookup(ctrl, "/demo.bmp").is_none() {
+                    let ino = hepfs::create_file(ctrl, hepfs::ROOT_INO, "demo.bmp");
+                    hepfs::write_file(ctrl, ino, &make_demo_bmp());
                 }
             }
         }
@@ -533,7 +541,7 @@ fn task_blink() -> ! {
                                 let mut dt = desktop::DESKTOP.lock();
                                 if let Some(dt) = dt.as_mut() { dt.dirty = true; }
                             } else {
-                                // Open file in editor
+                                // Open file in editor, or in the image viewer for .bmp
                                 let cur_path = HEPFS_NAV.lock().as_ref().map(|n| n.path.clone())
                                     .unwrap_or_else(|| alloc::string::String::from("/"));
                                 let file_path = if cur_path == "/" {
@@ -541,18 +549,25 @@ fn task_blink() -> ! {
                                 } else {
                                     alloc::format!("{}/{}", cur_path, name)
                                 };
-                                editor::open(&file_path);
+                                let is_bmp = name.to_lowercase().ends_with(".bmp");
+                                let win_id = if is_bmp {
+                                    image::open(&file_path);
+                                    6usize
+                                } else {
+                                    editor::open(&file_path);
+                                    3usize
+                                };
                                 {
                                     let mut dt = desktop::DESKTOP.lock();
                                     if let Some(dt) = dt.as_mut() {
-                                        if let Some(w) = dt.windows.iter_mut().find(|w| w.id == 3) {
+                                        if let Some(w) = dt.windows.iter_mut().find(|w| w.id == win_id) {
                                             w.minimized = false;
                                         }
-                                        dt.bring_to_front(3);
+                                        dt.bring_to_front(win_id);
                                         dt.dirty = true;
                                     }
                                 }
-                                *FOCUSED_WIN.lock() = Some(3);
+                                *FOCUSED_WIN.lock() = Some(win_id);
                             }
                         }
                     }
@@ -744,6 +759,14 @@ fn task_blink() -> ! {
                                } }
                         4 => render_sysmon_window(display),
                         5 => render_settings_window(display),
+                        6 => { let vg = image::VIEWER.lock();
+                               if let Some(v) = vg.as_ref() {
+                                   v.render(display, wx, wy, *ww, *wh);
+                               } else {
+                                   display.fill_rect(wx, wy, *ww, *wh, framebuffer::Color::from_hex(0x0A0A14));
+                                   display.draw_text(wx + 8, wy + 8, "No image open - try `view <file>.bmp`",
+                                       framebuffer::Color::from_hex(0x888888), 1);
+                               } }
                         _ => {
                             // Extra terminals spawned via `newterm`
                             let mut et = terminal::EXTRA_TERMINALS.lock();
@@ -1089,6 +1112,46 @@ fn write_u64(mut n: u64, pos: &mut usize, buf: &mut [u8; 64]) {
     buf[start..*pos].reverse();
 }
 
+/// Generate a small uncompressed 24-bit BMP (checkerboard, HepOS accent colors)
+/// so `view /demo.bmp` has something to show without needing a way to import
+/// host image files into HepFS.
+fn make_demo_bmp() -> alloc::vec::Vec<u8> {
+    const W: usize = 64;
+    const H: usize = 64;
+    const SQ: usize = 8; // checker square size
+    let row_stride = W * 3; // 192, already a multiple of 4 — no row padding needed
+    let pixel_offset = 54usize;
+    let file_size = pixel_offset + row_stride * H;
+
+    let mut buf = alloc::vec![0u8; file_size];
+    // BITMAPFILEHEADER
+    buf[0] = b'B'; buf[1] = b'M';
+    buf[2..6].copy_from_slice(&(file_size as u32).to_le_bytes());
+    buf[10..14].copy_from_slice(&(pixel_offset as u32).to_le_bytes());
+    // BITMAPINFOHEADER
+    buf[14..18].copy_from_slice(&40u32.to_le_bytes());       // header size
+    buf[18..22].copy_from_slice(&(W as i32).to_le_bytes());
+    buf[22..26].copy_from_slice(&(H as i32).to_le_bytes());  // positive = bottom-up
+    buf[26..28].copy_from_slice(&1u16.to_le_bytes());        // planes
+    buf[28..30].copy_from_slice(&24u16.to_le_bytes());       // bpp
+    // compression (30..34) = 0 = BI_RGB — already zeroed
+
+    let (ar, ag, ab) = (0x6Cu8, 0x8Eu8, 0xFFu8); // accent blue
+    let (br, bg, bb) = (0x14u8, 0x14u8, 0x1Eu8); // near-black
+
+    for row in 0..H {
+        for col in 0..W {
+            let checker = ((row / SQ) + (col / SQ)) % 2 == 0;
+            let (r, g, b) = if checker { (ar, ag, ab) } else { (br, bg, bb) };
+            let px = pixel_offset + row * row_stride + col * 3;
+            buf[px]     = b; // BMP stores BGR
+            buf[px + 1] = g;
+            buf[px + 2] = r;
+        }
+    }
+    buf
+}
+
 fn render_settings_window(display: &mut framebuffer::Display) {
     let Some((wx, wy, ww, wh)) = window_rect("Settings") else { return; };
     use framebuffer::Color;
@@ -1183,3 +1246,4 @@ fn render_settings_window(display: &mut framebuffer::Display) {
         display.draw_text(lx, ty0 + TH + 6, label, if cur_wp == wp_id { acc } else { dim }, 1);
     }
 }
+
