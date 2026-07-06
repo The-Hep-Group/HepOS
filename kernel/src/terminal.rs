@@ -238,6 +238,17 @@ impl Terminal {
         Some((line_idx, col))
     }
 
+    /// Selects the entire line at absolute index `row`, trimmed of trailing
+    /// blank cells — double-click convenience. A wholly-blank line selects
+    /// nothing (start == end collapses to no selection, same as elsewhere).
+    pub fn select_line(&mut self, row: usize) {
+        let row = row.min(self.lines.len().saturating_sub(1));
+        let mut end = self.cols;
+        while end > 0 && self.lines[row][end - 1].ch == b' ' { end -= 1; }
+        self.select_anchor = Some((row, 0));
+        self.select_head = Some((row, end));
+    }
+
     // ── Clipboard ──────────────────────────────────────────────────────────
 
     /// Copies the current selection (if any) to the system clipboard.
@@ -288,7 +299,10 @@ impl Terminal {
         // Any key other than Left/Right (which manage selection themselves
         // via update_selection_anchor/sync_selection_head) clears an
         // in-progress selection — matches normal editor/terminal behavior.
-        if c as u8 != ps2::KEY_LEFT && c as u8 != ps2::KEY_RIGHT {
+        // Copy (Ctrl+Shift+C) is exempt so the selection survives to be read
+        // below, and stays visible afterward like any other editor's Ctrl+C.
+        let is_copy_combo = c == 'C' && ps2::ctrl_held();
+        if c as u8 != ps2::KEY_LEFT && c as u8 != ps2::KEY_RIGHT && !is_copy_combo {
             self.select_anchor = None;
             self.select_head = None;
         }
@@ -331,6 +345,13 @@ impl Terminal {
                 self.print_colored("^C\n", ERR);
                 self.show_prompt();
             }
+            // Ctrl+Shift+C ('C' — shift suppresses the ctrl lowercase→control-code
+            // conversion in ps2.rs, so this is distinct from plain Ctrl+C above) → copy
+            b'C' if ps2::ctrl_held() => { self.copy_selection(); }
+            // Ctrl+Shift+V (same reasoning) → paste. Ctrl+V alone (0x16) isn't
+            // otherwise bound in the terminal, so it pastes too.
+            b'V' if ps2::ctrl_held() => { self.paste_clipboard(); }
+            0x16 => { self.paste_clipboard(); } // Ctrl+V
             b'\x0C' | b'\x0B' => { // Ctrl+L or Ctrl+K = clear
                 for line in &mut self.lines { *line = [Cell::blank(); MAX_COLS]; }
                 self.col = 0; self.row = 0;

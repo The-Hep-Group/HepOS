@@ -51,6 +51,26 @@ pub static FOCUSED_WIN: Mutex<Option<usize>> = Mutex::new(None);
 /// since the click landed in that editor's content area). `None` when no
 /// drag-selection is in progress.
 static TEXT_DRAG_WIN: Mutex<Option<usize>> = Mutex::new(None);
+
+/// (window id, row, col, tick) of the last fresh click in an editor/terminal
+/// content area — used to detect a double-click (same cell, within ~400ms)
+/// so it can select the whole line instead of just placing the cursor.
+static LAST_CLICK: Mutex<Option<(usize, usize, usize, u64)>> = Mutex::new(None);
+
+/// Consumes/updates `LAST_CLICK` and reports whether this click is a double-click
+/// on the same (window, row, col) within the double-click time window.
+fn is_double_click(win_id: usize, row: usize, col: usize) -> bool {
+    let now = scheduler::TICK_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+    let mut last = LAST_CLICK.lock();
+    let double = matches!(*last, Some((w, r, c, t))
+        if w == win_id && r == row && c.abs_diff(col) <= 1 && now.saturating_sub(t) <= 40);
+    if double {
+        *last = None; // consumed — the next click starts a fresh pair
+    } else {
+        *last = Some((win_id, row, col, now));
+    }
+    double
+}
 pub static PCI_DEVS: Mutex<alloc::vec::Vec<pci::PciDevice>> = Mutex::new(alloc::vec::Vec::new());
 
 // Frame counter for uptime (~60 fps → divide by 60 for seconds)
@@ -496,7 +516,9 @@ fn task_blink() -> ! {
                                 eg.as_mut().and_then(|ed| {
                                     let h = ed.hit_test(wxu, wyu, www, wwh, mx, my);
                                     if let Some((row, col)) = h {
-                                        if fresh_click { ed.mouse_down(row, col); } else { ed.mouse_drag(row, col); }
+                                        if fresh_click {
+                                            if is_double_click(id, row, col) { ed.select_line(row); } else { ed.mouse_down(row, col); }
+                                        } else { ed.mouse_drag(row, col); }
                                     }
                                     h
                                 })
@@ -505,7 +527,9 @@ fn task_blink() -> ! {
                                 ee.iter_mut().find(|(wid, _)| *wid == id).and_then(|(_, ed)| {
                                     let h = ed.hit_test(wxu, wyu, www, wwh, mx, my);
                                     if let Some((row, col)) = h {
-                                        if fresh_click { ed.mouse_down(row, col); } else { ed.mouse_drag(row, col); }
+                                        if fresh_click {
+                                            if is_double_click(id, row, col) { ed.select_line(row); } else { ed.mouse_down(row, col); }
+                                        } else { ed.mouse_drag(row, col); }
                                     }
                                     h
                                 })
@@ -517,7 +541,9 @@ fn task_blink() -> ! {
                                 tg.as_mut().and_then(|t| {
                                     let h = t.hit_test(wxu, wyu, www, wwh, mx, my);
                                     if let Some((row, col)) = h {
-                                        if fresh_click { t.mouse_down(row, col); } else { t.mouse_drag(row, col); }
+                                        if fresh_click {
+                                            if is_double_click(id, row, col) { t.select_line(row); } else { t.mouse_down(row, col); }
+                                        } else { t.mouse_drag(row, col); }
                                     }
                                     h
                                 })
@@ -526,7 +552,9 @@ fn task_blink() -> ! {
                                 et.iter_mut().find(|(wid, _)| *wid == id).and_then(|(_, t)| {
                                     let h = t.hit_test(wxu, wyu, www, wwh, mx, my);
                                     if let Some((row, col)) = h {
-                                        if fresh_click { t.mouse_down(row, col); } else { t.mouse_drag(row, col); }
+                                        if fresh_click {
+                                            if is_double_click(id, row, col) { t.select_line(row); } else { t.mouse_down(row, col); }
+                                        } else { t.mouse_drag(row, col); }
                                     }
                                     h
                                 })

@@ -285,6 +285,15 @@ impl Editor {
         self.ensure_visible();
     }
 
+    /// Selects the entire line at `row` — double-click convenience.
+    pub fn select_line(&mut self, row: usize) {
+        let row = row.min(self.lines.len().saturating_sub(1));
+        self.cursor_row = row;
+        self.cursor_col = self.lines[row].len();
+        self.select_anchor = Some((row, 0));
+        self.ensure_visible();
+    }
+
     /// Pixel coordinates (window-relative) → (row, col) in the text buffer.
     /// Mirrors `render()`'s exact layout math. Returns `None` for clicks
     /// outside the scrollable content area (status bar / bottom bar / gutter).
