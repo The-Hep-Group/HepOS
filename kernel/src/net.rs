@@ -201,47 +201,6 @@ fn handle_udp(_data: &[u8]) {
 /// for anything but the gateway itself.
 pub const GW_MAC: [u8; 6] = [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02];
 
-/// Send one UDP datagram to `dst_ip:dst_port` from `src_port`, then block
-/// waiting for a UDP reply addressed back to `src_port` (from any sender),
-/// up to `timeout_ms`. Returns `(payload, reply_src_ip, reply_src_port)`.
-///
-/// General-purpose counterpart to the UDP send/receive already hand-rolled
-/// inside `dns_resolve` — usable for any UDP service (echo, syslog, custom
-/// protocols), not just DNS.
-pub fn udp_send_recv(
-    dst_ip: [u8; 4], dst_mac: [u8; 6],
-    src_port: u16, dst_port: u16,
-    data: &[u8], timeout_ms: u64,
-) -> Option<(Vec<u8>, [u8; 4], u16)> {
-    udp_send(dst_ip, dst_mac, src_port, dst_port, data);
-
-    let tsc_per_ms = crate::hda::TSC_PER_MS.load(core::sync::atomic::Ordering::Relaxed);
-    let deadline = crate::hda::rdtsc().wrapping_add(tsc_per_ms.saturating_mul(timeout_ms));
-
-    loop {
-        if crate::hda::rdtsc().wrapping_sub(deadline) < u64::MAX / 2 { return None; }
-
-        let frame = with_nic(|n| n.recv()).flatten();
-        if let Some(f) = frame {
-            if f.len() < 14 { continue; }
-            if u16::from_be_bytes([f[12], f[13]]) != 0x0800 { continue; }
-            let ip = &f[14..];
-            if ip.len() < 20 || ip[9] != 17 { continue; }
-            let ihl = ((ip[0] & 0x0F) as usize) * 4;
-            if ip.len() < ihl + 8 { continue; }
-            let udp = &ip[ihl..];
-            let dp = u16::from_be_bytes([udp[2], udp[3]]);
-            if dp != src_port { continue; } // not addressed to our listening port
-            let ulen = u16::from_be_bytes([udp[4], udp[5]]) as usize;
-            if ulen < 8 || udp.len() < ulen { continue; }
-            let sp = u16::from_be_bytes([udp[0], udp[1]]);
-            let src_ip: [u8; 4] = ip[12..16].try_into().unwrap_or([0; 4]);
-            return Some((udp[8..ulen].to_vec(), src_ip, sp));
-        }
-        for _ in 0..10_000u32 { core::hint::spin_loop(); }
-    }
-}
-
 // ── TCP ───────────────────────────────────────────────────────────────────────
 
 const TCP_FIN: u8 = 0x01;
@@ -306,203 +265,52 @@ pub fn parse_ip(s: &str) -> Option<[u8; 4]> {
     Some([a, b, c, d])
 }
 
-/// DNS A-record lookup via SLiRP's built-in resolver at 10.0.2.3:53.
-/// Returns the first IPv4 address for `hostname`, or None on timeout / NXDOMAIN.
-pub fn dns_resolve(hostname: &str) -> Option<[u8; 4]> {
-    let dns_ip  = [10u8, 0, 2, 3];
-    let dns_mac = [0x52u8, 0x55, 0x0a, 0x00, 0x02, 0x02];
-    let src_port = 53000u16;
-    let txid = (crate::hda::rdtsc() & 0xFFFF) as u16;
+/// Parse a raw DNS response body (past the UDP header) looking for the
+/// first A record. `None` covers both "not a valid/complete answer" and
+/// NXDOMAIN — callers can't tell the difference, same as before.
+fn parse_dns_answer(dns: &[u8]) -> Option<[u8; 4]> {
+    if dns.len() < 12 { return None; }
+    let ancount = u16::from_be_bytes([dns[6], dns[7]]) as usize;
+    if ancount == 0 { return None; }
 
-    // Build DNS query packet
-    let mut q: Vec<u8> = Vec::new();
-    q.extend_from_slice(&txid.to_be_bytes());
-    q.extend_from_slice(&[0x01, 0x00]); // flags: recursion desired
-    q.extend_from_slice(&[0x00, 0x01]); // QDCOUNT=1
-    q.extend_from_slice(&[0x00, 0x00]); // ANCOUNT=0
-    q.extend_from_slice(&[0x00, 0x00]); // NSCOUNT=0
-    q.extend_from_slice(&[0x00, 0x00]); // ARCOUNT=0
-    for label in hostname.split('.') {
-        if label.is_empty() { continue; }
-        q.push(label.len() as u8);
-        q.extend_from_slice(label.as_bytes());
-    }
-    q.push(0);                          // root label
-    q.extend_from_slice(&[0x00, 0x01]); // QTYPE=A
-    q.extend_from_slice(&[0x00, 0x01]); // QCLASS=IN
-
-    udp_send(dns_ip, dns_mac, src_port, 53, &q);
-
-    let tsc_per_ms = crate::hda::TSC_PER_MS.load(core::sync::atomic::Ordering::Relaxed);
-    let deadline   = crate::hda::rdtsc().wrapping_add(tsc_per_ms.saturating_mul(2_000));
-
+    // Skip header + question section (QNAME + QTYPE + QCLASS)
+    let mut pos = 12usize;
     loop {
-        if crate::hda::rdtsc().wrapping_sub(deadline) < u64::MAX / 2 { return None; }
-
-        let frame = with_nic(|n| n.recv()).flatten();
-        if let Some(f) = frame {
-            if f.len() < 14 { continue; }
-            if u16::from_be_bytes([f[12], f[13]]) != 0x0800 { continue; }
-            let ip = &f[14..];
-            if ip.len() < 20 { continue; }
-            let src_ip: [u8; 4] = ip[12..16].try_into().unwrap_or([0; 4]);
-            if src_ip != dns_ip || ip[9] != 17 { continue; }
-            let ihl = ((ip[0] & 0x0F) as usize) * 4;
-            let udp = &ip[ihl..];
-            if udp.len() < 8 { continue; }
-            if u16::from_be_bytes([udp[0], udp[1]]) != 53    { continue; }
-            if u16::from_be_bytes([udp[2], udp[3]]) != src_port { continue; }
-            let dns = &udp[8..];
-            if dns.len() < 12 { continue; }
-            if u16::from_be_bytes([dns[0], dns[1]]) != txid  { continue; }
-            if dns[2] & 0x80 == 0 { continue; } // not a response
-            let ancount = u16::from_be_bytes([dns[6], dns[7]]) as usize;
-            if ancount == 0 { return None; }
-
-            // Skip header + question section (QNAME + QTYPE + QCLASS)
-            let mut pos = 12usize;
-            loop {
-                if pos >= dns.len() { return None; }
-                let l = dns[pos] as usize;
-                if l == 0 { pos += 1; break; }
-                if l & 0xC0 == 0xC0 { pos += 2; break; }
-                pos += 1 + l;
-            }
-            pos += 4; // QTYPE + QCLASS
-
-            // Walk answer RRs looking for A record
-            for _ in 0..ancount {
-                if pos + 10 > dns.len() { break; }
-                // NAME: pointer or labels
-                if dns[pos] & 0xC0 == 0xC0 { pos += 2; }
-                else {
-                    while pos < dns.len() && dns[pos] != 0 { pos += 1 + dns[pos] as usize; }
-                    pos += 1;
-                }
-                if pos + 10 > dns.len() { break; }
-                let rtype = u16::from_be_bytes([dns[pos],   dns[pos+1]]);
-                let rdlen = u16::from_be_bytes([dns[pos+8], dns[pos+9]]) as usize;
-                pos += 10;
-                if rtype == 1 && rdlen == 4 && pos + 4 <= dns.len() {
-                    return Some([dns[pos], dns[pos+1], dns[pos+2], dns[pos+3]]);
-                }
-                pos += rdlen;
-            }
-            return None;
-        }
-        for _ in 0..10_000u32 { core::hint::spin_loop(); }
+        if pos >= dns.len() { return None; }
+        let l = dns[pos] as usize;
+        if l == 0 { pos += 1; break; }
+        if l & 0xC0 == 0xC0 { pos += 2; break; }
+        pos += 1 + l;
     }
+    pos += 4; // QTYPE + QCLASS
+
+    // Walk answer RRs looking for an A record
+    for _ in 0..ancount {
+        if pos + 10 > dns.len() { break; }
+        if dns[pos] & 0xC0 == 0xC0 { pos += 2; }
+        else {
+            while pos < dns.len() && dns[pos] != 0 { pos += 1 + dns[pos] as usize; }
+            pos += 1;
+        }
+        if pos + 10 > dns.len() { break; }
+        let rtype = u16::from_be_bytes([dns[pos],   dns[pos+1]]);
+        let rdlen = u16::from_be_bytes([dns[pos+8], dns[pos+9]]) as usize;
+        pos += 10;
+        if rtype == 1 && rdlen == 4 && pos + 4 <= dns.len() {
+            return Some([dns[pos], dns[pos+1], dns[pos+2], dns[pos+3]]);
+        }
+        pos += rdlen;
+    }
+    None
 }
 
-/// Open a TCP connection to `dst_ip:dst_port`, send `request`, collect the full
-/// response (until the server sends FIN or we time out after ~5 s), then close.
-/// Routes via the SLiRP gateway MAC so external IPs work out of the box.
+// Rotate through ephemeral ports to avoid TIME_WAIT collisions on repeated calls.
 static NEXT_SRC_PORT: core::sync::atomic::AtomicU16 =
     core::sync::atomic::AtomicU16::new(49152);
 
-pub fn tcp_get(dst_ip: [u8; 4], dst_port: u16, request: &[u8]) -> Result<Vec<u8>, &'static str> {
-    let gw_mac   = [0x52u8, 0x55, 0x0a, 0x00, 0x02, 0x02];
-    // Rotate through ephemeral ports to avoid TIME_WAIT collisions on repeated calls.
-    let src_port = {
-        let p = NEXT_SRC_PORT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if p == 0 { NEXT_SRC_PORT.store(49153, core::sync::atomic::Ordering::Relaxed); 49152 } else { p }
-    };
-    // Use TSC as a varying ISN so SLiRP doesn't confuse this with an old connection.
-    let mut seq  = crate::hda::rdtsc() as u32 | 1;
-    let mut ack  = 0u32;
-    let mut state: u8 = 0; // 0 = SYN_SENT, 1 = ESTABLISHED, 2 = done
-    let mut rx   = Vec::new();
-
-    tcp_send_seg(dst_ip, gw_mac, src_port, dst_port, seq, 0, TCP_SYN, &[]);
-    crate::serial::print("tcp: SYN sent\n");
-
-    // TSC-based 8-second timeout — immune to QEMU speed variations.
-    let tsc_per_ms = crate::hda::TSC_PER_MS.load(core::sync::atomic::Ordering::Relaxed);
-    let deadline   = crate::hda::rdtsc().wrapping_add(tsc_per_ms.saturating_mul(3_000));
-
-    'poll: loop {
-        // Timeout check
-        if crate::hda::rdtsc().wrapping_sub(deadline) < u64::MAX / 2 { break 'poll; }
-
-        loop {
-            let frame = with_nic(|n| n.recv()).flatten();
-            let Some(f) = frame else { break };
-            if f.len() < 14 { continue; }
-            let etype = u16::from_be_bytes([f[12], f[13]]);
-            if etype != 0x0800 {
-                crate::serial::print("tcp: non-IP frame etype=");
-                crate::serial::print_hex("", etype as u64);
-                crate::serial::print("\n");
-                continue;
-            }
-
-            let ip = &f[14..];
-            if ip.len() < 20 { continue; }
-            // ICMP unreachable (type=3) → treat as hard error
-            if ip[9] == 1 {
-                let ihl2 = ((ip[0] & 0x0F) as usize) * 4;
-                if ip.len() > ihl2 && ip[ihl2] == 3 { return Err("tcp: unreachable"); }
-                continue;
-            }
-            if ip[9] != 6 {
-                crate::serial::print("tcp: IP proto not TCP: ");
-                crate::serial::print_hex("", ip[9] as u64);
-                crate::serial::print("\n");
-                continue;
-            }
-            let src_ip: [u8; 4] = ip[12..16].try_into().unwrap_or([0; 4]);
-            crate::serial::print("tcp: TCP from ");
-            crate::serial::print_hex("", src_ip[0] as u64); crate::serial::print(".");
-            crate::serial::print_hex("", src_ip[1] as u64); crate::serial::print(".");
-            crate::serial::print_hex("", src_ip[2] as u64); crate::serial::print(".");
-            crate::serial::print_hex("", src_ip[3] as u64);
-            crate::serial::print(" flags=");
-            if ip.len() > 20 { crate::serial::print_hex("", ip[33] as u64); }
-            crate::serial::print("\n");
-            if src_ip != dst_ip { continue; }
-            if ip[16..20] != MY_IP { continue; }
-
-            let ihl = ((ip[0] & 0x0F) as usize) * 4;
-            let Some((sp, dp, seg_seq, flags, payload)) = tcp_parse(&ip[ihl..]) else { continue };
-            if sp != dst_port || dp != src_port { continue; }
-
-            if flags & TCP_RST != 0 { return Err("tcp: connection refused"); }
-
-            match state {
-                0 => {
-                    if flags & (TCP_SYN | TCP_ACK) == (TCP_SYN | TCP_ACK) {
-                        seq   = seq.wrapping_add(1);
-                        ack   = seg_seq.wrapping_add(1);
-                        tcp_send_seg(dst_ip, gw_mac, src_port, dst_port, seq, ack, TCP_ACK, &[]);
-                        tcp_send_seg(dst_ip, gw_mac, src_port, dst_port, seq, ack, TCP_PSH | TCP_ACK, request);
-                        seq   = seq.wrapping_add(request.len() as u32);
-                        state = 1;
-                    }
-                }
-                1 => {
-                    if !payload.is_empty() {
-                        rx.extend_from_slice(payload);
-                        ack = seg_seq.wrapping_add(payload.len() as u32);
-                        tcp_send_seg(dst_ip, gw_mac, src_port, dst_port, seq, ack, TCP_ACK, &[]);
-                    }
-                    if flags & TCP_FIN != 0 {
-                        ack = ack.wrapping_add(1);
-                        tcp_send_seg(dst_ip, gw_mac, src_port, dst_port, seq, ack, TCP_FIN | TCP_ACK, &[]);
-                        state = 2;
-                        break 'poll;
-                    }
-                }
-                _ => break 'poll,
-            }
-        }
-
-        // Nothing in ring right now — brief pause, then re-check.
-        for _ in 0..10_000u32 { core::hint::spin_loop(); }
-    }
-
-    if state == 0 { return Err("tcp: timeout — no SYN-ACK received"); }
-    if rx.is_empty() { return Err("tcp: connected but no data received"); }
-    Ok(rx)
+fn next_src_port() -> u16 {
+    let p = NEXT_SRC_PORT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if p == 0 { NEXT_SRC_PORT.store(49153, core::sync::atomic::Ordering::Relaxed); 49152 } else { p }
 }
 
 /// Process one incoming Ethernet frame. Call this from your polling loop.
@@ -517,47 +325,317 @@ pub fn handle_frame(frame: &[u8]) {
     }
 }
 
-/// High-level ping. Sends request, polls for reply up to ~250 ms.
-/// Returns round-trip string or error.
-pub fn ping(target_ip: [u8; 4]) -> alloc::string::String {
-    use alloc::format;
-    // NIC check
-    if crate::rtl8139::NIC.lock().is_none() && crate::e1000::NIC.lock().is_none() {
-        return format!("ping: no NIC found");
+// ── Async network jobs ────────────────────────────────────────────────────────
+// ping/wget/udp used to block the whole main loop (spin-waiting for a reply
+// or timeout) — since HepOS's rendering, mouse, and every other window are
+// all driven from that same single-threaded loop, a slow/unreachable host
+// froze the entire desktop for the duration. These commands now kick off a
+// `NetJob`, return immediately, and get polled once per frame from `poll()`
+// (called alongside `hda::poll()` in main.rs) until they finish or time out
+// — the same "state machine polled once per frame" pattern as HDA playback.
+
+use alloc::string::String;
+
+// Deadlines are TSC-based, not `scheduler::TICK_COUNT`-based: the APIC timer
+// only actually advances TICK_COUNT once (the single tick that bootstraps
+// kmain into task_blink) — see PLAN.md Known Issues. TSC has no such
+// dependency on the timer interrupt actually firing repeatedly.
+fn tsc_deadline(ms: u64) -> u64 {
+    let tsc_per_ms = crate::hda::TSC_PER_MS.load(core::sync::atomic::Ordering::Relaxed);
+    crate::hda::rdtsc().wrapping_add(tsc_per_ms.saturating_mul(ms))
+}
+fn tsc_expired(deadline: u64) -> bool {
+    crate::hda::rdtsc().wrapping_sub(deadline) < u64::MAX / 2
+}
+
+/// What to do once a hostname resolves — carries the params needed to start
+/// the TCP or UDP job the user actually asked for.
+enum NextAction {
+    Tcp { port: u16, req: Vec<u8> },
+    Udp { port: u16, msg: Vec<u8> },
+}
+
+enum NetJob {
+    Ping {
+        target: [u8; 4], seq: u16, deadline: u64,
+    },
+    Resolve {
+        hostname: String, dns_ip: [u8; 4], src_port: u16, txid: u16,
+        deadline: u64, next: NextAction,
+    },
+    Tcp {
+        ip: [u8; 4], port: u16, src_port: u16,
+        seq: u32, ack: u32, state: u8, rx: Vec<u8>, req: Vec<u8>, deadline: u64,
+    },
+    Udp {
+        src_port: u16, deadline: u64,
+    },
+}
+
+/// (issuing terminal window id, job) — only one network operation
+/// system-wide at a time, same as the old blocking version (you couldn't
+/// run two pings at once either).
+static NET_JOB: spin::Mutex<Option<(usize, NetJob)>> = spin::Mutex::new(None);
+
+pub fn job_in_progress() -> bool { NET_JOB.lock().is_some() }
+
+fn build_resolve_job(hostname: &str, next: NextAction) -> NetJob {
+    let dns_ip   = [10u8, 0, 2, 3];
+    let src_port = 53000u16;
+    let txid     = (crate::hda::rdtsc() & 0xFFFF) as u16;
+
+    let mut q: Vec<u8> = Vec::new();
+    q.extend_from_slice(&txid.to_be_bytes());
+    q.extend_from_slice(&[0x01, 0x00]);
+    q.extend_from_slice(&[0x00, 0x01]);
+    q.extend_from_slice(&[0x00, 0x00]);
+    q.extend_from_slice(&[0x00, 0x00]);
+    q.extend_from_slice(&[0x00, 0x00]);
+    for label in hostname.split('.') {
+        if label.is_empty() { continue; }
+        q.push(label.len() as u8);
+        q.extend_from_slice(label.as_bytes());
     }
+    q.push(0);
+    q.extend_from_slice(&[0x00, 0x01]);
+    q.extend_from_slice(&[0x00, 0x01]);
+    udp_send(dns_ip, GW_MAC, src_port, 53, &q);
 
-    // Routing:
-    //   on-subnet destination  → would normally ARP, but SLiRP only provides
-    //                            the gateway host; ARP for other 10.0.2.x won't reply.
-    //                            Use gateway MAC for gateway IP, else best-effort.
-    //   off-subnet destination → route via gateway (use gateway MAC).
-    // In all QEMU SLiRP cases the known gateway MAC is 52:55:0a:00:02:02.
-    let gw_mac = [0x52u8, 0x55, 0x0a, 0x00, 0x02, 0x02];
-    let on_subnet = (target_ip[0] == MY_IP[0]) && (target_ip[1] == MY_IP[1])
-                 && (target_ip[2] == MY_IP[2]);
-    let dst_mac = gw_mac; // gateway MAC works for all QEMU SLiRP targets
-    let _ = on_subnet;    // routing note: on-subnet uses gateway MAC too (SLiRP limitation)
+    NetJob::Resolve { hostname: String::from(hostname), dns_ip, src_port, txid,
+                       deadline: tsc_deadline(2_000), next }
+}
 
-    // Send echo request
+fn build_tcp_job(ip: [u8; 4], port: u16, req: Vec<u8>) -> NetJob {
+    let src_port = next_src_port();
+    let isn = crate::hda::rdtsc() as u32 | 1;
+    tcp_send_seg(ip, GW_MAC, src_port, port, isn, 0, TCP_SYN, &[]);
+    NetJob::Tcp { ip, port, src_port, seq: isn, ack: 0, state: 0, rx: Vec::new(), req,
+                  deadline: tsc_deadline(3_000) }
+}
+
+fn build_udp_job(ip: [u8; 4], port: u16, msg: Vec<u8>) -> NetJob {
+    let src_port = 51000u16 + (crate::hda::rdtsc() as u16 % 1000);
+    udp_send(ip, GW_MAC, src_port, port, &msg);
+    NetJob::Udp { src_port, deadline: tsc_deadline(3_000) }
+}
+
+/// Start a ping — `issuer` is the terminal window id `poll()` should deliver
+/// the eventual result to.
+pub fn start_ping(issuer: usize, target: [u8; 4]) -> Result<(), &'static str> {
+    if job_in_progress() { return Err("a network operation is already in progress"); }
+    if crate::rtl8139::NIC.lock().is_none() && crate::e1000::NIC.lock().is_none() {
+        return Err("no NIC found");
+    }
     *PING_REPLY.lock() = None;
-    let seq = ping_send(target_ip, dst_mac);
-    let start = crate::rtc::now();
+    let seq = ping_send(target, GW_MAC);
+    *NET_JOB.lock() = Some((issuer, NetJob::Ping { target, seq, deadline: tsc_deadline(250) }));
+    Ok(())
+}
 
-    // Step 3: poll for ICMP reply (~250ms total)
-    for _ in 0..500u32 {
-        let frame = with_nic(|n| n.recv()).flatten();
-        if let Some(f) = frame { handle_frame(&f); }
-        for _ in 0..40_000u32 { core::hint::spin_loop(); }
-        if let Some(got_seq) = *PING_REPLY.lock() {
-            if got_seq == seq {
-                let end = crate::rtc::now();
-                let ms = (end.sec as i32 - start.sec as i32).abs() * 1000;
-                return format!("reply from {}.{}.{}.{}: seq={} time={}ms",
-                    target_ip[0], target_ip[1], target_ip[2], target_ip[3],
-                    seq, ms);
+pub fn start_wget(issuer: usize, host_str: &str, port: u16, path: &str) -> Result<(), &'static str> {
+    if job_in_progress() { return Err("a network operation is already in progress"); }
+    let req = alloc::format!(
+        "GET {} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n", path, host_str
+    ).into_bytes();
+    let job = match parse_ip(host_str) {
+        Some(ip) => build_tcp_job(ip, port, req),
+        None      => build_resolve_job(host_str, NextAction::Tcp { port, req }),
+    };
+    *NET_JOB.lock() = Some((issuer, job));
+    Ok(())
+}
+
+pub fn start_udp_cmd(issuer: usize, host_str: &str, port: u16, msg: &str) -> Result<(), &'static str> {
+    if job_in_progress() { return Err("a network operation is already in progress"); }
+    let msg = msg.as_bytes().to_vec();
+    let job = match parse_ip(host_str) {
+        Some(ip) => build_udp_job(ip, port, msg),
+        None      => build_resolve_job(host_str, NextAction::Udp { port, msg }),
+    };
+    *NET_JOB.lock() = Some((issuer, job));
+    Ok(())
+}
+
+enum JobOutcome { Pending, Done(String), Replace(NetJob) }
+
+fn format_wget_result(body: &[u8]) -> String {
+    let limit = body.len().min(4096);
+    let s = core::str::from_utf8(&body[..limit]).unwrap_or("(non-UTF-8 response)");
+    if body.len() > limit {
+        alloc::format!("{}\n[… {} bytes truncated]\n", s, body.len() - limit)
+    } else {
+        alloc::format!("{}\n", s)
+    }
+}
+
+/// Feed one received Ethernet frame to the in-progress job. Returns whether
+/// the job finished, is still pending, or transitioned into a new job (DNS
+/// resolution completing and handing off into the real TCP/UDP job).
+fn process_frame(job: &mut NetJob, frame: &[u8]) -> JobOutcome {
+    if frame.len() < 14 { return JobOutcome::Pending; }
+    let etype = u16::from_be_bytes([frame[12], frame[13]]);
+    if etype != 0x0800 { return JobOutcome::Pending; }
+    let ip_hdr = &frame[14..];
+    if ip_hdr.len() < 20 { return JobOutcome::Pending; }
+
+    match job {
+        NetJob::Ping { target, seq, .. } => {
+            handle_frame(frame); // updates PING_REPLY via the normal ICMP path
+            if let Some(got) = *PING_REPLY.lock() {
+                if got == *seq {
+                    return JobOutcome::Done(alloc::format!(
+                        "reply from {}.{}.{}.{}: seq={}",
+                        target[0], target[1], target[2], target[3], seq));
+                }
+            }
+            JobOutcome::Pending
+        }
+        NetJob::Resolve { dns_ip, src_port, txid, next, .. } => {
+            if ip_hdr[9] != 17 { return JobOutcome::Pending; }
+            let src_ip: [u8; 4] = ip_hdr[12..16].try_into().unwrap_or([0; 4]);
+            if src_ip != *dns_ip { return JobOutcome::Pending; }
+            let ihl = ((ip_hdr[0] & 0x0F) as usize) * 4;
+            if ip_hdr.len() < ihl + 8 { return JobOutcome::Pending; }
+            let udp = &ip_hdr[ihl..];
+            if u16::from_be_bytes([udp[0], udp[1]]) != 53 { return JobOutcome::Pending; }
+            if u16::from_be_bytes([udp[2], udp[3]]) != *src_port { return JobOutcome::Pending; }
+            let dns = &udp[8..];
+            if dns.len() < 12 { return JobOutcome::Pending; }
+            if u16::from_be_bytes([dns[0], dns[1]]) != *txid { return JobOutcome::Pending; }
+            if dns[2] & 0x80 == 0 { return JobOutcome::Pending; } // not a response
+            match parse_dns_answer(dns) {
+                None => JobOutcome::Done(String::from("could not resolve host")),
+                Some(ip) => {
+                    let taken = core::mem::replace(next, NextAction::Udp { port: 0, msg: Vec::new() });
+                    JobOutcome::Replace(match taken {
+                        NextAction::Tcp { port, req } => build_tcp_job(ip, port, req),
+                        NextAction::Udp { port, msg } => build_udp_job(ip, port, msg),
+                    })
+                }
             }
         }
+        NetJob::Tcp { ip, port, src_port, seq, ack, state, rx, req, .. } => {
+            if ip_hdr[9] == 1 { // ICMP — port/host unreachable
+                let ihl2 = ((ip_hdr[0] & 0x0F) as usize) * 4;
+                if ip_hdr.len() > ihl2 && ip_hdr[ihl2] == 3 {
+                    return JobOutcome::Done(String::from("wget: unreachable"));
+                }
+                return JobOutcome::Pending;
+            }
+            if ip_hdr[9] != 6 { return JobOutcome::Pending; }
+            let src_ip: [u8; 4] = ip_hdr[12..16].try_into().unwrap_or([0; 4]);
+            if src_ip != *ip || ip_hdr[16..20] != MY_IP { return JobOutcome::Pending; }
+            let ihl = ((ip_hdr[0] & 0x0F) as usize) * 4;
+            // Ethernet frames are padded to a minimum size — trim to the IP
+            // header's own Total Length field first, or that padding leaks
+            // into the TCP payload as phantom trailing zero bytes.
+            let ip_total_len = u16::from_be_bytes([ip_hdr[2], ip_hdr[3]]) as usize;
+            let ip_body = &ip_hdr[..ip_total_len.min(ip_hdr.len())];
+            if ip_body.len() < ihl { return JobOutcome::Pending; }
+            let Some((sp, dp, seg_seq, flags, payload)) = tcp_parse(&ip_body[ihl..]) else {
+                return JobOutcome::Pending;
+            };
+            if sp != *port || dp != *src_port { return JobOutcome::Pending; }
+            if flags & TCP_RST != 0 { return JobOutcome::Done(String::from("wget: connection refused")); }
+
+            match *state {
+                0 => {
+                    if flags & (TCP_SYN | TCP_ACK) == (TCP_SYN | TCP_ACK) {
+                        *seq = seq.wrapping_add(1);
+                        *ack = seg_seq.wrapping_add(1);
+                        tcp_send_seg(*ip, GW_MAC, *src_port, *port, *seq, *ack, TCP_ACK, &[]);
+                        tcp_send_seg(*ip, GW_MAC, *src_port, *port, *seq, *ack, TCP_PSH | TCP_ACK, req);
+                        *seq = seq.wrapping_add(req.len() as u32);
+                        *state = 1;
+                    }
+                    JobOutcome::Pending
+                }
+                1 => {
+                    if !payload.is_empty() {
+                        rx.extend_from_slice(payload);
+                        *ack = seg_seq.wrapping_add(payload.len() as u32);
+                        tcp_send_seg(*ip, GW_MAC, *src_port, *port, *seq, *ack, TCP_ACK, &[]);
+                    }
+                    if flags & TCP_FIN != 0 {
+                        *ack = ack.wrapping_add(1);
+                        tcp_send_seg(*ip, GW_MAC, *src_port, *port, *seq, *ack, TCP_FIN | TCP_ACK, &[]);
+                        JobOutcome::Done(format_wget_result(rx))
+                    } else {
+                        JobOutcome::Pending
+                    }
+                }
+                _ => JobOutcome::Pending,
+            }
+        }
+        NetJob::Udp { src_port, .. } => {
+            if ip_hdr[9] != 17 { return JobOutcome::Pending; }
+            let ihl = ((ip_hdr[0] & 0x0F) as usize) * 4;
+            if ip_hdr.len() < ihl + 8 { return JobOutcome::Pending; }
+            let udp = &ip_hdr[ihl..];
+            if u16::from_be_bytes([udp[2], udp[3]]) != *src_port { return JobOutcome::Pending; }
+            let ulen = u16::from_be_bytes([udp[4], udp[5]]) as usize;
+            if ulen < 8 || udp.len() < ulen { return JobOutcome::Pending; }
+            let sp = u16::from_be_bytes([udp[0], udp[1]]);
+            let src_ip: [u8; 4] = ip_hdr[12..16].try_into().unwrap_or([0; 4]);
+            let payload = &udp[8..ulen];
+            JobOutcome::Done(alloc::format!(
+                "Reply from {}.{}.{}.{}:{} ({} bytes):\n{}\n",
+                src_ip[0], src_ip[1], src_ip[2], src_ip[3], sp, payload.len(),
+                core::str::from_utf8(payload).unwrap_or("(non-UTF-8)")))
+        }
     }
-    format!("ping: timeout ({}.{}.{}.{})",
-        target_ip[0], target_ip[1], target_ip[2], target_ip[3])
+}
+
+fn job_deadline(job: &NetJob) -> u64 {
+    match job {
+        NetJob::Ping { deadline, .. }    => *deadline,
+        NetJob::Resolve { deadline, .. } => *deadline,
+        NetJob::Tcp { deadline, .. }     => *deadline,
+        NetJob::Udp { deadline, .. }     => *deadline,
+    }
+}
+
+fn job_timeout_message(job: &NetJob) -> String {
+    match job {
+        NetJob::Ping { target, .. } => alloc::format!(
+            "ping: timeout ({}.{}.{}.{})", target[0], target[1], target[2], target[3]),
+        NetJob::Resolve { hostname, .. } => alloc::format!("could not resolve host: {}", hostname),
+        NetJob::Tcp { .. } => String::from("wget: timeout — no response"),
+        NetJob::Udp { .. } => String::from("udp: no reply within timeout (datagram sent either way)"),
+    }
+}
+
+/// Advance the in-progress network job by one step, if any. Call this once
+/// per main-loop frame (alongside `hda::poll()`). Returns `Some((issuer,
+/// result))` exactly once, when the job finishes (success, error, or
+/// timeout) — the caller is responsible for printing `result` into the
+/// issuing terminal window.
+pub fn poll() -> Option<(usize, String)> {
+    // Drain every currently queued frame (recv() is itself non-blocking —
+    // it returns None once the ring is empty, so this loop is bounded).
+    loop {
+        if NET_JOB.lock().is_none() { return None; }
+        let frame = with_nic(|n| n.recv()).flatten();
+        let Some(f) = frame else { break; };
+
+        let mut guard = NET_JOB.lock();
+        let Some((issuer, job)) = guard.as_mut() else { return None; };
+        let issuer = *issuer;
+        match process_frame(job, &f) {
+            JobOutcome::Pending => {}
+            JobOutcome::Done(msg) => { *guard = None; return Some((issuer, msg)); }
+            JobOutcome::Replace(newjob) => { *guard = Some((issuer, newjob)); }
+        }
+    }
+
+    let mut guard = NET_JOB.lock();
+    if let Some((issuer, job)) = guard.as_ref() {
+        if tsc_expired(job_deadline(job)) {
+            let issuer = *issuer;
+            let msg = job_timeout_message(job);
+            *guard = None;
+            return Some((issuer, msg));
+        }
+    }
+    None
 }

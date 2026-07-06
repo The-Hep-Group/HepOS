@@ -67,10 +67,13 @@ pub struct Terminal {
     // start-row/visible-rows math used to lay out the last frame.
     render_start: usize,
     render_rows:  usize,
+    // This window's id — stamped on async network jobs (ping/wget/udp) so
+    // `net::poll()` knows which terminal to deliver the eventual result to.
+    win_id: usize,
 }
 
 impl Terminal {
-    pub fn new() -> Self {
+    pub fn new(win_id: usize) -> Self {
         let mut lines = Vec::new();
         for _ in 0..SCROLLBACK {
             lines.push([Cell::blank(); MAX_COLS]);
@@ -89,6 +92,7 @@ impl Terminal {
             select_head: None,
             render_start: 0,
             render_rows: 1,
+            win_id,
         };
         t.print_colored("HepOS Terminal v0.1\n", OK);
         t.print_colored("Type 'help' for commands\n\n", DIM);
@@ -112,6 +116,35 @@ impl Terminal {
 
     fn print(&mut self, s: &str) {
         self.print_colored(s, TEXT);
+    }
+
+    /// Prints `msg` as output from a completed background job (ping/wget/udp)
+    /// without losing whatever the user has typed at the prompt since issuing
+    /// it — clears the in-progress input line, prints the message on its own
+    /// line(s), then reprints the prompt and re-inserts the saved input.
+    pub fn print_async(&mut self, msg: &str) {
+        let saved = self.cmd_buf.clone();
+        let saved_cursor = self.cmd_cursor;
+
+        let row = self.prompt_row;
+        for c in self.prompt_col..self.cols { self.lines[row][c] = Cell::blank(); }
+        self.col = self.prompt_col;
+
+        self.print(msg);
+        if !msg.ends_with('\n') { self.put_char(b'\n', TEXT); }
+        self.show_prompt();
+
+        for ch in saved.bytes() {
+            self.cmd_buf.push(ch as char);
+            self.put_char(ch, TEXT);
+        }
+        self.cmd_cursor = saved.len();
+        if saved_cursor < self.cmd_buf.len() {
+            self.cmd_cursor = saved_cursor;
+            self.col = self.prompt_col + saved_cursor;
+        }
+        self.recolor_input();
+        self.dirty = true;
     }
 
     /// Drain the process output capture buffer and print it to this terminal.
@@ -1017,6 +1050,11 @@ impl Terminal {
                 self.print("255.255.255.0\n");
             }
 
+            // ping/wget/udp all kick off a `net::NetJob` and return immediately —
+            // the result prints asynchronously (via `print_async`) once
+            // `net::poll()` (driven from main.rs, once per frame) finishes it.
+            // This is what keeps the desktop responsive while they're in
+            // flight; see PLAN.md "Terminal commands freezing the desktop".
             "ping" => {
                 if arg1.is_empty() {
                     self.print_colored("usage: ping <ip>\n", ERR);
@@ -1029,22 +1067,19 @@ impl Terminal {
                             parts[2].parse().unwrap_or(0),
                             parts[3].parse().unwrap_or(0),
                         ];
-                        let on_subnet = ip[0] == 10 && ip[1] == 0 && ip[2] == 2;
-                        let route_note = if on_subnet {
-                            if ip == crate::net::GW_IP {
-                                " (gateway)"
-                            } else {
-                                " (local subnet — SLiRP may not reply)"
+                        match crate::net::start_ping(self.win_id, ip) {
+                            Err(e) => self.print_colored(&alloc::format!("ping: {}\n", e), ERR),
+                            Ok(()) => {
+                                let on_subnet = ip[0] == 10 && ip[1] == 0 && ip[2] == 2;
+                                let route_note = if on_subnet {
+                                    if ip == crate::net::GW_IP { " (gateway)" }
+                                    else { " (local subnet — SLiRP may not reply)" }
+                                } else {
+                                    " (via gateway 10.0.2.2)"
+                                };
+                                self.print_colored(&alloc::format!("PING {}{}\n", arg1, route_note), DIM);
                             }
-                        } else {
-                            " (via gateway 10.0.2.2)"
-                        };
-                        self.print_colored(
-                            &alloc::format!("PING {}{}\n", arg1, route_note), DIM
-                        );
-                        let result = crate::net::ping(ip);
-                        self.print(&result);
-                        self.print("\n");
+                        }
                     } else {
                         self.print_colored("ping: invalid IP address\n", ERR);
                     }
@@ -1055,48 +1090,16 @@ impl Terminal {
                 if arg1.is_empty() {
                     self.print_colored("usage: wget <ip|host>[:<port>] [/path]\n", ERR);
                 } else {
-                    // Split optional ":port" suffix
                     let (host_str, port) = if let Some(colon) = arg1.rfind(':') {
                         let p = arg1[colon+1..].parse::<u16>().unwrap_or(80);
                         (&arg1[..colon], p)
                     } else {
                         (arg1, 80u16)
                     };
-                    // Resolve: bare IP first, then DNS
-                    let resolved = if let Some(ip) = crate::net::parse_ip(host_str) {
-                        Some(ip)
-                    } else {
-                        self.print(&alloc::format!("Resolving {}…\n", host_str));
-                        crate::net::dns_resolve(host_str)
-                    };
-                    match resolved {
-                        None => self.print_colored("wget: could not resolve host\n", ERR),
-                        Some(ip) => {
-                            let path = if arg2.is_empty() { "/" } else { arg2 };
-                            let req  = alloc::format!(
-                                "GET {} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n",
-                                path, host_str
-                            );
-                            self.print(&alloc::format!("Connecting to {}:{}…\n", host_str, port));
-                            match crate::net::tcp_get(ip, port, req.as_bytes()) {
-                                Err(e) => self.print_colored(
-                                    &alloc::format!("wget: {}\n", e), ERR
-                                ),
-                                Ok(data) => {
-                                    let limit = data.len().min(4096);
-                                    let s = core::str::from_utf8(&data[..limit])
-                                        .unwrap_or("(non-UTF-8 response)");
-                                    self.print(s);
-                                    if data.len() > limit {
-                                        self.print_colored(
-                                            &alloc::format!("\n[… {} bytes truncated]\n",
-                                                data.len() - limit), DIM
-                                        );
-                                    }
-                                    self.print("\n");
-                                }
-                            }
-                        }
+                    let path = if arg2.is_empty() { "/" } else { arg2 };
+                    match crate::net::start_wget(self.win_id, host_str, port, path) {
+                        Err(e) => self.print_colored(&alloc::format!("wget: {}\n", e), ERR),
+                        Ok(()) => self.print(&alloc::format!("Connecting to {}:{}…\n", host_str, port)),
                     }
                 }
             }
@@ -1114,39 +1117,11 @@ impl Terminal {
                     if port == 0 {
                         self.print_colored("udp: missing or invalid port (use ip:port)\n", ERR);
                     } else {
-                        let resolved = if let Some(ip) = crate::net::parse_ip(host_str) {
-                            Some(ip)
-                        } else {
-                            self.print(&alloc::format!("Resolving {}…\n", host_str));
-                            crate::net::dns_resolve(host_str)
-                        };
-                        match resolved {
-                            None => self.print_colored("udp: could not resolve host\n", ERR),
-                            Some(ip) => {
-                                let src_port = 51000u16 + (crate::hda::rdtsc() as u16 % 1000);
-                                self.print(&alloc::format!(
-                                    "Sending {} bytes to {}:{}…\n", arg2.len(), host_str, port
-                                ));
-                                match crate::net::udp_send_recv(
-                                    ip, crate::net::GW_MAC, src_port, port,
-                                    arg2.as_bytes(), 3_000,
-                                ) {
-                                    None => self.print_colored(
-                                        "udp: no reply within 3s (datagram sent either way)\n", DIM
-                                    ),
-                                    Some((data, rip, rport)) => {
-                                        self.print_colored(&alloc::format!(
-                                            "Reply from {}.{}.{}.{}:{} ({} bytes):\n",
-                                            rip[0], rip[1], rip[2], rip[3], rport, data.len()
-                                        ), OK);
-                                        let limit = data.len().min(4096);
-                                        let s = core::str::from_utf8(&data[..limit])
-                                            .unwrap_or("(non-UTF-8 reply)");
-                                        self.print(s);
-                                        self.print("\n");
-                                    }
-                                }
-                            }
+                        match crate::net::start_udp_cmd(self.win_id, host_str, port, arg2) {
+                            Err(e) => self.print_colored(&alloc::format!("udp: {}\n", e), ERR),
+                            Ok(()) => self.print(&alloc::format!(
+                                "Sending {} bytes to {}:{}…\n", arg2.len(), host_str, port
+                            )),
                         }
                     }
                 }
@@ -1369,7 +1344,7 @@ pub static TERMINAL: Mutex<Option<Terminal>> = Mutex::new(None);
 pub static EXTRA_TERMINALS: Mutex<alloc::vec::Vec<(usize, Terminal)>> = Mutex::new(alloc::vec::Vec::new());
 
 pub fn init() {
-    *TERMINAL.lock() = Some(Terminal::new());
+    *TERMINAL.lock() = Some(Terminal::new(2)); // main terminal is always window id 2
     // Trigger desktop re-render so terminal content appears immediately
     if let Some(dt) = crate::desktop::DESKTOP.lock().as_mut() {
         dt.dirty = true;
@@ -1390,6 +1365,6 @@ pub fn spawn_terminal() -> usize {
             return usize::MAX;
         }
     };
-    EXTRA_TERMINALS.lock().push((win_id, Terminal::new()));
+    EXTRA_TERMINALS.lock().push((win_id, Terminal::new(win_id)));
     win_id
 }

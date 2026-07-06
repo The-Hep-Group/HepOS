@@ -52,18 +52,24 @@ pub static FOCUSED_WIN: Mutex<Option<usize>> = Mutex::new(None);
 /// drag-selection is in progress.
 static TEXT_DRAG_WIN: Mutex<Option<usize>> = Mutex::new(None);
 
-/// (window id, row, col, tick) of the last fresh click in an editor/terminal
-/// content area — used to detect a double-click (same cell, within ~400ms)
-/// so it can select the whole line instead of just placing the cursor.
+/// (window id, row, col, TSC timestamp) of the last fresh click in an
+/// editor/terminal content area — used to detect a double-click (same cell,
+/// within ~400ms) so it can select the whole line instead of just placing
+/// the cursor. Timed via TSC rather than `scheduler::TICK_COUNT`: the APIC
+/// timer only actually fires once in this build (see PLAN.md Known Issues —
+/// TICK_COUNT freezes right after the kmain->task_blink bootstrap switch),
+/// so anything gated on it would never expire.
 static LAST_CLICK: Mutex<Option<(usize, usize, usize, u64)>> = Mutex::new(None);
 
 /// Consumes/updates `LAST_CLICK` and reports whether this click is a double-click
 /// on the same (window, row, col) within the double-click time window.
 fn is_double_click(win_id: usize, row: usize, col: usize) -> bool {
-    let now = scheduler::TICK_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+    let now = hda::rdtsc();
+    let tsc_per_ms = hda::TSC_PER_MS.load(core::sync::atomic::Ordering::Relaxed);
+    let window = tsc_per_ms.saturating_mul(400);
     let mut last = LAST_CLICK.lock();
     let double = matches!(*last, Some((w, r, c, t))
-        if w == win_id && r == row && c.abs_diff(col) <= 1 && now.saturating_sub(t) <= 40);
+        if w == win_id && r == row && c.abs_diff(col) <= 1 && now.wrapping_sub(t) <= window);
     if double {
         *last = None; // consumed — the next click starts a fresh pair
     } else {
@@ -365,6 +371,7 @@ fn task_idle() -> ! {
     loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
 }
 
+/// TEMPORARY boot-time self-test for the async ping job — exercised via
 fn task_blink() -> ! {
     let mut mx: i32 = 400;
     let mut my: i32 = 300;
@@ -887,6 +894,18 @@ fn task_blink() -> ! {
         // Advance any in-progress async audio playback (zero-buffer/drain/stop
         // state machine — see hda::play_pcm()/poll() docs).
         hda::poll();
+
+        // Advance any in-progress async network job (ping/wget/udp) — see
+        // net::poll() docs. Delivers the result to whichever terminal window
+        // issued the command once it finishes (success, error, or timeout).
+        if let Some((win_id, msg)) = net::poll() {
+            if win_id == 2 {
+                if let Some(t) = terminal::TERMINAL.lock().as_mut() { t.print_async(&msg); }
+            } else if let Some((_, t)) = terminal::EXTRA_TERMINALS.lock().iter_mut().find(|(wid, _)| *wid == win_id) {
+                t.print_async(&msg);
+            }
+            if let Some(dt) = desktop::DESKTOP.lock().as_mut() { dt.dirty = true; }
+        }
 
         // Two-tier rendering:
         //   content_dirty → full scene redraw + save_scene + cursor + full flush
