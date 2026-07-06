@@ -229,10 +229,14 @@ pub struct Desktop {
     pub open_settings_requested: bool,
     pub new_window_requested:   Option<AppKind>,
     pub taskbar_jumplist:  Option<(AppKind, usize)>, // (kind, button left-x) — open when count>1
+    /// Set when the user picks Copy/Paste from an editor/terminal's
+    /// right-click menu — (window id, is_paste). Consumed by main.rs, which
+    /// routes it to the right Editor/Terminal instance.
+    pub clipboard_action_requested: Option<(usize, bool)>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub enum ContextMenuKind { Background, App(AppKind) }
+pub enum ContextMenuKind { Background, App(AppKind), EditText(usize) }
 
 impl Desktop {
     pub fn new(fb_w: usize, fb_h: usize) -> Self {
@@ -244,6 +248,7 @@ impl Desktop {
             context_menu: None, context_menu_kind: ContextMenuKind::Background,
             open_settings_requested: false, new_window_requested: None,
             taskbar_jumplist: None,
+            clipboard_action_requested: None,
         }
     }
 
@@ -440,17 +445,30 @@ impl Desktop {
                     self.dirty              = true;
                 }
             } else if !in_taskbar {
-                let on_window = self.windows.iter().rev().any(|w| {
-                    !w.minimized && (w.close_hit(mx, my) || w.maximize_hit(mx, my)
-                        || w.newterm_hit(mx, my) || w.title_hit(mx, my)
-                        || w.resize_hit(mx, my) || w.content_hit(mx, my))
+                // Right-clicking inside an Editor/Terminal window's text area
+                // shows Copy/Paste instead of the generic New-Window menu.
+                let text_win = self.windows.iter().rev().find(|w| {
+                    !w.minimized && w.content_hit(mx, my)
+                        && matches!(w.app_kind, AppKind::Editor | AppKind::Terminal)
                 });
-                if !on_window {
+                if let Some(w) = text_win {
                     self.context_menu      = Some((mx, my));
-                    self.context_menu_kind = ContextMenuKind::Background;
-                    self.start_menu_open    = false;
+                    self.context_menu_kind = ContextMenuKind::EditText(w.id);
                     self.taskbar_jumplist   = None;
-                    self.dirty               = true;
+                    self.dirty              = true;
+                } else {
+                    let on_window = self.windows.iter().rev().any(|w| {
+                        !w.minimized && (w.close_hit(mx, my) || w.maximize_hit(mx, my)
+                            || w.newterm_hit(mx, my) || w.title_hit(mx, my)
+                            || w.resize_hit(mx, my) || w.content_hit(mx, my))
+                    });
+                    if !on_window {
+                        self.context_menu      = Some((mx, my));
+                        self.context_menu_kind = ContextMenuKind::Background;
+                        self.start_menu_open    = false;
+                        self.taskbar_jumplist   = None;
+                        self.dirty               = true;
+                    }
                 }
             }
         }
@@ -463,11 +481,12 @@ impl Desktop {
             let kind = self.context_menu_kind;
             self.context_menu = None;
             self.dirty = true;
-            if item == Some(0) {
-                match kind {
-                    ContextMenuKind::Background => self.open_settings_requested = true,
-                    ContextMenuKind::App(k)     => self.new_window_requested = Some(k),
-                }
+            match (kind, item) {
+                (ContextMenuKind::Background, Some(0)) => self.open_settings_requested = true,
+                (ContextMenuKind::App(k),     Some(0)) => self.new_window_requested = Some(k),
+                (ContextMenuKind::EditText(id), Some(0)) => self.clipboard_action_requested = Some((id, false)), // Copy
+                (ContextMenuKind::EditText(id), Some(1)) => self.clipboard_action_requested = Some((id, true)),  // Paste
+                _ => {}
             }
             return false;
         }
@@ -914,6 +933,15 @@ impl Desktop {
         ids.get(row).copied()
     }
 
+    /// Labels for the current context menu's items, top to bottom.
+    fn context_menu_labels(&self) -> &'static [&'static str] {
+        match self.context_menu_kind {
+            ContextMenuKind::Background => &["Change background"],
+            ContextMenuKind::App(_)     => &["New Window"],
+            ContextMenuKind::EditText(_) => &["Copy", "Paste"],
+        }
+    }
+
     /// Draw right-click context menu if one is open.
     pub fn draw_context_menu(&self, display: &mut Display) {
         let (cx, cy) = match self.context_menu {
@@ -922,23 +950,22 @@ impl Desktop {
         };
         const CM_W: usize = 168;
         const ITEM_H: usize = 26;
-        const CM_H: usize = ITEM_H + 8; // 1 item + padding
+        let labels = self.context_menu_labels();
+        let cm_h = labels.len() * ITEM_H + 8;
         // Clamp so it stays on screen
         let x = (cx as usize).min(self.fb_w.saturating_sub(CM_W));
-        let y = (cy as usize).min(self.fb_h.saturating_sub(CM_H + TASKBAR_H));
+        let y = (cy as usize).min(self.fb_h.saturating_sub(cm_h + TASKBAR_H));
         // Shadow
-        display.fill_rect(x + 3, y + 3, CM_W, CM_H, Color::from_hex(0x000000));
+        display.fill_rect(x + 3, y + 3, CM_W, cm_h, Color::from_hex(0x000000));
         // Background + border
-        display.fill_rect(x, y, CM_W, CM_H, pal::MENU_BG);
+        display.fill_rect(x, y, CM_W, cm_h, pal::MENU_BG);
         display.fill_rect(x, y, CM_W, 1, pal::MENU_BORDER);
-        display.fill_rect(x, y + CM_H - 1, CM_W, 1, pal::MENU_BORDER);
-        display.fill_rect(x, y, 1, CM_H, pal::MENU_BORDER);
-        display.fill_rect(x + CM_W - 1, y, 1, CM_H, pal::MENU_BORDER);
-        let label = match self.context_menu_kind {
-            ContextMenuKind::Background => "Change background",
-            ContextMenuKind::App(_)     => "New Window",
-        };
-        display.draw_text(x + 10, y + 8, label, pal::TEXT, 1);
+        display.fill_rect(x, y + cm_h - 1, CM_W, 1, pal::MENU_BORDER);
+        display.fill_rect(x, y, 1, cm_h, pal::MENU_BORDER);
+        display.fill_rect(x + CM_W - 1, y, 1, cm_h, pal::MENU_BORDER);
+        for (i, label) in labels.iter().enumerate() {
+            display.draw_text(x + 10, y + 8 + i * ITEM_H, label, pal::TEXT, 1);
+        }
     }
 
     /// Context-menu item hit-test.  Returns Some(item_index) if (mx,my) is inside
@@ -947,11 +974,12 @@ impl Desktop {
         let (cx, cy) = self.context_menu?;
         const CM_W: i32 = 168;
         const ITEM_H: i32 = 26;
-        const CM_H: i32 = ITEM_H + 8;
+        let labels = self.context_menu_labels();
+        let cm_h = (labels.len() * ITEM_H as usize + 8) as i32;
         let x = (cx as usize).min(self.fb_w.saturating_sub(CM_W as usize)) as i32;
-        let y = (cy as usize).min(self.fb_h.saturating_sub((CM_H as usize) + TASKBAR_H)) as i32;
-        if mx >= x && mx < x + CM_W && my >= y + 4 && my < y + 4 + ITEM_H {
-            Some(0) // only one item for now
+        let y = (cy as usize).min(self.fb_h.saturating_sub((cm_h as usize) + TASKBAR_H)) as i32;
+        if mx >= x && mx < x + CM_W && my >= y + 4 && my < y + 4 + cm_h - 8 {
+            Some(((my - (y + 4)) / ITEM_H) as usize)
         } else {
             None
         }

@@ -7,6 +7,7 @@ mod acpi;
 mod apic;
 mod audio;
 mod bootinfo;
+mod clipboard;
 mod editor;
 mod e1000;
 mod net;
@@ -459,7 +460,7 @@ fn task_blink() -> ! {
         };
         if spawn_terminal { crate::terminal::spawn_terminal(); }
 
-        // Text selection: drag-to-select in editor windows. `fresh_click`
+        // Text selection: drag-to-select in editor/terminal windows. `fresh_click`
         // anchors the selection (mouse_down); subsequent frames with the
         // button still held extend it (mouse_drag) against the same window
         // even if the cursor later leaves its bounds.
@@ -468,49 +469,120 @@ fn task_blink() -> ! {
             if !btn_held {
                 *TEXT_DRAG_WIN.lock() = None;
             } else {
-                let win_info: Option<(usize, i32, i32, usize, usize)> = {
+                let win_info: Option<(usize, desktop::AppKind, i32, i32, usize, usize)> = {
                     let dt = desktop::DESKTOP.lock();
                     dt.as_ref().and_then(|d| {
                         if fresh_click {
                             d.windows.iter().rev()
-                                .find(|w| !w.minimized && w.app_kind == desktop::AppKind::Editor
+                                .find(|w| !w.minimized
+                                    && matches!(w.app_kind, desktop::AppKind::Editor | desktop::AppKind::Terminal)
                                     && w.content_hit(mx, my))
-                                .map(|w| (w.id, w.x, w.y, w.w, w.h))
+                                .map(|w| (w.id, w.app_kind, w.x, w.y, w.w, w.h))
                         } else {
                             let wid = *TEXT_DRAG_WIN.lock();
                             wid.and_then(|id| d.windows.iter().find(|w| w.id == id)
-                                .map(|w| (w.id, w.x, w.y, w.w, w.h)))
+                                .map(|w| (w.id, w.app_kind, w.x, w.y, w.w, w.h)))
                         }
                     })
                 };
-                if let Some((id, wwx, wwy, www, wwh)) = win_info {
+                if let Some((id, kind, wwx, wwy, www, wwh)) = win_info {
                     if fresh_click { *TEXT_DRAG_WIN.lock() = Some(id); }
                     let wxu = wwx.max(0) as usize;
                     let wyu = wwy.max(0) as usize;
-                    let hit = if id == 3 {
-                        let mut eg = editor::EDITOR.lock();
-                        eg.as_mut().and_then(|ed| {
-                            let h = ed.hit_test(wxu, wyu, www, wwh, mx, my);
-                            if let Some((row, col)) = h {
-                                if fresh_click { ed.mouse_down(row, col); } else { ed.mouse_drag(row, col); }
+                    let hit = match kind {
+                        desktop::AppKind::Editor => {
+                            if id == 3 {
+                                let mut eg = editor::EDITOR.lock();
+                                eg.as_mut().and_then(|ed| {
+                                    let h = ed.hit_test(wxu, wyu, www, wwh, mx, my);
+                                    if let Some((row, col)) = h {
+                                        if fresh_click { ed.mouse_down(row, col); } else { ed.mouse_drag(row, col); }
+                                    }
+                                    h
+                                })
+                            } else {
+                                let mut ee = editor::EXTRA_EDITORS.lock();
+                                ee.iter_mut().find(|(wid, _)| *wid == id).and_then(|(_, ed)| {
+                                    let h = ed.hit_test(wxu, wyu, www, wwh, mx, my);
+                                    if let Some((row, col)) = h {
+                                        if fresh_click { ed.mouse_down(row, col); } else { ed.mouse_drag(row, col); }
+                                    }
+                                    h
+                                })
                             }
-                            h
-                        })
-                    } else {
-                        let mut ee = editor::EXTRA_EDITORS.lock();
-                        ee.iter_mut().find(|(wid, _)| *wid == id).and_then(|(_, ed)| {
-                            let h = ed.hit_test(wxu, wyu, www, wwh, mx, my);
-                            if let Some((row, col)) = h {
-                                if fresh_click { ed.mouse_down(row, col); } else { ed.mouse_drag(row, col); }
+                        }
+                        desktop::AppKind::Terminal => {
+                            if id == 2 {
+                                let mut tg = terminal::TERMINAL.lock();
+                                tg.as_mut().and_then(|t| {
+                                    let h = t.hit_test(wxu, wyu, www, wwh, mx, my);
+                                    if let Some((row, col)) = h {
+                                        if fresh_click { t.mouse_down(row, col); } else { t.mouse_drag(row, col); }
+                                    }
+                                    h
+                                })
+                            } else {
+                                let mut et = terminal::EXTRA_TERMINALS.lock();
+                                et.iter_mut().find(|(wid, _)| *wid == id).and_then(|(_, t)| {
+                                    let h = t.hit_test(wxu, wyu, www, wwh, mx, my);
+                                    if let Some((row, col)) = h {
+                                        if fresh_click { t.mouse_down(row, col); } else { t.mouse_drag(row, col); }
+                                    }
+                                    h
+                                })
                             }
-                            h
-                        })
+                        }
+                        _ => None,
                     };
                     if hit.is_some() {
                         let mut dt = desktop::DESKTOP.lock();
                         if let Some(dt) = dt.as_mut() { dt.dirty = true; }
+                        if kind == desktop::AppKind::Terminal {
+                            if id == 2 {
+                                if let Some(t) = terminal::TERMINAL.lock().as_mut() { t.dirty = true; }
+                            } else if let Some((_, t)) = terminal::EXTRA_TERMINALS.lock().iter_mut().find(|(wid, _)| *wid == id) {
+                                t.dirty = true;
+                            }
+                        }
                     }
                 }
+            }
+        }
+
+        // Handle clipboard_action_requested — Copy/Paste from an editor or
+        // terminal's right-click context menu.
+        {
+            let action = {
+                let mut dt = desktop::DESKTOP.lock();
+                dt.as_mut().and_then(|d| d.clipboard_action_requested.take())
+            };
+            if let Some((win_id, is_paste)) = action {
+                let kind = {
+                    let dt = desktop::DESKTOP.lock();
+                    dt.as_ref().and_then(|d| d.windows.iter().find(|w| w.id == win_id).map(|w| w.app_kind))
+                };
+                match kind {
+                    Some(desktop::AppKind::Editor) => {
+                        if win_id == 3 {
+                            if let Some(ed) = editor::EDITOR.lock().as_mut() { ed.clipboard_action(is_paste); }
+                        } else if let Some((_, ed)) = editor::EXTRA_EDITORS.lock().iter_mut().find(|(wid, _)| *wid == win_id) {
+                            ed.clipboard_action(is_paste);
+                        }
+                    }
+                    Some(desktop::AppKind::Terminal) => {
+                        if win_id == 2 {
+                            if let Some(t) = terminal::TERMINAL.lock().as_mut() {
+                                if is_paste { t.paste_clipboard(); } else { t.copy_selection(); }
+                                t.dirty = true;
+                            }
+                        } else if let Some((_, t)) = terminal::EXTRA_TERMINALS.lock().iter_mut().find(|(wid, _)| *wid == win_id) {
+                            if is_paste { t.paste_clipboard(); } else { t.copy_selection(); }
+                            t.dirty = true;
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some(dt) = desktop::DESKTOP.lock().as_mut() { dt.dirty = true; }
             }
         }
 

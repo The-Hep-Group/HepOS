@@ -308,6 +308,58 @@ impl Editor {
         Some((line_idx, col))
     }
 
+    // ── Clipboard ──────────────────────────────────────────────────────────
+
+    /// Copies the current selection (if any) to the system clipboard. No-op
+    /// if nothing is selected — matches every other editor's Ctrl+C behavior.
+    fn copy_selection(&self) {
+        let Some((s, e)) = self.selection_range() else { return; };
+        let mut buf: Vec<u8> = Vec::new();
+        if s.0 == e.0 {
+            buf.extend_from_slice(&self.lines[s.0][s.1..e.1]);
+        } else {
+            buf.extend_from_slice(&self.lines[s.0][s.1..]);
+            for row in &self.lines[s.0 + 1..e.0] {
+                buf.push(b'\n');
+                buf.extend_from_slice(row);
+            }
+            buf.push(b'\n');
+            buf.extend_from_slice(&self.lines[e.0][..e.1]);
+        }
+        crate::clipboard::set(&buf);
+    }
+
+    /// Inserts raw text at the cursor, splitting into new lines on `\n` —
+    /// shared by paste and (indirectly) by typed input.
+    fn insert_text(&mut self, text: &[u8]) {
+        for &b in text {
+            if b == b'\n' {
+                let rest = self.lines[self.cursor_row].split_off(self.cursor_col);
+                self.cursor_row += 1;
+                self.lines.insert(self.cursor_row, rest);
+                self.cursor_col = 0;
+            } else if b >= 32 && b < 128 {
+                self.lines[self.cursor_row].insert(self.cursor_col, b);
+                self.cursor_col += 1;
+            }
+        }
+        self.ensure_visible();
+        self.modified = true;
+    }
+
+    /// Replaces the selection (if any) with the clipboard's contents.
+    fn paste_clipboard(&mut self) {
+        self.delete_selection_if_any();
+        let text = crate::clipboard::get();
+        self.insert_text(&text);
+    }
+
+    /// Entry point for the right-click Copy/Paste context menu (main.rs
+    /// doesn't have access to the private copy_selection/paste_clipboard).
+    pub fn clipboard_action(&mut self, is_paste: bool) {
+        if is_paste { self.paste_clipboard(); } else { self.copy_selection(); }
+    }
+
     pub fn on_key(&mut self, c: char) {
         use crate::ps2;
 
@@ -354,6 +406,15 @@ impl Editor {
             // Ctrl+S or F2 → save
             0x13 => { self.save(); }
             b if b == ps2::KEY_F2 => { self.save(); }
+
+            // Ctrl+C (0x03) or Ctrl+Shift+C ('C' — shift suppresses the ctrl
+            // lowercase→control-code conversion in ps2.rs) → copy selection
+            0x03 => { self.copy_selection(); }
+            b'C' if ps2::ctrl_held() => { self.copy_selection(); }
+
+            // Ctrl+V (0x16) or Ctrl+Shift+V ('V', same reasoning) → paste
+            0x16 => { self.paste_clipboard(); }
+            b'V' if ps2::ctrl_held() => { self.paste_clipboard(); }
 
             // Ctrl+Q or ESC or F10 → close
             0x11 | 0x1B => {

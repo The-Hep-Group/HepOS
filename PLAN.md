@@ -499,6 +499,8 @@ Range 0–32767 scaled to framebuffer size.
 | ✓ | Text editor — Ctrl+F find, PgUp/Dn, Ctrl+Home/End, F2/F10, basic syntax highlighting (Rust/C: keywords/strings/numbers/comments) |
 | ✓ | Terminal live input highlighting — command name / known verbs, quoted strings, and numbers colored as you type, reusing the editor's tokenizer with `COMMAND_NAMES` as the keyword list (`terminal::recolor_input()`) |
 | ✓ | Text editor selection — drag-to-select and Shift+Arrow/Home/End/PgUp/PgDn extend a visible highlighted selection; typing, Enter, Backspace, and Delete all replace the selection like a normal editor (`Editor::select_anchor`, `selection_range()`, `delete_selection_if_any()`, `mouse_down()`/`mouse_drag()` wired from `main.rs`) |
+| ✓ | Terminal selection — drag-to-select and Shift+Left/Right extend a highlighted selection over the scrollback+input grid (`Terminal::select_anchor`/`select_head`, `hit_test()`/`mouse_down()`/`mouse_drag()`) |
+| ✓ | Clipboard — Ctrl+C/Ctrl+V and Ctrl+Shift+C/Ctrl+Shift+V copy/paste the editor's selection (`clipboard.rs`, shared `CLIPBOARD` static); right-click Copy/Paste context menu in both the editor and terminal (`ContextMenuKind::EditText`, `Desktop::clipboard_action_requested`) |
 | ✓ | HepFS file manager — back/forward/path bar, click-to-navigate, click-to-open |
 | ✓ | Welcome window — system info |
 | ✓ | Sysmon window — RAM bar, uptime, PCI list, storage/net status |

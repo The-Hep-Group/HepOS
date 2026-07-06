@@ -20,6 +20,7 @@ const BG:     Color = Color::from_hex(0x0C0C0C);
 const CURSOR: Color = Color::from_hex(0x6C8EFF);
 const ERR:    Color = Color::from_hex(0xFF6B6B);
 const OK:     Color = Color::from_hex(0x6BFF8E);
+const SELECTION: Color = Color::from_hex(0x264F78); // text selection background
 
 // Known command verbs — shared by tab-completion and live input highlighting
 // (reuses editor.rs's generic tokenizer with these as the "keyword" list).
@@ -57,6 +58,15 @@ pub struct Terminal {
     // History
     history:     Vec<String>,
     history_idx: Option<usize>,
+    // Text selection — (absolute line idx, col). `select_head` is the other
+    // end (updated by mouse drag or Shift+Left/Right); a real selection only
+    // exists once the two differ (see `selection_range()`).
+    select_anchor: Option<(usize, usize)>,
+    select_head:   Option<(usize, usize)>,
+    // Set every render() call — lets hit_test() replicate the same
+    // start-row/visible-rows math used to lay out the last frame.
+    render_start: usize,
+    render_rows:  usize,
 }
 
 impl Terminal {
@@ -75,6 +85,10 @@ impl Terminal {
             cwd_path: String::from("/"),
             history: Vec::new(),
             history_idx: None,
+            select_anchor: None,
+            select_head: None,
+            render_start: 0,
+            render_rows: 1,
         };
         t.print_colored("HepOS Terminal v0.1\n", OK);
         t.print_colored("Type 'help' for commands\n\n", DIM);
@@ -146,8 +160,138 @@ impl Terminal {
         }
     }
 
+    // ── Selection ──────────────────────────────────────────────────────────
+
+    /// Normalized (start, end) selection range, or `None` if there's no real
+    /// selection (anchor equals head, or either endpoint isn't set).
+    fn selection_range(&self) -> Option<((usize, usize), (usize, usize))> {
+        let a = self.select_anchor?;
+        let h = self.select_head?;
+        if a == h { return None; }
+        Some(if a <= h { (a, h) } else { (h, a) })
+    }
+
+    /// Column range `[start, end)` selected on absolute line `line_idx`, if any.
+    fn selection_cols_for_line(&self, line_idx: usize) -> Option<(usize, usize)> {
+        let (s, e) = self.selection_range()?;
+        if line_idx < s.0 || line_idx > e.0 { return None; }
+        let start = if line_idx == s.0 { s.1 } else { 0 };
+        let end   = if line_idx == e.0 { e.1 } else { self.cols };
+        if start >= end { return None; }
+        Some((start, end))
+    }
+
+    /// Called before Left/Right move the input cursor: extends the selection
+    /// if Shift is held (anchoring at the pre-move position the first time),
+    /// or clears it otherwise.
+    fn update_selection_anchor(&mut self) {
+        if ps2::shift_held() {
+            if self.select_anchor.is_none() {
+                self.select_anchor = Some((self.row, self.col));
+            }
+        } else {
+            self.select_anchor = None;
+            self.select_head = None;
+        }
+    }
+
+    /// Called after Left/Right actually move the input cursor — extends the
+    /// selection head to the new position, if a selection is in progress.
+    fn sync_selection_head(&mut self) {
+        if self.select_anchor.is_some() {
+            self.select_head = Some((self.row, self.col));
+        }
+    }
+
+    /// Mouse button pressed at (row, col) — anchors a potential drag selection
+    /// (only becomes visible once the mouse actually moves elsewhere).
+    pub fn mouse_down(&mut self, row: usize, col: usize) {
+        let row = row.min(self.lines.len().saturating_sub(1));
+        let col = col.min(self.cols.saturating_sub(1));
+        self.select_anchor = Some((row, col));
+        self.select_head = Some((row, col));
+    }
+
+    /// Mouse dragged (button still held) to (row, col) — extends the
+    /// selection from wherever `mouse_down` anchored it.
+    pub fn mouse_drag(&mut self, row: usize, col: usize) {
+        if self.select_anchor.is_some() {
+            let row = row.min(self.lines.len().saturating_sub(1));
+            let col = col.min(self.cols.saturating_sub(1));
+            self.select_head = Some((row, col));
+        }
+    }
+
+    /// Pixel coordinates (window-relative) → (absolute line idx, col).
+    /// Mirrors `render()`'s exact layout math via the hints it stores.
+    /// Returns `None` for clicks outside the content area.
+    pub fn hit_test(&self, wx: usize, wy: usize, ww: usize, wh: usize, mx: i32, my: i32) -> Option<(usize, usize)> {
+        if mx < wx as i32 || mx >= (wx + ww) as i32 { return None; }
+        if my < wy as i32 || my >= (wy + wh) as i32 { return None; }
+
+        let visible_rows = self.render_rows.max(1);
+        let r = (((my - wy as i32 - 4).max(0)) as usize / CHAR_H).min(visible_rows.saturating_sub(1));
+        let line_idx = (self.render_start + r).min(self.lines.len().saturating_sub(1));
+
+        let c = ((mx - wx as i32 - 4).max(0)) as usize / CHAR_W;
+        let col = c.min(self.cols.saturating_sub(1));
+        Some((line_idx, col))
+    }
+
+    // ── Clipboard ──────────────────────────────────────────────────────────
+
+    /// Copies the current selection (if any) to the system clipboard.
+    pub fn copy_selection(&self) {
+        let Some((s, e)) = self.selection_range() else { return; };
+        let mut buf: Vec<u8> = Vec::new();
+        for line_idx in s.0..=e.0 {
+            if line_idx >= self.lines.len() { break; }
+            let (cs, ce) = if line_idx == s.0 && line_idx == e.0 { (s.1, e.1) }
+                else if line_idx == s.0 { (s.1, self.cols) }
+                else if line_idx == e.0 { (0, e.1) }
+                else { (0, self.cols) };
+            let line = &self.lines[line_idx];
+            for col in cs..ce.min(self.cols) { buf.push(line[col].ch); }
+            while buf.last() == Some(&b' ') { buf.pop(); }
+            if line_idx != e.0 { buf.push(b'\n'); }
+        }
+        crate::clipboard::set(&buf);
+    }
+
+    /// Inserts the clipboard's contents into the current input line at the
+    /// cursor (newlines are dropped — terminal input is always single-line).
+    pub fn paste_clipboard(&mut self) {
+        for b in crate::clipboard::get() {
+            if b == b'\n' || b == b'\r' { continue; }
+            if b >= 32 && b < 128 && self.cmd_buf.len() < self.cols.saturating_sub(2) {
+                if self.cmd_cursor == self.cmd_buf.len() {
+                    self.cmd_buf.push(b as char);
+                    self.put_char(b, TEXT);
+                    self.cmd_cursor += 1;
+                } else {
+                    self.cmd_buf.insert(self.cmd_cursor, b as char);
+                    let row = self.row;
+                    let c = self.col;
+                    for i in (c..self.cols - 1).rev() { self.lines[row][i + 1] = self.lines[row][i]; }
+                    self.lines[row][c] = Cell { ch: b, color: TEXT };
+                    self.col += 1;
+                    self.cmd_cursor += 1;
+                }
+            }
+        }
+        self.recolor_input();
+        self.dirty = true;
+    }
+
     /// Handle a keypress from PS/2.
     pub fn on_key(&mut self, c: char) {
+        // Any key other than Left/Right (which manage selection themselves
+        // via update_selection_anchor/sync_selection_head) clears an
+        // in-progress selection — matches normal editor/terminal behavior.
+        if c as u8 != ps2::KEY_LEFT && c as u8 != ps2::KEY_RIGHT {
+            self.select_anchor = None;
+            self.select_head = None;
+        }
         match c as u8 {
             b'\n' => {
                 self.put_char(b'\n', TEXT);
@@ -221,17 +365,21 @@ impl Terminal {
                     }
                 }
             }
-            ps2::KEY_LEFT => { // move cursor left within input
+            ps2::KEY_LEFT => { // move cursor left within input (Shift extends selection)
+                self.update_selection_anchor();
                 if self.cmd_cursor > 0 {
                     self.cmd_cursor -= 1;
                     self.col -= 1;
                 }
+                self.sync_selection_head();
             }
-            ps2::KEY_RIGHT => { // move cursor right within input
+            ps2::KEY_RIGHT => { // move cursor right within input (Shift extends selection)
+                self.update_selection_anchor();
                 if self.cmd_cursor < self.cmd_buf.len() {
                     self.cmd_cursor += 1;
                     self.col += 1;
                 }
+                self.sync_selection_head();
             }
             ch if ch >= 32 => {
                 if self.cmd_buf.len() < self.cols.saturating_sub(2) {
@@ -1152,6 +1300,8 @@ impl Terminal {
         } else {
             0
         };
+        self.render_start = start;
+        self.render_rows  = visible_rows.max(1);
 
         for r in 0..visible_rows {
             let line_idx = start + r;
@@ -1159,6 +1309,15 @@ impl Terminal {
             let line = &self.lines[line_idx];
             let py = wy + 4 + r * CHAR_H;
             if py + CHAR_H > wy + wh { break; }
+
+            if let Some((sel_start, sel_end)) = self.selection_cols_for_line(line_idx) {
+                let sel_x = wx + 4 + sel_start * CHAR_W;
+                let sel_w = (sel_end - sel_start) * CHAR_W;
+                if sel_x < wx + ww {
+                    let sel_w = sel_w.min(wx + ww - sel_x);
+                    display.fill_rect(sel_x, py, sel_w, CHAR_H, SELECTION);
+                }
+            }
 
             for (ci, cell) in line[..self.cols].iter().enumerate() {
                 let px = wx + 4 + ci * CHAR_W;
