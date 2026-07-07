@@ -112,6 +112,7 @@ const MENU_W:         usize = 160;
 // Harmless: only the boot-created windows are affected, and every animation
 // after boot (new windows, unminimize, close) times correctly.
 const ANIM_MS: u64 = 180;
+const MENU_ANIM_MS: u64 = 150;
 
 #[derive(Clone, Copy, PartialEq)]
 enum AnimKind {
@@ -162,6 +163,12 @@ pub struct Window {
     resize_orig_mx:  i32,
     resize_orig_my:  i32,
     anim:            Option<WindowAnim>,
+    /// True once this window has actually been shown to the user (created
+    /// visible, or unminimized at least once) — distinguishes "minimized
+    /// after being open" (still shows a taskbar button, like a real OS) from
+    /// "never opened yet" (boot-time windows created pre-hidden via
+    /// `hide_instant()` — no taskbar clutter for programs nobody's touched).
+    ever_shown:      bool,
 }
 
 impl Window {
@@ -172,6 +179,7 @@ impl Window {
             saved_x: x, saved_y: y, saved_w: w, saved_h: h,
             drag_off_x: 0, drag_off_y: 0, dragging: false,
             resizing: false, resize_edge_flags: 0,
+            ever_shown: true,
             resize_orig_x: x, resize_orig_y: y,
             resize_orig_w: w, resize_orig_h: h,
             resize_orig_mx: 0, resize_orig_my: 0,
@@ -181,6 +189,7 @@ impl Window {
 
     /// Unminimize (or reveal a just-created window) with an ease-out open animation.
     pub fn show(&mut self) {
+        self.ever_shown = true;
         if self.minimized {
             self.minimized = false;
             self.anim = Some(WindowAnim { kind: AnimKind::Opening, start_tsc: crate::hda::rdtsc() });
@@ -201,6 +210,7 @@ impl Window {
     pub fn hide_instant(&mut self) {
         self.minimized = true;
         self.anim = None;
+        self.ever_shown = false;
     }
 
     /// True while a close animation is in progress — the render loop needs to
@@ -220,15 +230,21 @@ impl Window {
         let eased = 1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t); // ease-out cubic
         match anim.kind {
             AnimKind::Opening | AnimKind::Closing => {
-                let scale = match anim.kind {
-                    AnimKind::Opening => 0.7 + 0.3 * eased, // 70% -> 100%
-                    AnimKind::Closing => 1.0 - 0.3 * eased, // 100% -> 70%
+                // Shrinks/grows toward the taskbar (slides down + shrinks a lot,
+                // not just a small in-place scale) so minimizing/restoring reads
+                // as "going to/from the taskbar" rather than a static fade.
+                // slide_frac/scale both run 0->1 over the animation for Opening
+                // (rising up + growing from near nothing) and 1->0 for Closing
+                // (sinking down + shrinking away), via `eased` vs `1-eased`.
+                let (scale, slide_frac) = match anim.kind {
+                    AnimKind::Opening => (0.1 + 0.9 * eased, 1.0 - eased),
+                    AnimKind::Closing => (1.0 - 0.9 * eased, eased),
                     AnimKind::Transition { .. } => unreachable!(),
                 };
                 let cx = self.x + self.w as i32 / 2;
-                let cy = self.y + self.h as i32 / 2;
-                let nw = ((self.w as f32) * scale) as usize;
-                let nh = ((self.h as f32) * scale) as usize;
+                let cy = self.y + self.h as i32 / 2 + (self.h as f32 * slide_frac) as i32;
+                let nw = ((self.w as f32) * scale).max(1.0) as usize;
+                let nh = ((self.h as f32) * scale).max(1.0) as usize;
                 let nx = cx - nw as i32 / 2;
                 let ny = cy - nh as i32 / 2;
                 (nx, ny, nw, nh)
@@ -350,6 +366,11 @@ pub struct Desktop {
     pub prev_cx:          i32,
     pub prev_cy:          i32,
     pub start_menu_open:  bool,
+    /// TSC timestamp of the most recent Start Menu open — lets `draw_start_menu()`
+    /// slide the popup up from behind the taskbar over `MENU_ANIM_MS` instead of
+    /// snapping open instantly. `None` means "not mid-open-animation" (fully open
+    /// or closed — closing is still instant, only the open transition animates).
+    start_menu_anim_tsc:  Option<u64>,
     dbl_click_pending:    Option<usize>,
     pub snap_zone:        Option<SnapZone>,
     pub context_menu:      Option<(i32, i32)>, // Some(x,y) = right-click menu position
@@ -372,6 +393,7 @@ impl Desktop {
             windows: Vec::new(), focused: None, next_id: 0,
             fb_w, fb_h, prev_btn: 0, dirty: true, mouse_dirty: false,
             prev_cx: 0, prev_cy: 0, start_menu_open: false,
+            start_menu_anim_tsc: None,
             dbl_click_pending: None, snap_zone: None,
             context_menu: None, context_menu_kind: ContextMenuKind::Background,
             open_settings_requested: false, new_window_requested: None,
@@ -421,10 +443,13 @@ impl Desktop {
         }
     }
 
-    /// Group non-minimized windows by app kind, in order of first appearance.
+    /// Group windows that have ever been shown to the user by app kind, in
+    /// order of first appearance — includes currently-minimized ones (a real
+    /// "minimize to taskbar", not a disappear) but excludes windows that
+    /// started pre-hidden at boot and were never actually opened.
     /// Returns (kind, ids-of-that-kind) — ids in the same z-order as `self.windows`.
     pub fn grouped_taskbar_entries(&self) -> Vec<(AppKind, Vec<usize>)> {
-        Self::group_by_kind(self.windows.iter().filter(|w| !w.minimized))
+        Self::group_by_kind(self.windows.iter().filter(|w| w.ever_shown))
     }
 
     /// Group ALL windows (regardless of minimized state) by app kind — used by
@@ -472,6 +497,21 @@ impl Desktop {
     /// nothing else would otherwise mark the scene dirty mid-animation.
     pub fn any_animating(&self) -> bool {
         self.windows.iter().any(|w| w.anim.is_some())
+    }
+
+    /// 0.0-1.0 progress through the Start Menu's open-slide animation (always
+    /// 1.0 once it's finished, or if the menu's never been animated-open yet).
+    fn start_menu_progress(&self) -> f32 {
+        let Some(start) = self.start_menu_anim_tsc else { return 1.0; };
+        let tsc_per_ms = crate::hda::TSC_PER_MS.load(core::sync::atomic::Ordering::Relaxed).max(1);
+        let elapsed_ms = crate::hda::rdtsc().wrapping_sub(start) / tsc_per_ms;
+        (elapsed_ms as f32 / MENU_ANIM_MS as f32).min(1.0)
+    }
+
+    /// True while the Start Menu's open-slide animation is still in progress —
+    /// same "force a redraw" role as `any_animating()`.
+    pub fn start_menu_animating(&self) -> bool {
+        self.start_menu_open && self.start_menu_progress() < 1.0
     }
 
     /// Advance window animations — call once per frame. Finishes any anim
@@ -702,6 +742,7 @@ impl Desktop {
             if (mx as usize) < START_W {
                 // Start button
                 self.start_menu_open = !self.start_menu_open;
+                if self.start_menu_open { self.start_menu_anim_tsc = Some(crate::hda::rdtsc()); }
                 self.dirty = true;
             } else {
                 // Window button — grouped by app kind; a group with >1 window opens
@@ -713,7 +754,14 @@ impl Desktop {
                 if let Some((kind, ids)) = groups.get(slot) {
                     if ids.len() == 1 {
                         let wid = ids[0];
-                        if self.focused == Some(wid) {
+                        let is_minimized = self.windows.iter().find(|w| w.id == wid).map(|w| w.minimized).unwrap_or(false);
+                        if is_minimized {
+                            // Minimized (but shown before, hence its taskbar button
+                            // still exists) — restore it, same as clicking it in the
+                            // Start Menu or a jump list would.
+                            if let Some(w) = self.windows.iter_mut().find(|w| w.id == wid) { w.show(); }
+                            self.bring_to_front(wid);
+                        } else if self.focused == Some(wid) {
                             // Click focused window button = minimize it
                             if let Some(w) = self.windows.iter_mut().find(|w| w.id == wid) {
                                 w.hide();
@@ -779,7 +827,28 @@ impl Desktop {
             } else if win.maximize_hit(mx, my) {
                 let sw = self.fb_w; let sh = self.fb_h;
                 win.toggle_maximize(sw, sh);
-            } else if !win.maximized {
+            } else if win.maximized {
+                // Dragging a maximized window's title bar restores it first
+                // (like any normal OS), then keeps dragging so the same motion
+                // can carry it into a snap zone (e.g. back to the top to
+                // re-maximize) — this used to do nothing at all, since the
+                // drag-start logic below only ran for `!win.maximized` windows.
+                if win.title_hit(mx, my) {
+                    // Grab position as a fraction along the (wide) maximized
+                    // title bar, so restoring keeps the window roughly under
+                    // the cursor instead of snapping to a fixed spot.
+                    let old_outer_x = win.outer_x();
+                    let old_outer_w = win.outer_w().max(1);
+                    let frac = ((mx - old_outer_x) as f32 / old_outer_w as f32).clamp(0.0, 1.0);
+                    let sw = self.fb_w; let sh = self.fb_h;
+                    win.toggle_maximize(sw, sh); // restores to saved_x/y/w/h
+                    win.x = mx - (frac * win.w as f32) as i32;
+                    win.y = my - (TITLE_H as i32 / 2);
+                    win.dragging   = true;
+                    win.drag_off_x = mx - win.x;
+                    win.drag_off_y = my - win.y;
+                }
+            } else {
                 let edges = win.resize_edges_at(mx, my);
                 if edges != 0 {
                     win.resizing          = true;
@@ -1027,25 +1096,33 @@ impl Desktop {
         // Separator
         display.fill_rect(START_W, ty + 4, 1, TASKBAR_H - 8, pal::BORDER);
 
-        // Open (non-minimized) window buttons — grouped by app kind, "(N)" suffix if >1
+        // Window buttons — grouped by app kind, one per program that's ever been
+        // opened (includes currently-minimized windows — a real "minimize to
+        // taskbar", not a disappear). "(N)" suffix shows the currently-open
+        // count when there's more than one instance; minimized-only groups are
+        // dimmed since nothing of that kind is visible right now.
         let mut bx = START_W + 4;
         for (kind, ids) in self.grouped_taskbar_entries() {
             if bx + TASK_BTN_W > self.fb_w - 80 { break; }
-            let active = ids.len() == 1 && self.focused == Some(ids[0])
-                || (ids.len() > 1 && ids.iter().any(|&i| self.focused == Some(i)));
-            let bc = if active { pal::TASKBAR_ACT } else { pal::TASKBAR_BTN };
+            let open_count = ids.iter().filter(|&&id| self.windows.iter().any(|w| w.id == id && !w.minimized)).count();
+            let active = open_count > 0 && (ids.len() == 1 && self.focused == Some(ids[0])
+                || (ids.len() > 1 && ids.iter().any(|&i| self.focused == Some(i))));
+            let bc = if active { pal::TASKBAR_ACT }
+                     else if open_count == 0 { pal::TASKBAR } // dimmed — minimized, not currently visible
+                     else { pal::TASKBAR_BTN };
             display.fill_rect(bx, ty + 4, TASK_BTN_W - 4, TASKBAR_H - 8, bc);
             if active {
                 display.fill_rect(bx, ty + TASKBAR_H - 5, TASK_BTN_W - 4, 2, pal::ACCENT);
             }
             let full_label = if ids.len() > 1 {
-                alloc::format!("{} ({})", app_label(kind), ids.len())
+                alloc::format!("{} ({})", app_label(kind), open_count)
             } else {
                 let win = self.windows.iter().find(|w| w.id == ids[0]);
                 win.map(|w| w.title.clone()).unwrap_or_else(|| String::from(app_label(kind)))
             };
             let label = if full_label.len() > 13 { &full_label[..13] } else { &full_label };
-            display.draw_text(bx + 6, ty + 10, label, pal::TEXT, 1);
+            let text_col = if open_count == 0 { pal::TEXT_DIM } else { pal::TEXT };
+            display.draw_text(bx + 6, ty + 10, label, text_col, 1);
             bx += TASK_BTN_W;
         }
 
@@ -1162,7 +1239,15 @@ impl Desktop {
 
         let groups = self.grouped_all_entries();
         let menu_h = groups.len() * MENU_ENTRY_H + 8;
-        let menu_y = (self.fb_h - TASKBAR_H).saturating_sub(menu_h);
+        let target_menu_y = (self.fb_h - TASKBAR_H).saturating_sub(menu_h);
+        // Slide up from behind the taskbar on open (150ms ease-out); closing
+        // stays instant. Hit-testing (in update_mouse) always uses target_menu_y
+        // directly, not this eased value — you can't click precisely during a
+        // 150ms slide anyway, so there's no reason to chase a moving target.
+        let t = self.start_menu_progress();
+        let eased = 1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t);
+        let start_y = self.fb_h - TASKBAR_H;
+        let menu_y = (start_y as f32 + (target_menu_y as f32 - start_y as f32) * eased) as usize;
 
         // Background + border
         display.fill_rect(0, menu_y, MENU_W, menu_h, pal::MENU_BG);
@@ -1205,3 +1290,4 @@ impl Desktop {
 }
 
 pub static DESKTOP: Mutex<Option<Desktop>> = Mutex::new(None);
+

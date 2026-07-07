@@ -967,7 +967,10 @@ fn task_blink() -> ! {
         // indefinitely, until some unrelated input forced a redraw.
         let animating = {
             let mut dt = desktop::DESKTOP.lock();
-            dt.as_mut().map(|d| { let just_finished = d.tick_anims(); just_finished || d.any_animating() }).unwrap_or(false)
+            dt.as_mut().map(|d| {
+                let just_finished = d.tick_anims();
+                just_finished || d.any_animating() || d.start_menu_animating()
+            }).unwrap_or(false)
         };
 
         let content_dirty = {

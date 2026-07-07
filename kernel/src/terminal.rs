@@ -1217,7 +1217,7 @@ impl Terminal {
                         let mut dt = crate::desktop::DESKTOP.lock();
                         if let Some(dt) = dt.as_mut() {
                             if let Some(w) = dt.windows.iter_mut().find(|w| w.id == 7) {
-                                w.minimized = false;
+                                w.show();
                             }
                             dt.bring_to_front(7);
                             dt.dirty = true;

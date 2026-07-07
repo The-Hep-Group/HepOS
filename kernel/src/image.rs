@@ -192,7 +192,7 @@ pub fn open_smart(path: &str) -> usize {
         let mut dt = crate::desktop::DESKTOP.lock();
         if let Some(dt) = dt.as_mut() {
             if let Some(w) = dt.windows.iter_mut().find(|w| w.id == win_id) {
-                w.minimized = false;
+                w.show();
             }
             dt.bring_to_front(win_id);
             dt.dirty = true;
