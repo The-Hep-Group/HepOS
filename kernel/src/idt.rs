@@ -78,6 +78,23 @@ extern "C" fn exception_handler(frame: &ExceptionFrame) {
     let vec = frame.vector as usize;
     let name = if vec < 32 { EXCEPTION_NAMES[vec] } else { "Unknown" };
 
+    crate::serial::print("\nKERNEL EXCEPTION: ");
+    crate::serial::print(name);
+    crate::serial::print(&alloc::format!(
+        "  vector={:#x} error={:#x} rip={:#x} cr2={:#x} rsp={:#x} cs={:#x}\n",
+        frame.vector, frame.error_code, frame.rip,
+        unsafe { let cr2: u64; core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack)); cr2 },
+        frame.rsp, frame.cs,
+    ));
+    crate::serial::print(&alloc::format!(
+        "  rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rbp={:#x}\n",
+        frame.rax, frame.rbx, frame.rcx, frame.rdx, frame.rsi, frame.rdi, frame.rbp,
+    ));
+    crate::serial::print(&alloc::format!(
+        "  r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}\n",
+        frame.r8, frame.r9, frame.r10, frame.r11, frame.r12, frame.r13, frame.r14, frame.r15,
+    ));
+
     // paint screen red and show exception info
     if let Some(display) = crate::DISPLAY.lock().as_mut() {
         use crate::framebuffer::Color;

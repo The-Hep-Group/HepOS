@@ -37,6 +37,14 @@ pub fn load(data: &[u8], pml4_phys: u64) -> Result<Loaded, &'static str> {
     if e_phentsize < 56 { return Err("phentsize too small"); }
 
     let mut pages: Vec<u64> = Vec::new();
+    // Tracks virt-page -> phys-page for pages already allocated by an earlier
+    // PT_LOAD segment in this same file, so a later segment that shares a
+    // page (e.g. a small RELRO/GOT segment tail-packed into the same page as
+    // the preceding code/rodata segment — common, since segments only need
+    // page alignment, not exclusivity) writes into the SAME physical page
+    // instead of allocating a fresh, zeroed one and silently discarding
+    // everything the earlier segment had already placed there.
+    let mut page_map: Vec<(u64, u64)> = Vec::new();
 
     for i in 0..e_phnum {
         let ph_off = e_phoff + i * e_phentsize;
@@ -67,14 +75,23 @@ pub fn load(data: &[u8], pml4_phys: u64) -> Result<Loaded, &'static str> {
 
         for p in 0..num_pages {
             let virt = (page_start + p * PAGE_SIZE) as u64;
-            let phys = pmm::alloc_page().ok_or("ELF load: out of physical memory")?;
-            pages.push(phys);
 
-            // Zero the page first (covers BSS)
-            let dest = unsafe {
-                core::slice::from_raw_parts_mut(vmm::phys_to_virt(phys), PAGE_SIZE)
+            let phys = if let Some(&(_, existing)) = page_map.iter().find(|&&(v, _)| v == virt) {
+                // Already mapped by an earlier segment sharing this page —
+                // reuse it (don't re-zero: that would erase that segment's data).
+                existing
+            } else {
+                let phys = pmm::alloc_page().ok_or("ELF load: out of physical memory")?;
+                pages.push(phys);
+                page_map.push((virt, phys));
+                // Zero the page first (covers BSS)
+                let dest = unsafe {
+                    core::slice::from_raw_parts_mut(vmm::phys_to_virt(phys), PAGE_SIZE)
+                };
+                dest.fill(0);
+                paging::map_page_into(pml4_phys, virt, phys, pg_flags);
+                phys
             };
-            dest.fill(0);
 
             // Copy file bytes that fall within [p_vaddr .. p_vaddr + p_filesz)
             // intersected with [page_va_lo .. page_va_hi)
@@ -90,10 +107,11 @@ pub fn load(data: &[u8], pml4_phys: u64) -> Result<Loaded, &'static str> {
                 let dst_off = copy_lo - page_va_lo;
                 let src_off = p_offset + (copy_lo - file_va_lo);
                 let len     = copy_hi - copy_lo;
+                let dest = unsafe {
+                    core::slice::from_raw_parts_mut(vmm::phys_to_virt(phys), PAGE_SIZE)
+                };
                 dest[dst_off..dst_off + len].copy_from_slice(&data[src_off..src_off + len]);
             }
-
-            paging::map_page_into(pml4_phys, virt, phys, pg_flags);
         }
     }
 

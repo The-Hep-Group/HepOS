@@ -20,3 +20,11 @@ version = "0.1.0"
 dependencies = [
  "hepos-rt",
 ]
+
+[[package]]
+name = "hwtest"
+version = "0.1.0"
+dependencies = [
+ "hepos-rt",
+ "hepos-std",
+]

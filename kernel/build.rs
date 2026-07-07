@@ -20,4 +20,16 @@ fn main() {
     } else {
         std::fs::write(&gen, "static HELLO_ELF: &[u8] = &[];\n").unwrap();
     }
+
+    // Bake the userspace hwtest ELF the same way.
+    let hwtest     = root.join("userspace/target/x86_64-unknown-none/release/hwtest");
+    let gen_hwtest = std::path::Path::new(&out_dir).join("hwtest_elf.rs");
+    if hwtest.exists() {
+        let bytes = std::fs::read(&hwtest).expect("read hwtest ELF");
+        let lit: String = bytes.iter().map(|b| format!("{},", b)).collect();
+        std::fs::write(&gen_hwtest, format!("static HWTEST_ELF: &[u8] = &[{}];\n", lit)).unwrap();
+        println!("cargo:rerun-if-changed={}", hwtest.display());
+    } else {
+        std::fs::write(&gen_hwtest, "static HWTEST_ELF: &[u8] = &[];\n").unwrap();
+    }
 }

@@ -26,6 +26,14 @@ pub const SYS_WRITE:  u64 = 1;
 pub const SYS_EXIT:   u64 = 60;
 pub const SYS_GETPID: u64 = 39;
 
+// HepOS-specific extensions (no Linux equivalent) — the foundational
+// MMIO/port-IO passthrough syscalls a userspace driver process would use.
+// Numbered well above the Linux range so they can never collide with a
+// syscall number this project later decides to add real Linux-ABI support for.
+pub const SYS_MMAP_MMIO: u64 = 500; // (phys_addr, len)         -> user VA (0 = fail)
+pub const SYS_PORT_IN:   u64 = 501; // (port, width 1/2/4)      -> value
+pub const SYS_PORT_OUT:  u64 = 502; // (port, width 1/2/4, val) -> 0
+
 const ENOSYS: i64 = -38;
 const EBADF:  i64 = -9;
 
@@ -184,10 +192,13 @@ unsafe extern "C" fn syscall_entry() {
 #[unsafe(no_mangle)]
 extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 {
     match num {
-        SYS_WRITE  => sys_write(a1, a2, a3),
-        SYS_EXIT   => sys_exit(a1),
-        SYS_GETPID => crate::process::CURRENT_PID.load(Ordering::Relaxed) as u64,
-        _          => ENOSYS as u64,
+        SYS_WRITE      => sys_write(a1, a2, a3),
+        SYS_EXIT       => sys_exit(a1),
+        SYS_GETPID     => crate::process::CURRENT_PID.load(Ordering::Relaxed) as u64,
+        SYS_MMAP_MMIO  => sys_mmap_mmio(a1, a2),
+        SYS_PORT_IN    => sys_port_in(a1, a2),
+        SYS_PORT_OUT   => sys_port_out(a1, a2, a3),
+        _              => ENOSYS as u64,
     }
 }
 
@@ -221,6 +232,45 @@ fn sys_exit(code: u64) -> u64 {
     } else {
         serial::print("sys_exit: no process running\n");
         ENOSYS as u64
+    }
+}
+
+/// mmap_mmio(phys_addr, len) — maps a physical MMIO region into the calling
+/// process's own page tables and returns the user virtual address (0 = fail:
+/// no process running, or a too-large/zero request). Once mapped, the caller
+/// reads/writes it directly with no further syscalls — the actual point of
+/// "passthrough", since a real driver needs fast polled MMIO access.
+fn sys_mmap_mmio(phys: u64, len: u64) -> u64 {
+    crate::process::map_mmio_for_user(phys, len)
+}
+
+/// port_in(port, width) — privileged IN, done here (not in ring 3) because
+/// ring-3 IN/OUT needs IOPL=3 or a TSS I/O bitmap, neither of which this
+/// project sets up; the syscall boundary *is* the permission check for now.
+/// width must be 1, 2, or 4 (bytes); anything else returns -ENOSYS.
+fn sys_port_in(port: u64, width: u64) -> u64 {
+    let port = port as u16;
+    unsafe {
+        match width {
+            1 => { let v: u8;  asm!("in al, dx",  out("al")  v, in("dx") port, options(nomem, nostack)); v as u64 }
+            2 => { let v: u16; asm!("in ax, dx",  out("ax")  v, in("dx") port, options(nomem, nostack)); v as u64 }
+            4 => { let v: u32; asm!("in eax, dx", out("eax") v, in("dx") port, options(nomem, nostack)); v as u64 }
+            _ => ENOSYS as u64,
+        }
+    }
+}
+
+/// port_out(port, width, value) — privileged OUT; see `sys_port_in` for why
+/// this runs in the kernel rather than granting ring-3 IOPL.
+fn sys_port_out(port: u64, width: u64, val: u64) -> u64 {
+    let port = port as u16;
+    unsafe {
+        match width {
+            1 => { asm!("out dx, al",  in("dx") port, in("al")  val as u8,  options(nomem, nostack)); 0 }
+            2 => { asm!("out dx, ax",  in("dx") port, in("ax")  val as u16, options(nomem, nostack)); 0 }
+            4 => { asm!("out dx, eax", in("dx") port, in("eax") val as u32, options(nomem, nostack)); 0 }
+            _ => ENOSYS as u64,
+        }
     }
 }
 

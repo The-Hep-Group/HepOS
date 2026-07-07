@@ -29,7 +29,7 @@ const COMMAND_NAMES: &[&str] = &[
     "rm", "cp", "mv", "write", "edit", "uname", "mem", "date",
     "history", "lspci", "netdiag", "netstart", "netpoll", "ifconfig",
     "ping", "wget", "udp", "view", "play", "shutdown", "reboot", "echo",
-    "sysinfo", "syscallinfo", "runtest", "runhello", "exec", "ps", "newterm", "beep", "volume", "sata",
+    "sysinfo", "syscallinfo", "runtest", "runhello", "runhwtest", "exec", "ps", "newterm", "beep", "volume", "sata",
 ];
 
 #[derive(Clone, Copy)]
@@ -925,6 +925,17 @@ impl Terminal {
                         self.print(&alloc::format!("hello exited: {}\n", code));
                     }
                     Err(e) => self.print_colored(&alloc::format!("runhello: {}\n", e), ERR),
+                }
+            }
+
+            "runhwtest" => {
+                self.print_colored("Launching hwtest (userspace MMIO/port-IO demo)...\n", OK);
+                match crate::process::run_hwtest() {
+                    Ok(code) => {
+                        self.flush_proc_output();
+                        self.print(&alloc::format!("hwtest exited: {}\n", code));
+                    }
+                    Err(e) => self.print_colored(&alloc::format!("runhwtest: {}\n", e), ERR),
                 }
             }
 

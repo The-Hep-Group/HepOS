@@ -58,6 +58,30 @@ unsafe fn get_or_make_user(table_phys: u64, idx: usize) -> u64 {
     }
 }
 
+/// Map a physical page into the *currently loaded* PML4 (CR3), with USER set
+/// on every level of the walk. Used by the MMIO-passthrough syscall: it runs
+/// with the calling ring-3 process's own PML4 already loaded (SYSCALL/SYSRET
+/// doesn't touch CR3), so — unlike `map_page_into`, which targets a PML4
+/// that isn't loaded yet — this needs the invlpg that `map_page` does, but
+/// `map_page`'s own `get_or_make` doesn't set USER on intermediate tables
+/// (fine for kernel-only mappings, wrong here: without USER at every level
+/// the CPU treats the leaf as supervisor-only regardless of the leaf's own
+/// USER bit).
+pub fn map_page_current_user(virt: u64, phys: u64, flags: u64) {
+    let i4 = ((virt >> 39) & 0x1FF) as usize;
+    let i3 = ((virt >> 30) & 0x1FF) as usize;
+    let i2 = ((virt >> 21) & 0x1FF) as usize;
+    let i1 = ((virt >> 12) & 0x1FF) as usize;
+    unsafe {
+        let p3 = get_or_make_user(cr3_phys(), i4);
+        let p2 = get_or_make_user(p3, i3);
+        let p1 = get_or_make_user(p2, i2);
+        let pt = (vmm::phys_to_virt(p1) as *mut u64).add(i1);
+        pt.write_volatile(phys | flags | PRESENT | USER);
+        invlpg(virt);
+    }
+}
+
 /// Map a physical page into an arbitrary PML4 (not the current CR3).
 /// All intermediate page-table entries get the USER bit so ring-3 code can walk them.
 pub fn map_page_into(pml4_phys: u64, virt: u64, phys: u64, flags: u64) {
