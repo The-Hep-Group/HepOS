@@ -210,13 +210,25 @@ impl Window {
         }
     }
 
-    /// Minimize/close with an ease-out shrink animation — `minimized` isn't
-    /// set until the animation finishes (see `Desktop::tick_anims()`), so the
+    /// Minimize with an ease-out shrink animation — `minimized` isn't set
+    /// until the animation finishes (see `Desktop::tick_anims()`), so the
     /// window keeps rendering (at a shrinking scale) for the transition.
+    /// Stays in the taskbar (`ever_shown` untouched) — this is "minimize",
+    /// not "close"; see `close()` for the taskbar-removing version.
     pub fn hide(&mut self) {
         if !self.minimized {
             self.anim = Some(WindowAnim { kind: AnimKind::Closing, start_tsc: crate::hda::rdtsc() });
         }
+    }
+
+    /// Close — same shrink animation as `hide()`, but also drops out of the
+    /// taskbar immediately (`ever_shown = false`), same as a window that's
+    /// never been opened. This is what the ✕ button calls; `hide()` (the "_"
+    /// minimize button, and clicking a focused taskbar button) keeps the
+    /// taskbar entry since minimizing isn't closing.
+    pub fn close(&mut self) {
+        self.hide();
+        self.ever_shown = false;
     }
 
     /// Minimize with no animation — for boot-time setup (windows that start
@@ -859,7 +871,7 @@ impl Desktop {
             self.dirty = true;
             let win = self.windows.iter_mut().find(|w| w.id == id).unwrap();
             if win.close_hit(mx, my) {
-                win.hide();
+                win.close();
                 self.focused  = None;
             } else if win.minimize_hit(mx, my) {
                 win.hide();

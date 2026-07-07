@@ -422,7 +422,7 @@ fn task_blink() -> ! {
                         let mut dt = desktop::DESKTOP.lock();
                         if let Some(dt) = dt.as_mut() {
                             if let Some(w) = dt.windows.iter_mut().find(|w| w.id == 3) {
-                                w.hide();
+                                w.close();
                             }
                             dt.dirty = true;
                         }
@@ -448,7 +448,7 @@ fn task_blink() -> ! {
                         let mut dt = desktop::DESKTOP.lock();
                         if let Some(dt) = dt.as_mut() {
                             if let Some(w) = dt.windows.iter_mut().find(|w| w.id == target_wid) {
-                                w.hide();
+                                w.close();
                             }
                             dt.dirty = true;
                         }
