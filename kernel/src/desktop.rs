@@ -97,6 +97,21 @@ const TASK_BTN_W:     usize = 120;
 const MENU_ENTRY_H:   usize = 26;
 const MENU_W:         usize = 160;
 
+// Shutdown/restart buttons in the Start Menu's header, top-right — shared
+// between draw_start_menu() and update_mouse()'s hit-test so they can never
+// drift out of sync with each other.
+const MENU_BTN_SIZE: usize = 14;
+const MENU_BTN_Y:    usize = 2; // relative to the menu's own top edge
+const MENU_SHUTDOWN_X: usize = MENU_W - MENU_BTN_SIZE - 4;
+const MENU_RESTART_X:  usize = MENU_SHUTDOWN_X - MENU_BTN_SIZE - 4;
+
+/// (rel_x, rel_y) are mouse coordinates relative to the menu's own top-left
+/// corner. Split out from `update_mouse()` so it's testable without
+/// triggering the (diverging) `acpi::shutdown()`/`reboot()` calls it gates.
+fn menu_btn_hit(bx: usize, rel_x: usize, rel_y: usize) -> bool {
+    rel_x >= bx && rel_x < bx + MENU_BTN_SIZE && rel_y >= MENU_BTN_Y && rel_y < MENU_BTN_Y + MENU_BTN_SIZE
+}
+
 // ── Window open/close animation ───────────────────────────────────────────────
 // 180ms ease-out scale, centered on the window's own position. `Opening` runs
 // on creation and on every unminimize; `Closing` runs on minimize/close and
@@ -772,6 +787,21 @@ impl Desktop {
             && mx >= 0 && (mx as usize) < MENU_W
             && my >= menu_top as i32 && my < self.fb_h as i32 - TASKBAR_H as i32;
 
+        // Start-menu header buttons (shutdown/restart) — checked before the
+        // program-row hit-test below, since row 0's click band overlaps the
+        // header's y-range and would otherwise swallow these clicks as "open
+        // the first program in the list."
+        if in_menu {
+            let rel_x = mx as usize;
+            let rel_y = (my - menu_top as i32) as usize;
+            if menu_btn_hit(MENU_SHUTDOWN_X, rel_x, rel_y) {
+                crate::acpi::shutdown();
+            }
+            if menu_btn_hit(MENU_RESTART_X, rel_x, rel_y) {
+                crate::acpi::reboot();
+            }
+        }
+
         // Start-menu item click — one program per row; >1 open instance opens
         // a jump list (same picker the taskbar uses) instead of guessing which to focus.
         if in_menu {
@@ -1319,6 +1349,15 @@ impl Desktop {
         // Header
         display.draw_text(8, menu_y + 4, "Programs", pal::ACCENT, 1);
         display.fill_rect(0, menu_y + 18, MENU_W, 1, pal::MENU_BORDER);
+
+        // Shutdown/restart buttons, top-right of the header — same
+        // "colored square + single letter" style as the window title bar's
+        // close/minimize/maximize buttons.
+        let btn_y = menu_y + MENU_BTN_Y;
+        display.fill_rect(MENU_RESTART_X, btn_y, MENU_BTN_SIZE, MENU_BTN_SIZE, pal::TASKBAR_BTN);
+        display.draw_text(MENU_RESTART_X + 4, btn_y + 3, "R", pal::TEXT, 1);
+        display.fill_rect(MENU_SHUTDOWN_X, btn_y, MENU_BTN_SIZE, MENU_BTN_SIZE, pal::CLOSE_BTN);
+        display.draw_text(MENU_SHUTDOWN_X + 4, btn_y + 3, "P", pal::TEXT, 1);
 
         for (i, (kind, ids)) in groups.iter().enumerate() {
             let ey = menu_y + 8 + i * MENU_ENTRY_H;

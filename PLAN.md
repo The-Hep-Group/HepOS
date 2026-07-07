@@ -258,6 +258,7 @@ All windows:
 - **Window buttons**: only non-minimized windows shown, grouped by app kind (see below); click focused → minimize, click other → focus; group with >1 window opens a jump list instead
 - **Right-click** a taskbar button or a Start Menu row → "New Window" (spawns another instance of that program; not offered for Files)
 - **Clock** (far right): live RTC time
+- **Shutdown ("P") / Restart ("R") buttons**, top-right of the Start Menu's header — same "colored square + single letter" style as a window's close/minimize/maximize buttons. Call `acpi::shutdown()`/`acpi::reboot()` directly (the same functions the terminal's `shutdown`/`reboot` commands use). Hit-testing (`Desktop::menu_btn_hit()`) is checked before the program-row click logic, since row 0's click band overlaps the header's y-range and would otherwise swallow these clicks. Verified with a temporary boot-time test of the hit-test geometry only (button centers hit, buttons don't overlap each other, clicking the "Programs" label misses both) — deliberately not exercised through the real click path, since that would trigger the actual (diverging) shutdown/reboot calls.
 
 ---
 
@@ -456,7 +457,7 @@ Range 0–32767 scaled to framebuffer size.
 | ✓ | e1000 NIC — TX only |
 | ✓ | Networking RX — e1000 RX confirmed working on QEMU/Windows (ping 10.0.2.2 replies) |
 | ✓ | Intel HDA audio — `beep [hz] [ms]` via hda-output codec (switched from hda-duplex — see Known Issues), square-wave PCM, DMA stream |
-| ○ | ACPI FADT parsing (for real hardware shutdown) |
+| ✓ | ACPI FADT parsing — `acpi.rs`: real RSDP→RSDT/XSDT→FADT→DSDT parsing, byte-scanning the DSDT for the `\_S5` package (the well-known hobbyist recipe, not a full AML interpreter — see the module doc) to get the real PM1a/b_CNT_BLK ports and SLP_TYP values, instead of hardcoded QEMU-only ports |
 | ✓ | AHCI/SATA driver — `ahci.rs`: PCI detect, port init, IDENTIFY, LBA48 read/write via a single polled command slot, all bounded (never `panic!`/hang on timeout). HepFS now mounts over it too via `hepfs::BlockDev` — see Storage table. |
 | ✓ | virtio-gpu driver — `virtio_gpu.rs`: modern virtio-pci transport from scratch (PCI cap-list walk, virtqueue, polled), `GET_DISPLAY_INFO` + full 2D resource create/attach/scanout/transfer/flush pipeline. The real desktop now mirrors to it live (zero-copy, same backbuffer physical memory) alongside the GOP boot display. |
 | ○ | USB HID keyboard — XHCI only drives the USB HID mouse (tablet) today; keyboard is PS/2 |
@@ -566,12 +567,11 @@ Completed items are removed once done — see the "Original Design Plan vs. Curr
 3. **Real file format support** — PNG/JPG (image viewer), MP3/FLAC/OGG (audio player), MP4/H.264 (no video player exists at all), PDF viewer, Markdown rendering, ZIP/TAR archive support. All ❌ today; blocked in practice on #2 for the codec-heavy ones.
 4. **Dynamic task spawn/exit + blocking primitives** — the scheduler (`scheduler.rs`) does real preemption now (soak-tested), but still only ever runs the same 2 hardcoded tasks (`idle`/`blink`); there's no way to spawn a new task at runtime, no exit path, no wait/blocking primitive. Needed before real preemptive multitasking (background OS tasks, multi-process ring-3) is usable for anything beyond the 2 built-ins.
 5. **USB HID keyboard** — XHCI (`xhci.rs`) currently only drives the USB HID mouse (tablet); the keyboard is still PS/2 (`ps2.rs`).
-6. **ACPI FADT parsing** — shutdown/reboot (`acpi.rs`) is hardcoded to QEMU's port 0x604; real hardware needs to actually parse the FADT to find the right ports/values.
-7. **RTL8169 / real hardware NIC** — for running on physical machines (untestable in this QEMU-only dev environment).
-8. **QEMU cursor on window resize** — `zoom-to-fit` not available on this QEMU/Windows build; known SDL limitation, not a HepOS bug, no fix available from our side.
-9. **Settings: resolution control** — Settings app has wallpaper + volume pages, no resolution control. Likely infeasible as a *live* control without bootloader-level GOP mode-selection UI, since HepBL picks the display mode once at boot, before the kernel (or Settings) ever runs — would need HepBL itself to offer a mode picker pre-ExitBootServices.
-10. **Taskbar volume control widget** — volume control exists (Settings "Sound" page, `volume` terminal command) but isn't a widget directly on the taskbar the way the original design pictured it. Minor polish.
-11. **Per-widget dirty-rect tracking** — current two-tier scheme (full-scene redraw vs. ~20-row cursor-only partial flush) achieves the same practical goal as literal per-widget dirty rects but isn't the same mechanism. Minor polish, not blocking anything.
+6. **RTL8169 / real hardware NIC** — for running on physical machines (untestable in this QEMU-only dev environment).
+7. **QEMU cursor on window resize** — `zoom-to-fit` not available on this QEMU/Windows build; known SDL limitation, not a HepOS bug, no fix available from our side.
+8. **Settings: resolution control** — Settings app has wallpaper + volume pages, no resolution control. Likely infeasible as a *live* control without bootloader-level GOP mode-selection UI, since HepBL picks the display mode once at boot, before the kernel (or Settings) ever runs — would need HepBL itself to offer a mode picker pre-ExitBootServices.
+9. **Taskbar volume control widget** — volume control exists (Settings "Sound" page, `volume` terminal command) but isn't a widget directly on the taskbar the way the original design pictured it. Minor polish.
+10. **Per-widget dirty-rect tracking** — current two-tier scheme (full-scene redraw vs. ~20-row cursor-only partial flush) achieves the same practical goal as literal per-widget dirty rects but isn't the same mechanism. Minor polish, not blocking anything.
 
 ---
 

@@ -50,6 +50,7 @@ pub struct BootInfo {
     pub _pad:         [u8; 3],
     pub memmap_count: u64,
     pub memmap:       [MemRegion; MAX_MEMMAP],
+    pub acpi_rsdp:    u64, // physical address of the ACPI RSDP, 0 if not found
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -71,6 +72,30 @@ const SFS_GUID: Guid = Guid(0x964e5b22, 0x6459, 0x11d2,
     [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b]);
 const FILE_INFO_GUID: Guid = Guid(0x09576e92, 0x6d3f, 0x11d2,
     [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b]);
+// ACPI RSDP pointers live in the UEFI configuration table, keyed by one of
+// these two GUIDs — prefer the 2.0 one (XSDT, 64-bit table pointers), fall
+// back to 1.0 (RSDT only) if that's all the firmware publishes.
+const ACPI_20_TABLE_GUID: Guid = Guid(0x8868e871, 0xe4f1, 0x11d3,
+    [0xbc, 0x22, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81]);
+const ACPI_10_TABLE_GUID: Guid = Guid(0xeb9d2d30, 0x2d88, 0x11d3,
+    [0x9a, 0x16, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d]);
+
+fn guid_eq(a: &Guid, b: &Guid) -> bool { a.0 == b.0 && a.1 == b.1 && a.2 == b.2 && a.3 == b.3 }
+
+/// Walk the UEFI configuration table looking for the ACPI RSDP. Prefers the
+/// ACPI 2.0 GUID; falls back to 1.0. Returns 0 if neither is present.
+unsafe fn find_rsdp(st: &SystemTable) -> u64 {
+    #[repr(C)]
+    struct ConfigEntry { guid: Guid, table: *mut c_void }
+    let entries = st.config_table as *const ConfigEntry;
+    let mut acpi1: u64 = 0;
+    for i in 0..st.num_table_entries {
+        let e = &*entries.add(i);
+        if guid_eq(&e.guid, &ACPI_20_TABLE_GUID) { return e.table as u64; }
+        if guid_eq(&e.guid, &ACPI_10_TABLE_GUID) { acpi1 = e.table as u64; }
+    }
+    acpi1
+}
 
 #[repr(C)]
 struct TableHeader {
@@ -521,6 +546,10 @@ unsafe fn efi_main_inner(image: Handle, st: *mut SystemTable) -> Status {
     bi.fb_green_shift = gs;
     bi.fb_blue_shift  = bl;
     let _ = fb_size;
+    bi.acpi_rsdp = find_rsdp(&*st);
+    print("ACPI RSDP=");
+    print_hex(bi.acpi_rsdp);
+    print("\n");
 
     // ── 5. Memory map + ExitBootServices ─────────────────────────────────────
     // Buffer allocated up front: no further allocations between the final

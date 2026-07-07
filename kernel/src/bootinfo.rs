@@ -29,4 +29,5 @@ pub struct BootInfo {
     pub _pad:         [u8; 3],
     pub memmap_count: u64,
     pub memmap:       [MemRegion; MAX_MEMMAP],
+    pub acpi_rsdp:    u64, // physical address of the ACPI RSDP, 0 if not found
 }

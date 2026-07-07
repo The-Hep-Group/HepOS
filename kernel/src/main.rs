@@ -46,6 +46,12 @@ use spin::Mutex;
 // Global display — used by exception handler and future modules
 pub static DISPLAY: Mutex<Option<Display>> = Mutex::new(None);
 
+/// Physical address of the ACPI RSDP, as found by HepBL (0 if not found) —
+/// set once early in `kmain` from `BootInfo::acpi_rsdp`, read by
+/// `acpi::shutdown()` to attempt a real ACPI shutdown before falling back to
+/// the hardcoded QEMU/Bochs/VirtualBox ports.
+pub static BOOTINFO_ACPI_RSDP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 // Focus: Some(id) = that window has keyboard focus; defaults to terminal (id=2)
 pub static FOCUSED_WIN: Mutex<Option<usize>> = Mutex::new(None);
 
@@ -163,6 +169,7 @@ extern "C" fn kmain(bi_ptr: *const bootinfo::BootInfo) -> ! {
         serial::print("FATAL: bad BootInfo magic\n");
         loop { unsafe { core::arch::asm!("hlt"); } }
     }
+    BOOTINFO_ACPI_RSDP.store(bi.acpi_rsdp, core::sync::atomic::Ordering::Relaxed);
 
     gdt::init();
     serial::print("GDT loaded\n");
