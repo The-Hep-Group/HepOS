@@ -87,15 +87,20 @@ pub static PCI_DEVS: Mutex<alloc::vec::Vec<pci::PciDevice>> = Mutex::new(alloc::
 // Frame counter for uptime (~60 fps → divide by 60 for seconds)
 static UPTIME_FRAMES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-// HepFS navigator state (current directory + back/forward history).
-// One entry per Files window, keyed by window id — same pattern as
-// `editor::EXTRA_EDITORS` — so multiple Files windows browse independently.
+// HepFS navigator state (current directory + back/forward history). One
+// shared nav per Files window — both panes (see render_hepfs_window) show
+// this same current directory, just filtered differently: a directories-only
+// list on the left (a lightweight one-level "tree"), the full listing
+// (dirs + files) on the right. Not two independent browsers.
 struct HepfsNav {
     ino:  u32,
     path: alloc::string::String,
     back: alloc::vec::Vec<(u32, alloc::string::String)>,
     fwd:  alloc::vec::Vec<(u32, alloc::string::String)>,
 }
+
+// One entry per Files window, keyed by window id — same pattern as
+// `editor::EXTRA_EDITORS` — so multiple Files windows browse independently.
 static HEPFS_NAVS: Mutex<alloc::vec::Vec<(usize, HepfsNav)>> = Mutex::new(alloc::vec::Vec::new());
 
 fn hepfs_nav_new() -> HepfsNav {
@@ -121,6 +126,29 @@ fn spawn_files() -> usize {
     };
     HEPFS_NAVS.lock().push((win_id, hepfs_nav_new()));
     win_id
+}
+
+/// The id of whichever window is actually topmost at (mx, my) — chrome
+/// (close/maximize/minimize/newterm/title bar/resize edge) or content, same
+/// predicate `Desktop::update_mouse()`'s own hit-testing uses, checked
+/// topmost-first (`.rev()`, since z-order is back-to-front in `windows`).
+///
+/// Per-app click routing below (HepFS, Settings, editor/terminal text-drag)
+/// used to hit-test only *their own* window kind, ignoring whether some
+/// other window was actually stacked on top at that point — so e.g. a Files
+/// window's content area is quite large, and clicking the close button of an
+/// unrelated window that happened to visually overlap it would both close
+/// that window (correctly, via Desktop::update_mouse()) *and* leak through
+/// as a stray Files-window navigation click. Each such block now checks its
+/// candidate window's id against this before acting.
+fn topmost_window_id_at(d: &desktop::Desktop, mx: i32, my: i32) -> Option<usize> {
+    d.windows.iter().rev().find(|w| {
+        !w.minimized && (
+            w.close_hit(mx, my) || w.maximize_hit(mx, my) || w.minimize_hit(mx, my)
+                || w.newterm_hit(mx, my) || w.title_hit(mx, my)
+                || w.resize_hit(mx, my) || w.content_hit(mx, my)
+        )
+    }).map(|w| w.id)
 }
 
 #[no_mangle]
@@ -230,7 +258,7 @@ extern "C" fn kmain(bi_ptr: *const bootinfo::BootInfo) -> ! {
     terminal::init();
     serial::print("Terminal init\n");
 
-    // Main Files window (id=1) navigator starts at root
+    // Main Files window (id=1) — both panes start at root
     HEPFS_NAVS.lock().push((1, hepfs_nav_new()));
 
     // Minimize editor, sysmon, settings, and image viewer until explicitly opened; focus terminal (id=2)
@@ -508,7 +536,8 @@ fn task_blink() -> ! {
                             d.windows.iter().rev()
                                 .find(|w| !w.minimized
                                     && matches!(w.app_kind, desktop::AppKind::Editor | desktop::AppKind::Terminal)
-                                    && w.content_hit(mx, my))
+                                    && w.content_hit(mx, my)
+                                    && topmost_window_id_at(d, mx, my) == Some(w.id))
                                 .map(|w| (w.id, w.app_kind, w.x, w.y, w.w, w.h))
                         } else {
                             let wid = *TEXT_DRAG_WIN.lock();
@@ -700,36 +729,47 @@ fn task_blink() -> ! {
 
         // HepFS window: navigate directories and open files on click.
         // Any Files window can be clicked (not just id=1) — each has its own
-        // independent navigator entry in HEPFS_NAVS.
+        // independent navigator entry in HEPFS_NAVS, shared by both panes
+        // (see render_hepfs_window: left = directories-only, right = full
+        // listing — both views of the *same* current directory).
+        //
+        // Z-order note: this only fires if the topmost thing under the
+        // cursor is actually this Files window's own chrome/content — a
+        // window of any *other* kind stacked on top (e.g. its close button
+        // visually overlapping the Files window underneath) must win the
+        // click instead of leaking through to Files-window navigation. See
+        // `topmost_window_id_at()`.
         if fresh_click {
-            // Determine which Files window (if any) and where within it was clicked
             let hepfs_click = {
                 let dt = desktop::DESKTOP.lock();
                 dt.as_ref().and_then(|d| {
-                    let win = d.windows.iter().rev().find(|w| {
+                    let win = d.windows.iter().find(|w| {
                         w.app_kind == desktop::AppKind::Files && !w.minimized
                             && mx >= w.x && mx < w.x + w.w as i32
                             && my >= w.y && my < w.y + w.h as i32
                     })?;
+                    if topmost_window_id_at(d, mx, my) != Some(win.id) { return None; }
                     let win_id = win.id;
                     let rel_x = (mx - win.x) as usize;
                     let rel_y = my - win.y;
                     if rel_y < 22 {
-                        // Nav bar: back=0, fwd=1, none=2
-                        let zone = if rel_x < 22 { 0usize }
-                                   else if rel_x < 44 { 1 }
-                                   else { 2 };
-                        Some((win_id, 0i32, zone)) // sentinel 0 = nav bar
+                        // Nav bar: back=0, fwd=1, other=2
+                        let zone = if rel_x < 22 { 0u8 } else if rel_x < 44 { 1 } else { 2 };
+                        Some((win_id, zone, 0usize))
                     } else {
-                        // File list (entries start at row y=23)
+                        let left_w = (win.w * HEPFS_TREE_W_NUM) / HEPFS_TREE_W_DEN;
                         let entry_idx = (rel_y - 23).max(0) as usize / 14;
-                        Some((win_id, 1, entry_idx))
+                        if rel_x <= left_w {
+                            Some((win_id, 3u8, entry_idx)) // left pane: directories only
+                        } else {
+                            Some((win_id, 4u8, entry_idx)) // right pane: full listing
+                        }
                     }
                 })
             };
 
             match hepfs_click {
-                Some((win_id, 0, 0)) => {
+                Some((win_id, 0, _)) => {
                     // Back button
                     let mut navs = HEPFS_NAVS.lock();
                     if let Some((_, nav)) = navs.iter_mut().find(|(id, _)| *id == win_id) {
@@ -745,7 +785,7 @@ fn task_blink() -> ! {
                     let mut dt = desktop::DESKTOP.lock();
                     if let Some(dt) = dt.as_mut() { dt.dirty = true; }
                 }
-                Some((win_id, 0, 1)) => {
+                Some((win_id, 1, _)) => {
                     // Forward button
                     let mut navs = HEPFS_NAVS.lock();
                     if let Some((_, nav)) = navs.iter_mut().find(|(id, _)| *id == win_id) {
@@ -761,16 +801,15 @@ fn task_blink() -> ! {
                     let mut dt = desktop::DESKTOP.lock();
                     if let Some(dt) = dt.as_mut() { dt.dirty = true; }
                 }
-                Some((win_id, 1, idx)) => {
-                    // File list entry click
+                Some((win_id, pane @ (3 | 4), idx)) => {
+                    // Directory-tree (pane==3) or full-listing (pane==4) entry click.
                     let cur_ino = HEPFS_NAVS.lock().iter()
                         .find(|(id, _)| *id == win_id).map(|(_, n)| n.ino)
                         .unwrap_or(hepfs::ROOT_INO);
                     let at_root = cur_ino == hepfs::ROOT_INO;
 
-                    // ".." row (only shown when not at root)
+                    // ".." row (only shown when not at root) — same on both panes
                     if !at_root && idx == 0 {
-                        // Navigate up: back button behaviour
                         let mut navs = HEPFS_NAVS.lock();
                         if let Some((_, nav)) = navs.iter_mut().find(|(id, _)| *id == win_id) {
                             if let Some((pino, ppath)) = nav.back.pop() {
@@ -785,16 +824,23 @@ fn task_blink() -> ! {
                         let mut dt = desktop::DESKTOP.lock();
                         if let Some(dt) = dt.as_mut() { dt.dirty = true; }
                     } else {
-                        // Real entry index (subtract 1 if ".." row is shown)
                         let real_idx = if !at_root { idx.saturating_sub(1) } else { idx };
+                        // Left pane (3) only lists directories; right pane (4) lists everything.
                         let entry = {
                             let mut ctrl = nvme::CONTROLLER.lock();
                             ctrl.as_mut().and_then(|ctrl| {
                                 let entries = hepfs::list_dir(ctrl, cur_ino);
-                                entries.get(real_idx).map(|(ino, name)| {
-                                    let inode = hepfs::read_inode(ctrl, *ino);
-                                    (*ino, name.clone(), inode.flags)
-                                })
+                                if pane == 3 {
+                                    entries.iter()
+                                        .filter(|(ino, _)| hepfs::read_inode(ctrl, *ino).flags == hepfs::F_DIR)
+                                        .nth(real_idx)
+                                        .map(|(ino, name)| (*ino, name.clone(), hepfs::F_DIR))
+                                } else {
+                                    entries.get(real_idx).map(|(ino, name)| {
+                                        let inode = hepfs::read_inode(ctrl, *ino);
+                                        (*ino, name.clone(), inode.flags)
+                                    })
+                                }
                             })
                         };
                         if let Some((ino, name, flags)) = entry {
@@ -818,6 +864,7 @@ fn task_blink() -> ! {
                                 if let Some(dt) = dt.as_mut() { dt.dirty = true; }
                             } else {
                                 // Open file in editor, or in the image viewer for .bmp
+                                // (only reachable from the right/full-listing pane)
                                 let cur_path = HEPFS_NAVS.lock().iter()
                                     .find(|(id, _)| *id == win_id).map(|(_, n)| n.path.clone())
                                     .unwrap_or_else(|| alloc::string::String::from("/"));
@@ -870,7 +917,15 @@ fn task_blink() -> ! {
                     Some(((mx - win.x) as usize, (my - win.y) as usize))
                 })
             };
-            let action = if fresh_click {
+            // Only act if the Settings window is actually topmost at (mx, my)
+            // — otherwise a click meant for some other window stacked on top
+            // (e.g. its close button visually overlapping Settings) would
+            // leak through as a stray sidebar/slider click underneath.
+            let settings_is_topmost = {
+                let dt = desktop::DESKTOP.lock();
+                dt.as_ref().map(|d| topmost_window_id_at(d, mx, my) == Some(5)).unwrap_or(false)
+            };
+            let action = if fresh_click && settings_is_topmost {
                 win_rel.and_then(|(rel_x, rel_y)| {
                     if rel_x < 110 {
                         let row = (rel_y.saturating_sub(SETTINGS_SIDEBAR_TOP)) / SETTINGS_SIDEBAR_ROW_H;
@@ -1241,20 +1296,32 @@ fn spawn_stateless_window(kind: desktop::AppKind, title: &str, w: usize, h: usiz
     }
 }
 
+/// Two-pane file manager (Norton-Commander-style): splits the window into a
+/// left and right half, each an independent `HepfsNav`, separated by a 1px
+/// divider. The active pane (last one clicked) gets a highlighted top border.
+/// Left-pane width as a fraction of the window — narrower than the right,
+/// since it only ever shows directory names (no sizes).
+const HEPFS_TREE_W_NUM: usize = 35;
+const HEPFS_TREE_W_DEN: usize = 100;
+
+/// Two-pane file manager: a single shared nav bar (back/forward/path) across
+/// the top, then a directories-only list on the left (a lightweight
+/// current-directory "tree") and the full listing (directories + files) on
+/// the right — both views of the *same* current directory, not independent
+/// browsers. Clicking a directory in either pane navigates both.
 fn render_hepfs_window(display: &mut framebuffer::Display, wx: usize, wy: usize, ww: usize, wh: usize, win_id: usize) {
-    let bg   = framebuffer::Color::from_hex(0x0C0C0C);
-    let acc  = framebuffer::Color::from_hex(0x6C8EFF);
-    let text = framebuffer::Color::from_hex(0xE8E8E8);
-    let dim  = framebuffer::Color::from_hex(0x888888);
+    let bg       = framebuffer::Color::from_hex(0x0C0C0C);
+    let text     = framebuffer::Color::from_hex(0xE8E8E8);
+    let dim      = framebuffer::Color::from_hex(0x888888);
+    let acc      = framebuffer::Color::from_hex(0x6C8EFF);
     let nav_bg   = framebuffer::Color::from_hex(0x0F0F1A);
     let btn_bg   = framebuffer::Color::from_hex(0x1A1A30);
     let path_bg  = framebuffer::Color::from_hex(0x0D0D18);
     let dir_col  = framebuffer::Color::from_hex(0x88AAFF);
 
-    // Background
     display.fill_rect(wx, wy, ww, wh, bg);
 
-    // ── Nav bar (22px tall) ──────────────────────────────────────────────────
+    // ── Nav bar (22px tall, full width, shared by both panes) ────────────────
     let nav_h: usize = 22;
     display.fill_rect(wx, wy, ww, nav_h, nav_bg);
 
@@ -1268,61 +1335,80 @@ fn render_hepfs_window(display: &mut framebuffer::Display, wx: usize, wy: usize,
 
     // Back button
     display.fill_rect(wx + 2, wy + 4, 18, 14, btn_bg);
-    display.draw_text(wx + 6,  wy + 6, "<",
-        if has_back { acc } else { dim }, 1);
+    display.draw_text(wx + 6,  wy + 6, "<", if has_back { acc } else { dim }, 1);
 
     // Forward button
     display.fill_rect(wx + 22, wy + 4, 18, 14, btn_bg);
-    display.draw_text(wx + 27, wy + 6, ">",
-        if has_fwd { acc } else { dim }, 1);
+    display.draw_text(wx + 27, wy + 6, ">", if has_fwd { acc } else { dim }, 1);
 
     // Path bar
     let path_x = wx + 44;
     let path_w = ww.saturating_sub(46);
     display.fill_rect(path_x, wy + 4, path_w, 14, path_bg);
-    // Trim path if too long for the bar
     let max_chars = path_w / 9;
     let display_path = if cur_path.len() > max_chars && max_chars > 0 {
         &cur_path[cur_path.len() - max_chars..]
     } else { &cur_path };
     display.draw_text(path_x + 2, wy + 6, display_path, text, 1);
 
-    // Separator
+    // Separator under the nav bar
     display.fill_rect(wx, wy + nav_h, ww, 1, acc);
 
-    // ── File list ────────────────────────────────────────────────────────────
+    // ── Two panes below the nav bar ───────────────────────────────────────────
     let list_top = wy + nav_h + 1;
-    let at_root  = cur_ino == hepfs::ROOT_INO;
-    let mut y = list_top + 2;
+    let list_h   = wh.saturating_sub(nav_h + 1);
+    let left_w   = (ww * HEPFS_TREE_W_NUM) / HEPFS_TREE_W_DEN;
+    let right_w  = ww.saturating_sub(left_w + 1);
+    let right_x  = wx + left_w + 1;
+    display.fill_rect(wx + left_w, list_top, 1, list_h, acc);
 
-    // ".." entry when not at root
-    if !at_root {
-        display.draw_text(wx + 4,  y, "d", dim, 1);
-        display.draw_text(wx + 16, y, "..", dir_col, 1);
-        y += 14;
-    }
-
+    let at_root = cur_ino == hepfs::ROOT_INO;
     let mut ctrl = nvme::CONTROLLER.lock();
     if let Some(ctrl) = ctrl.as_mut() {
         let entries = hepfs::list_dir(ctrl, cur_ino);
+        let dirs: alloc::vec::Vec<_> = entries.iter()
+            .filter(|(ino, _)| hepfs::read_inode(ctrl, *ino).flags == hepfs::F_DIR)
+            .collect();
+
+        // Left pane: directories only (current directory's one-level "tree")
+        let mut y = list_top + 2;
+        if !at_root {
+            display.draw_text(wx + 4, y, "..", dir_col, 1);
+            y += 14;
+        }
+        for (_, name) in &dirs {
+            if y + 12 > list_top + list_h { break; }
+            display.draw_text(wx + 4, y, name, dir_col, 1);
+            y += 14;
+        }
+        if dirs.is_empty() && at_root {
+            display.draw_text(wx + 4, list_top + 4, "(no folders)", dim, 1);
+        }
+
+        // Right pane: full listing (directories + files), with sizes
+        let mut y = list_top + 2;
+        if !at_root {
+            display.draw_text(right_x + 4,  y, "d", dim, 1);
+            display.draw_text(right_x + 16, y, "..", dir_col, 1);
+            y += 14;
+        }
         for (ino, name) in &entries {
-            if y + 12 > wy + wh { break; }
+            if y + 12 > list_top + list_h { break; }
             let inode = hepfs::read_inode(ctrl, *ino);
             let is_dir = inode.flags == hepfs::F_DIR;
             let (pfx, col) = if is_dir { ("d", dir_col) } else { ("f", text) };
-            display.draw_text(wx + 4,  y, pfx, dim, 1);
-            display.draw_text(wx + 16, y, name, col, 1);
-            // File size on right
+            display.draw_text(right_x + 4,  y, pfx, dim, 1);
+            display.draw_text(right_x + 16, y, name, col, 1);
             if !is_dir {
                 let sz = fmt_size(inode.size);
                 let chars = sz.iter().position(|&b| b == 0).unwrap_or(sz.len());
-                let sx = wx + ww.saturating_sub(chars * 9 + 4);
+                let sx = right_x + right_w.saturating_sub(chars * 9 + 4);
                 display.draw_text(sx, y, core::str::from_utf8(&sz[..chars]).unwrap_or(""), dim, 1);
             }
             y += 14;
         }
         if entries.is_empty() && at_root {
-            display.draw_text(wx + 4, list_top + 4, "(empty)", dim, 1);
+            display.draw_text(right_x + 4, list_top + 4, "(empty)", dim, 1);
         }
     } else {
         display.draw_text(wx + 4, list_top + 4, "No NVMe", dim, 1);
