@@ -262,6 +262,7 @@ All windows:
 - **Right-click** a taskbar button or a Start Menu row → "New Window" (spawns another instance of that program; not offered for Files)
 - **Clock** (far right): live RTC time
 - **Shutdown ("P") / Restart ("R") buttons**, top-right of the Start Menu's header — same "colored square + single letter" style as a window's close/minimize/maximize buttons. Call `acpi::shutdown()`/`acpi::reboot()` directly (the same functions the terminal's `shutdown`/`reboot` commands use). Hit-testing (`Desktop::menu_btn_hit()`) is checked before the program-row click logic, since row 0's click band overlaps the header's y-range and would otherwise swallow these clicks. Verified with a temporary boot-time test of the hit-test geometry only (button centers hit, buttons don't overlap each other, clicking the "Programs" label misses both) — deliberately not exercised through the real click path, since that would trigger the actual (diverging) shutdown/reboot calls.
+- **Volume widget**: a small 3-bar speaker icon just left of the clock (taskbar's reserved right-side zone widened from 80px to `VOL_RESERVED_W = 110` to fit both). Click toggles a slider popup above the taskbar (`Desktop::draw_volume_popup()`), same visual style as the taskbar jump list; click/drag on the slider calls `hda::set_volume()`/`get_volume()` directly (separate consts from `main.rs`'s `VOL_SLIDER_*`, which size the Settings page's own slider in a window's content area). Bars dim when volume is 0. Click-outside closes the popup, except a click back on the icon itself (which falls through to the toggle instead of close-then-reopen). Drag state (`Desktop::volume_drag`) is tracked the same way window-resize/drag is, so moving the mouse off the slider's y-range mid-drag still keeps scrubbing.
 
 ---
 
@@ -578,8 +579,7 @@ Completed items are removed once done — see the "Original Design Plan vs. Curr
 6. **RTL8169 / real hardware NIC** — for running on physical machines (untestable in this QEMU-only dev environment).
 7. **QEMU cursor on window resize** — `zoom-to-fit` not available on this QEMU/Windows build; known SDL limitation, not a HepOS bug, no fix available from our side.
 8. **Settings: resolution control** — Settings app has wallpaper + volume pages, no resolution control. Likely infeasible as a *live* control without bootloader-level GOP mode-selection UI, since HepBL picks the display mode once at boot, before the kernel (or Settings) ever runs — would need HepBL itself to offer a mode picker pre-ExitBootServices.
-9. **Taskbar volume control widget** — volume control exists (Settings "Sound" page, `volume` terminal command) but isn't a widget directly on the taskbar the way the original design pictured it. Minor polish.
-10. **Per-widget dirty-rect tracking** — current two-tier scheme (full-scene redraw vs. ~20-row cursor-only partial flush) achieves the same practical goal as literal per-widget dirty rects but isn't the same mechanism. Minor polish, not blocking anything.
+9. **Per-widget dirty-rect tracking** — current two-tier scheme (full-scene redraw vs. ~20-row cursor-only partial flush) achieves the same practical goal as literal per-widget dirty rects but isn't the same mechanism. Minor polish, not blocking anything.
 
 ---
 

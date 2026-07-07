@@ -105,6 +105,29 @@ const MENU_BTN_Y:    usize = 2; // relative to the menu's own top edge
 const MENU_SHUTDOWN_X: usize = MENU_W - MENU_BTN_SIZE - 4;
 const MENU_RESTART_X:  usize = MENU_SHUTDOWN_X - MENU_BTN_SIZE - 4;
 
+// Taskbar volume widget — a small speaker icon right before the clock, and
+// the slider popup it opens above the taskbar when clicked. Kept separate
+// from main.rs's own VOL_SLIDER_* consts (those size the Settings page's
+// slider, which lives in a window's content area, not the taskbar).
+const VOL_ICON_W:      usize = 24;
+const VOL_RESERVED_W:  usize = 110; // right-side zone reserved from window buttons: icon + clock
+const VOL_POPUP_W:     usize = 140;
+const VOL_POPUP_H:     usize = 50;
+const VOL_POPUP_PAD:   usize = 12;
+const VOL_POPUP_SLIDER_Y: usize = 28;
+const VOL_POPUP_SLIDER_W: usize = VOL_POPUP_W - VOL_POPUP_PAD * 2;
+const VOL_POPUP_SLIDER_H: usize = 8;
+
+fn vol_icon_rect(fb_w: usize, ty: usize) -> (usize, usize, usize, usize) {
+    (fb_w.saturating_sub(VOL_RESERVED_W), ty + 4, VOL_ICON_W, TASKBAR_H - 8)
+}
+
+fn vol_popup_rect(fb_w: usize, ty: usize) -> (usize, usize, usize, usize) {
+    let (ix, _, iw, _) = vol_icon_rect(fb_w, ty);
+    let px = (ix + iw / 2).saturating_sub(VOL_POPUP_W / 2).min(fb_w.saturating_sub(VOL_POPUP_W));
+    (px, ty.saturating_sub(VOL_POPUP_H), VOL_POPUP_W, VOL_POPUP_H)
+}
+
 /// (rel_x, rel_y) are mouse coordinates relative to the menu's own top-left
 /// corner. Split out from `update_mouse()` so it's testable without
 /// triggering the (diverging) `acpi::shutdown()`/`reboot()` calls it gates.
@@ -424,6 +447,13 @@ pub struct Desktop {
     /// right-click menu — (window id, is_paste). Consumed by main.rs, which
     /// routes it to the right Editor/Terminal instance.
     pub clipboard_action_requested: Option<(usize, bool)>,
+    /// True while the taskbar's volume popup (opened by clicking the volume
+    /// icon) is showing.
+    pub volume_popup_open: bool,
+    /// True while the popup's slider is being click-dragged — lets the drag
+    /// keep scrubbing volume even if the cursor moves off the slider's y-range,
+    /// same held/fresh_click pattern used elsewhere (e.g. Settings' own slider).
+    volume_drag: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -441,6 +471,8 @@ impl Desktop {
             open_settings_requested: false, new_window_requested: None,
             taskbar_jumplist: None,
             clipboard_action_requested: None,
+            volume_popup_open: false,
+            volume_drag: false,
         }
     }
 
@@ -652,7 +684,18 @@ impl Desktop {
                 }
             }
         }
+        if held && self.volume_drag {
+            let ty = self.fb_h - TASKBAR_H;
+            let (px, _, pw, _) = vol_popup_rect(self.fb_w, ty);
+            let sx = px + VOL_POPUP_PAD;
+            let frac = (mx - sx as i32) as f32 / VOL_POPUP_SLIDER_W as f32;
+            crate::hda::set_volume((frac.clamp(0.0, 1.0) * 100.0) as u8);
+            let _ = pw;
+            self.dirty = true;
+            return false;
+        }
         if released {
+            self.volume_drag = false;
             // Apply snap if a window was being dragged into a snap zone
             if let Some(zone) = self.snap_zone.take() {
                 if let Some(fid) = self.focused {
@@ -776,6 +819,39 @@ impl Desktop {
             jumplist_just_closed_for = Some(jl_kind);
         }
 
+        // Left-click while the volume popup is open: hit the slider to set/drag
+        // volume, or close it on an outside click (falls through so the same
+        // click can still register normally, same pattern as the jump list above).
+        if self.volume_popup_open {
+            let ty = self.fb_h - TASKBAR_H;
+            let (px, py, pw, ph) = vol_popup_rect(self.fb_w, ty);
+            let in_popup = mx >= px as i32 && mx < (px + pw) as i32
+                && my >= py as i32 && my < (py + ph) as i32;
+            if in_popup {
+                let sx = px + VOL_POPUP_PAD;
+                let sy = py + VOL_POPUP_SLIDER_Y;
+                if my >= sy as i32 - 4 && my < (sy + VOL_POPUP_SLIDER_H) as i32 + 4 {
+                    let frac = (mx - sx as i32) as f32 / VOL_POPUP_SLIDER_W as f32;
+                    crate::hda::set_volume((frac.clamp(0.0, 1.0) * 100.0) as u8);
+                    self.volume_drag = true;
+                    self.dirty = true;
+                }
+                return false;
+            } else {
+                let ty = self.fb_h - TASKBAR_H;
+                let (vix, viy, viw, vih) = vol_icon_rect(self.fb_w, ty);
+                let on_icon = mx >= vix as i32 && mx < (vix + viw) as i32
+                    && my >= viy as i32 && my < (viy + vih) as i32;
+                // Let a click on the icon itself fall through to the toggle
+                // below instead of closing here — otherwise close-then-reopen
+                // would make the icon incapable of ever closing its own popup.
+                if !on_icon {
+                    self.volume_popup_open = false;
+                    self.dirty = true;
+                }
+            }
+        }
+
         // Double-click tracking: clear pending unless we land on the same title bar again
         let prev_dbl = self.dbl_click_pending.take();
 
@@ -824,9 +900,16 @@ impl Desktop {
 
         // Taskbar click
         if in_taskbar {
+            let (vix, viy, viw, vih) = vol_icon_rect(self.fb_w, self.fb_h - TASKBAR_H);
+            let on_vol_icon = mx >= vix as i32 && mx < (vix + viw) as i32
+                && my >= viy as i32 && my < (viy + vih) as i32;
             if (mx as usize) < START_W {
                 // Start button
                 if self.start_menu_open { self.close_start_menu(); } else { self.open_start_menu(); }
+                self.dirty = true;
+            } else if on_vol_icon {
+                self.close_start_menu();
+                self.volume_popup_open = !self.volume_popup_open;
                 self.dirty = true;
             } else {
                 // Window button — grouped by app kind; a group with >1 window opens
@@ -1187,7 +1270,7 @@ impl Desktop {
         // dimmed since nothing of that kind is visible right now.
         let mut bx = START_W + 4;
         for (kind, ids) in self.grouped_taskbar_entries() {
-            if bx + TASK_BTN_W > self.fb_w - 80 { break; }
+            if bx + TASK_BTN_W > self.fb_w.saturating_sub(VOL_RESERVED_W) { break; }
             let open_count = ids.iter().filter(|&&id| self.windows.iter().any(|w| w.id == id && !w.minimized)).count();
             let active = open_count > 0 && (ids.len() == 1 && self.focused == Some(ids[0])
                 || (ids.len() > 1 && ids.iter().any(|&i| self.focused == Some(i))));
@@ -1210,11 +1293,45 @@ impl Desktop {
             bx += TASK_BTN_W;
         }
 
+        // Volume icon — 3 bars of increasing height, like a signal-strength icon.
+        let (vix, viy, viw, vih) = vol_icon_rect(self.fb_w, ty);
+        let vc = if self.volume_popup_open { pal::TASKBAR_ACT } else { pal::TASKBAR };
+        display.fill_rect(vix, ty + 4, viw, TASKBAR_H - 8, vc);
+        let muted = crate::hda::get_volume() == 0;
+        let bar_col = if muted { pal::TEXT_DIM } else { pal::ACCENT };
+        let bars_x = vix + 6;
+        let base_y = viy + vih;
+        for (i, bh) in [4usize, 8, 12].iter().enumerate() {
+            let bw = 3;
+            let bx2 = bars_x + i * (bw + 2);
+            display.fill_rect(bx2, base_y.saturating_sub(*bh), bw, *bh, bar_col);
+        }
+
         // Clock (right-aligned)
         let mut tbuf = [0u8; 6];
         let time = crate::rtc::fmt_time(&mut tbuf);
         let tw   = time.len() * 9;
         display.draw_text(self.fb_w.saturating_sub(tw + 8), ty + 10, time, pal::TEXT, 1);
+    }
+
+    /// Draw the volume slider popup — opens above the taskbar when the
+    /// volume icon is clicked, same visual style as the jump-list popup.
+    pub fn draw_volume_popup(&self, display: &mut Display) {
+        if !self.volume_popup_open { return; }
+        let ty = self.fb_h - TASKBAR_H;
+        let (px, py, pw, ph) = vol_popup_rect(self.fb_w, ty);
+        display.fill_rect(px, py, pw, ph, pal::TASKBAR_BTN);
+        display.fill_rect(px, py, pw, 1, pal::BORDER);
+        display.draw_text(px + VOL_POPUP_PAD, py + 6, "Volume", pal::TEXT, 1);
+
+        let vol = crate::hda::get_volume();
+        let sx = px + VOL_POPUP_PAD;
+        let sy = py + VOL_POPUP_SLIDER_Y;
+        display.fill_rect(sx, sy, VOL_POPUP_SLIDER_W, VOL_POPUP_SLIDER_H, Color::from_hex(0x222244));
+        let fill_w = (VOL_POPUP_SLIDER_W * vol as usize) / 100;
+        if fill_w > 0 { display.fill_rect(sx, sy, fill_w, VOL_POPUP_SLIDER_H, pal::ACCENT); }
+        let hx = sx + fill_w.min(VOL_POPUP_SLIDER_W.saturating_sub(4));
+        display.fill_rect(hx, sy.saturating_sub(2), 4, VOL_POPUP_SLIDER_H + 4, Color::from_hex(0xFFFFFF));
     }
 
     /// Draw the jump-list popup (opens above the taskbar when a grouped button

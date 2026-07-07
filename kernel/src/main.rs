@@ -1274,6 +1274,8 @@ fn task_blink() -> ! {
                 { let dt = desktop::DESKTOP.lock();
                   if let Some(dt) = dt.as_ref() { dt.draw_taskbar_jumplist(display); } }
                 { let dt = desktop::DESKTOP.lock();
+                  if let Some(dt) = dt.as_ref() { dt.draw_volume_popup(display); } }
+                { let dt = desktop::DESKTOP.lock();
                   if let Some(dt) = dt.as_ref() { dt.draw_context_menu(display); } }
 
                 // 4. Save scene (no cursor yet) so cursor-only path can erase later
