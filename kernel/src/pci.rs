@@ -32,6 +32,11 @@ pub fn config_read16(bus: u8, dev: u8, func: u8, offset: u8) -> u16 {
     (v >> ((offset & 2) * 8)) as u16
 }
 
+pub fn config_read8(bus: u8, dev: u8, func: u8, offset: u8) -> u8 {
+    let v = config_read32(bus, dev, func, offset & !3);
+    (v >> ((offset & 3) * 8)) as u8
+}
+
 pub fn config_write32(bus: u8, dev: u8, func: u8, offset: u8, val: u32) {
     outl(PCI_ADDR, config_addr(bus, dev, func, offset));
     outl(PCI_DATA, val);

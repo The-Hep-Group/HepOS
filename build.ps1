@@ -78,6 +78,7 @@ $qemu = "C:\Program Files\qemu\qemu-system-x86_64.exe"
     -device ahci,id=ahci0 `
     -drive file=$sata_disk,if=none,id=sata0,format=raw `
     -device ide-hd,drive=sata0,bus=ahci0.0 `
+    -device virtio-gpu-pci `
     -netdev user,id=net0 `
     -device rtl8139,netdev=net0 `
     -device intel-hda `

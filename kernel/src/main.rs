@@ -15,6 +15,7 @@ mod net;
 mod rtc;
 mod rtl8139;
 mod virtio_net;
+mod virtio_gpu;
 mod xhci;
 mod desktop;
 mod framebuffer;
@@ -370,6 +371,10 @@ extern "C" fn kmain(bi_ptr: *const bootinfo::BootInfo) -> ! {
     // AHCI/SATA — not yet mounted by HepFS (NVMe-only today), but the driver
     // itself (detect, port init, IDENTIFY, read/write) is up and usable.
     ahci::init(&pci_devices);
+
+    // virtio-gpu — independent of the real GOP boot display; not wired into
+    // the actual render path yet, see virtio_gpu.rs's module doc.
+    virtio_gpu::init(&pci_devices);
 
     // Intel HDA audio
     hda::init(&pci_devices);
