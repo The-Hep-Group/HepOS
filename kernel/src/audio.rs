@@ -85,6 +85,7 @@ fn play_inner(path: &str) -> PlayResult {
     let content = {
         let mut ctrl = crate::nvme::CONTROLLER.lock();
         if let Some(ctrl) = ctrl.as_mut() {
+            let ctrl = &mut crate::hepfs::BlockDev::Nvme(ctrl);
             match crate::hepfs::lookup(ctrl, path) {
                 Some(ino) => crate::hepfs::read_file(ctrl, ino),
                 None => return PlayResult {

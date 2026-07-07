@@ -1284,10 +1284,14 @@ impl Terminal {
         }
     }
 
-    /// Run a closure with the global NVMe controller locked.
-    fn with_ctrl<T, F: FnOnce(&mut crate::nvme::NvmeController) -> T>(&self, f: F) -> T {
+    /// Run a closure with the mounted HepFS block device locked (NVMe today —
+    /// see `hepfs::BlockDev`; this is the one place that decides which
+    /// backend HepFS is running on, so every `with_ctrl` call site below
+    /// stays backend-agnostic for free).
+    fn with_ctrl<T, F: FnOnce(&mut crate::hepfs::BlockDev) -> T>(&self, f: F) -> T {
         let mut guard = crate::nvme::CONTROLLER.lock();
-        f(guard.as_mut().expect("no NVMe controller"))
+        let ctrl = guard.as_mut().expect("no NVMe controller");
+        f(&mut crate::hepfs::BlockDev::Nvme(ctrl))
     }
 
     fn print_u64(&mut self, mut n: u64) {

@@ -308,26 +308,27 @@ extern "C" fn kmain(bi_ptr: *const bootinfo::BootInfo) -> ! {
         serial::print(if ok { "NVMe R/W OK\n" } else { "NVMe R/W FAIL\n" });
 
         // HepFS
-        if !hepfs::probe(&mut ctrl) {
+        let mut dev = hepfs::BlockDev::Nvme(&mut ctrl);
+        if !hepfs::probe(&mut dev) {
             serial::print("Formatting HepFS...\n");
-            hepfs::format(&mut ctrl);
+            hepfs::format(&mut dev);
             serial::print("HepFS formatted\n");
         } else {
             serial::print("HepFS found\n");
         }
 
         // Smoke test: create dirs + file, write, read back
-        hepfs::create_dir(&mut ctrl, hepfs::ROOT_INO, "home");
-        hepfs::create_dir(&mut ctrl, hepfs::ROOT_INO, "etc");
-        let home = hepfs::lookup(&mut ctrl, "/home").unwrap();
-        let fno  = hepfs::create_file(&mut ctrl, home, "hello.txt");
-        hepfs::write_file(&mut ctrl, fno, b"Hello from HepOS!\n");
-        let data = hepfs::read_file(&mut ctrl, fno);
+        hepfs::create_dir(&mut dev, hepfs::ROOT_INO, "home");
+        hepfs::create_dir(&mut dev, hepfs::ROOT_INO, "etc");
+        let home = hepfs::lookup(&mut dev, "/home").unwrap();
+        let fno  = hepfs::create_file(&mut dev, home, "hello.txt");
+        hepfs::write_file(&mut dev, fno, b"Hello from HepOS!\n");
+        let data = hepfs::read_file(&mut dev, fno);
         let s    = core::str::from_utf8(&data).unwrap_or("?");
         serial::print("Read back: ");
         serial::print(s);
 
-        let entries = hepfs::list_dir(&mut ctrl, hepfs::ROOT_INO);
+        let entries = hepfs::list_dir(&mut dev, hepfs::ROOT_INO);
         serial::print("/ contents:\n");
         for (_, name) in &entries { serial::print("  "); serial::print(name); serial::print("\n"); }
 
@@ -338,6 +339,7 @@ extern "C" fn kmain(bi_ptr: *const bootinfo::BootInfo) -> ! {
         {
             let mut c = nvme::CONTROLLER.lock();
             if let Some(ctrl) = c.as_mut() {
+                let ctrl = &mut hepfs::BlockDev::Nvme(ctrl);
                 if hepfs::lookup(ctrl, "/kernel.txt").is_none() {
                     let ino = hepfs::create_file(ctrl, hepfs::ROOT_INO, "kernel.txt");
                     let mut db = [0u8; 11];
@@ -834,6 +836,7 @@ fn task_blink() -> ! {
                         let entry = {
                             let mut ctrl = nvme::CONTROLLER.lock();
                             ctrl.as_mut().and_then(|ctrl| {
+                                let ctrl = &mut hepfs::BlockDev::Nvme(ctrl);
                                 let entries = hepfs::list_dir(ctrl, cur_ino);
                                 if pane == 3 {
                                     entries.iter()
@@ -1370,6 +1373,7 @@ fn render_hepfs_window(display: &mut framebuffer::Display, wx: usize, wy: usize,
     let at_root = cur_ino == hepfs::ROOT_INO;
     let mut ctrl = nvme::CONTROLLER.lock();
     if let Some(ctrl) = ctrl.as_mut() {
+        let ctrl = &mut hepfs::BlockDev::Nvme(ctrl);
         let entries = hepfs::list_dir(ctrl, cur_ino);
         let dirs: alloc::vec::Vec<_> = entries.iter()
             .filter(|(ino, _)| hepfs::read_inode(ctrl, *ino).flags == hepfs::F_DIR)

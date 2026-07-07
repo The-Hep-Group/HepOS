@@ -11,7 +11,46 @@
 //!              = 48 KB + 4 MB + 4 GB ≈ 4 GB (bounded in practice by disk capacity)
 
 use alloc::{string::String, vec::Vec};
-use crate::{nvme::NvmeController, pmm, vmm};
+use crate::{ahci, nvme::NvmeController, pmm, vmm};
+
+/// Block-device backend HepFS is mounted on — NVMe (the only one actually
+/// wired up to mount/format/boot logic today) or AHCI/SATA (driver exists
+/// and is verified standalone, see `ahci.rs`, but nothing mounts HepFS on it
+/// yet — this enum is what makes that possible once something does).
+/// AHCI has no explicit controller handle to carry (its API is free
+/// functions against a global static, unlike NVMe's `&mut NvmeController`),
+/// so this doesn't need a lifetime for that variant.
+pub enum BlockDev<'a> {
+    Nvme(&'a mut NvmeController),
+    Ahci,
+}
+
+impl<'a> BlockDev<'a> {
+    fn lba_size(&self) -> u32 {
+        match self {
+            BlockDev::Nvme(c) => c.lba_size,
+            BlockDev::Ahci => 512,
+        }
+    }
+    fn lba_count(&self) -> u64 {
+        match self {
+            BlockDev::Nvme(c) => c.lba_count,
+            BlockDev::Ahci => ahci::CONTROLLER.lock().as_ref().map(|c| c.sectors).unwrap_or(0),
+        }
+    }
+    fn read_blocks(&mut self, lba: u64, count: u16, buf_phys: u64) {
+        match self {
+            BlockDev::Nvme(c) => c.read_blocks(lba, count, buf_phys),
+            BlockDev::Ahci => { ahci::read_sectors(lba, count, buf_phys); }
+        }
+    }
+    fn write_blocks(&mut self, lba: u64, count: u16, buf_phys: u64) {
+        match self {
+            BlockDev::Nvme(c) => c.write_blocks(lba, count, buf_phys),
+            BlockDev::Ahci => { ahci::write_sectors(lba, count, buf_phys); }
+        }
+    }
+}
 
 // ── Constants ────────────────────────────────────────────────────────────────
 pub const MAGIC:           u64   = 0x48657046_53000001; // "HepFS\0\0\1"
@@ -105,24 +144,24 @@ impl Page {
 }
 
 // ── Low-level block I/O ──────────────────────────────────────────────────────
-fn sectors_per_block(ctrl: &NvmeController) -> u16 {
-    (BLOCK_SIZE / ctrl.lba_size as usize) as u16
+fn sectors_per_block(ctrl: &BlockDev) -> u16 {
+    (BLOCK_SIZE / ctrl.lba_size() as usize) as u16
 }
 
-fn read_block(ctrl: &mut NvmeController, block: u64) -> Page {
+fn read_block(ctrl: &mut BlockDev, block: u64) -> Page {
     let page = Page::alloc();
     let spb  = sectors_per_block(ctrl);
     ctrl.read_blocks(block * spb as u64, spb, page.phys);
     page
 }
 
-fn write_block(ctrl: &mut NvmeController, block: u64, page: &Page) {
+fn write_block(ctrl: &mut BlockDev, block: u64, page: &Page) {
     let spb = sectors_per_block(ctrl);
     ctrl.write_blocks(block * spb as u64, spb, page.phys);
 }
 
 // ── Bitmap helpers ───────────────────────────────────────────────────────────
-fn bitmap_alloc(ctrl: &mut NvmeController, bm_start: u64, bm_len: u64, skip: u64) -> Option<u64> {
+fn bitmap_alloc(ctrl: &mut BlockDev, bm_start: u64, bm_len: u64, skip: u64) -> Option<u64> {
     for bi in 0..bm_len {
         let page = read_block(ctrl, bm_start + bi);
         let buf  = page.as_slice();
@@ -145,7 +184,7 @@ fn bitmap_alloc(ctrl: &mut NvmeController, bm_start: u64, bm_len: u64, skip: u64
     None
 }
 
-fn bitmap_set(ctrl: &mut NvmeController, bm_start: u64, idx: u64, used: bool) {
+fn bitmap_set(ctrl: &mut BlockDev, bm_start: u64, idx: u64, used: bool) {
     let block = bm_start + idx / (BLOCK_SIZE as u64 * 8);
     let byte  = (idx / 8) as usize % BLOCK_SIZE;
     let bit   = idx % 8;
@@ -156,14 +195,14 @@ fn bitmap_set(ctrl: &mut NvmeController, bm_start: u64, idx: u64, used: bool) {
 }
 
 // ── Inode I/O ────────────────────────────────────────────────────────────────
-pub fn read_inode(ctrl: &mut NvmeController, ino: u32) -> Inode {
+pub fn read_inode(ctrl: &mut BlockDev, ino: u32) -> Inode {
     let blk = INODE_TBL_BLOCK + (ino as u64 / INODES_PER_BLK as u64);
     let off = (ino as usize % INODES_PER_BLK) * 128;
     let page = read_block(ctrl, blk);
     unsafe { *(page.as_slice().as_ptr().add(off) as *const Inode) }
 }
 
-pub fn write_inode(ctrl: &mut NvmeController, ino: u32, inode: &Inode) {
+pub fn write_inode(ctrl: &mut BlockDev, ino: u32, inode: &Inode) {
     let blk  = INODE_TBL_BLOCK + (ino as u64 / INODES_PER_BLK as u64);
     let off  = (ino as usize % INODES_PER_BLK) * 128;
     let page = read_block(ctrl, blk);
@@ -172,14 +211,14 @@ pub fn write_inode(ctrl: &mut NvmeController, ino: u32, inode: &Inode) {
 }
 
 // ── Block allocation ──────────────────────────────────────────────────────────
-fn alloc_block(ctrl: &mut NvmeController) -> u32 {
+fn alloc_block(ctrl: &mut BlockDev) -> u32 {
     // skip the first DATA_BLOCK_START blocks (they are system blocks)
     let blk = bitmap_alloc(ctrl, BLOCK_BM_BLOCK, BLOCK_BM_LEN, DATA_BLOCK_START)
         .expect("hepfs: disk full");
     blk as u32
 }
 
-fn alloc_inode(ctrl: &mut NvmeController) -> u32 {
+fn alloc_inode(ctrl: &mut BlockDev) -> u32 {
     let ino = bitmap_alloc(ctrl, INODE_BM_BLOCK, 1, 0)
         .expect("hepfs: inode table full") as u32;
     assert!(ino < MAX_INODES, "hepfs: too many inodes");
@@ -189,8 +228,8 @@ fn alloc_inode(ctrl: &mut NvmeController) -> u32 {
 // ── Public API ───────────────────────────────────────────────────────────────
 
 /// Format a fresh filesystem onto the NVMe controller.
-pub fn format(ctrl: &mut NvmeController) {
-    let total_blocks = ctrl.lba_count * ctrl.lba_size as u64 / BLOCK_SIZE as u64;
+pub fn format(ctrl: &mut BlockDev) {
+    let total_blocks = ctrl.lba_count() * ctrl.lba_size() as u64 / BLOCK_SIZE as u64;
 
     // Write superblock
     let sb_page = Page::alloc();
@@ -236,14 +275,14 @@ pub fn format(ctrl: &mut NvmeController) {
 }
 
 /// Verify the magic number. Returns true if a valid HepFS is present.
-pub fn probe(ctrl: &mut NvmeController) -> bool {
+pub fn probe(ctrl: &mut BlockDev) -> bool {
     let page = read_block(ctrl, SB_BLOCK);
     let magic = unsafe { *(page.virt as *const u64) };
     magic == MAGIC
 }
 
 /// Resolve an absolute path like "/foo/bar" to an inode number.
-pub fn lookup(ctrl: &mut NvmeController, path: &str) -> Option<u32> {
+pub fn lookup(ctrl: &mut BlockDev, path: &str) -> Option<u32> {
     let mut ino = ROOT_INO;
     for part in path.split('/').filter(|s| !s.is_empty()) {
         ino = find_in_dir(ctrl, ino, part)?;
@@ -252,7 +291,7 @@ pub fn lookup(ctrl: &mut NvmeController, path: &str) -> Option<u32> {
 }
 
 /// List entries in a directory. Returns Vec of (inode, name).
-pub fn list_dir(ctrl: &mut NvmeController, dir_ino: u32) -> Vec<(u32, String)> {
+pub fn list_dir(ctrl: &mut BlockDev, dir_ino: u32) -> Vec<(u32, String)> {
     let inode = read_inode(ctrl, dir_ino);
     assert!(inode.flags == F_DIR, "not a directory");
     let mut out = Vec::new();
@@ -269,7 +308,7 @@ pub fn list_dir(ctrl: &mut NvmeController, dir_ino: u32) -> Vec<(u32, String)> {
     out
 }
 
-fn find_in_dir(ctrl: &mut NvmeController, dir_ino: u32, name: &str) -> Option<u32> {
+fn find_in_dir(ctrl: &mut BlockDev, dir_ino: u32, name: &str) -> Option<u32> {
     let inode = read_inode(ctrl, dir_ino);
     for &blk in inode.direct.iter().filter(|&&b| b != 0) {
         let page = read_block(ctrl, blk as u64);
@@ -284,7 +323,7 @@ fn find_in_dir(ctrl: &mut NvmeController, dir_ino: u32, name: &str) -> Option<u3
     None
 }
 
-fn add_dir_entry(ctrl: &mut NvmeController, dir_ino: u32, name: &str, ino: u32) {
+fn add_dir_entry(ctrl: &mut BlockDev, dir_ino: u32, name: &str, ino: u32) {
     let mut inode = read_inode(ctrl, dir_ino);
     let name_bytes = name.as_bytes();
     assert!(name_bytes.len() <= 27, "filename too long (max 27)");
@@ -318,7 +357,7 @@ fn add_dir_entry(ctrl: &mut NvmeController, dir_ino: u32, name: &str, ino: u32) 
 }
 
 /// Create a file inside parent directory. Returns the new inode number.
-pub fn create_file(ctrl: &mut NvmeController, parent: u32, name: &str) -> u32 {
+pub fn create_file(ctrl: &mut BlockDev, parent: u32, name: &str) -> u32 {
     let ino  = alloc_inode(ctrl);
     let inode = Inode { flags: F_FILE, ..Default::default() };
     write_inode(ctrl, ino, &inode);
@@ -327,7 +366,7 @@ pub fn create_file(ctrl: &mut NvmeController, parent: u32, name: &str) -> u32 {
 }
 
 /// Create a subdirectory inside parent directory. Returns the new inode number.
-pub fn create_dir(ctrl: &mut NvmeController, parent: u32, name: &str) -> u32 {
+pub fn create_dir(ctrl: &mut BlockDev, parent: u32, name: &str) -> u32 {
     let ino  = alloc_inode(ctrl);
     let blk  = alloc_block(ctrl);
     let inode = Inode { flags: F_DIR, nblocks: 1, direct: { let mut d = [0u32; 12]; d[0] = blk; d }, ..Default::default() };
@@ -341,7 +380,7 @@ pub fn create_dir(ctrl: &mut NvmeController, parent: u32, name: &str) -> u32 {
 
 /// Write data to a file (overwrites from offset 0).
 /// Max size: 12 direct blocks + 1024 indirect blocks = ~4.1 MB.
-pub fn write_file(ctrl: &mut NvmeController, ino: u32, data: &[u8]) {
+pub fn write_file(ctrl: &mut BlockDev, ino: u32, data: &[u8]) {
     let mut inode = read_inode(ctrl, ino);
     assert!(inode.flags == F_FILE, "not a file");
 
@@ -456,7 +495,7 @@ pub fn write_file(ctrl: &mut NvmeController, ino: u32, data: &[u8]) {
 }
 
 /// Remove a file or empty directory from its parent. Returns true on success.
-pub fn remove(ctrl: &mut NvmeController, parent_ino: u32, name: &str) -> bool {
+pub fn remove(ctrl: &mut BlockDev, parent_ino: u32, name: &str) -> bool {
     let ino = match find_in_dir(ctrl, parent_ino, name) {
         Some(i) => i,
         None    => return false,
@@ -533,13 +572,13 @@ pub fn remove(ctrl: &mut NvmeController, parent_ino: u32, name: &str) -> bool {
 }
 
 /// Lookup an entry by name in a directory. Returns (inode_id, is_dir).
-pub fn stat(ctrl: &mut NvmeController, ino: u32) -> (bool, u64) {
+pub fn stat(ctrl: &mut BlockDev, ino: u32) -> (bool, u64) {
     let inode = read_inode(ctrl, ino);
     (inode.flags == F_DIR, inode.size)
 }
 
 /// Read all data from a file. Returns a Vec<u8>.
-pub fn read_file(ctrl: &mut NvmeController, ino: u32) -> Vec<u8> {
+pub fn read_file(ctrl: &mut BlockDev, ino: u32) -> Vec<u8> {
     let inode = read_inode(ctrl, ino);
     assert!(inode.flags == F_FILE, "not a file");
     let mut out = Vec::with_capacity(inode.size as usize);

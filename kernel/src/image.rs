@@ -115,6 +115,7 @@ pub static EXTRA_VIEWERS: Mutex<alloc::vec::Vec<(usize, ImageViewer)>> = Mutex::
 fn read_content(path: &str) -> Vec<u8> {
     let mut ctrl = crate::nvme::CONTROLLER.lock();
     if let Some(ctrl) = ctrl.as_mut() {
+        let ctrl = &mut crate::hepfs::BlockDev::Nvme(ctrl);
         match crate::hepfs::lookup(ctrl, path) {
             Some(ino) => crate::hepfs::read_file(ctrl, ino),
             None      => alloc::vec![],

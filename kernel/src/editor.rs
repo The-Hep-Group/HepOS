@@ -599,6 +599,7 @@ impl Editor {
 
         let mut ctrl = crate::nvme::CONTROLLER.lock();
         if let Some(ctrl) = ctrl.as_mut() {
+            let ctrl = &mut crate::hepfs::BlockDev::Nvme(ctrl);
             // Find or create file
             let path = self.path.clone();
             let ino = crate::hepfs::lookup(ctrl, &path).unwrap_or_else(|| {
@@ -764,6 +765,7 @@ pub static EXTRA_EDITORS: Mutex<alloc::vec::Vec<(usize, Editor)>> = Mutex::new(a
 fn read_content(path: &str) -> Vec<u8> {
     let mut ctrl = crate::nvme::CONTROLLER.lock();
     if let Some(ctrl) = ctrl.as_mut() {
+        let ctrl = &mut crate::hepfs::BlockDev::Nvme(ctrl);
         match crate::hepfs::lookup(ctrl, path) {
             Some(ino) => crate::hepfs::read_file(ctrl, ino),
             None      => alloc::vec![],
