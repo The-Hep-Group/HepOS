@@ -1,5 +1,24 @@
-//! Minimal XHCI host controller driver — QEMU `qemu-xhci` + `usb-tablet`.
-//! Poll-based (no interrupts). Reads 6-byte HID tablet reports (absolute coords).
+//! Minimal XHCI host controller driver — QEMU `qemu-xhci` + `usb-tablet` (+
+//! `usb-kbd`, since this session). Poll-based (no interrupts).
+//!
+//! Scoped simplification, clearly documented rather than hidden: this driver
+//! doesn't parse HID report/interface descriptors to classify device type
+//! (a real classifier would read bInterfaceProtocol — 1=keyboard, 2=mouse —
+//! off the configuration descriptor, which needs control-IN data-stage
+//! transfers this driver doesn't implement). Instead it assumes **the first
+//! connected port is the mouse and the second is the keyboard** — true as
+//! long as `-device usb-tablet,bus=xhci.0` is listed before
+//! `-device usb-kbd,bus=xhci.0` in the QEMU command line (see build.sh/
+//! build.ps1), since QEMU attaches devices to ports in command-line order.
+//! Good enough for this dev environment; would need real descriptor parsing
+//! to be robust on arbitrary hardware/port orderings.
+//!
+//! Keyboard input is translated from USB HID boot-protocol keycodes to PS/2
+//! Set-1 scancodes and fed through `ps2::handle_scancode()` — so it reuses
+//! 100% of the existing shift/caps/ctrl state machine and special-key
+//! mapping (arrows, F-keys, etc.) instead of duplicating any of it. The rest
+//! of the OS (terminal, editor, ...) needs zero changes to accept USB
+//! keyboard input alongside PS/2.
 
 use crate::{pmm, vmm, serial};
 use spin::Mutex;
@@ -75,6 +94,24 @@ unsafe fn trb_r(base: *const u8, idx: usize) -> [u32; 4] {
      p.add(2).read_volatile(), p.add(3).read_volatile()]
 }
 
+/// One HID interrupt-IN endpoint's ring state — every USB HID device this
+/// driver drives (mouse, optionally keyboard) gets one of these.
+struct HidEp {
+    slot: u8,
+    ep0_v: *mut u8, ep0_p: u64, ep0_i: usize, ep0_c: u8,
+    hid_v: *mut u8, hid_p: u64, hid_i: usize, hid_c: u8,
+    hid_buf_v: *mut u8, hid_buf_p: u64,
+}
+
+/// Edge-tracked state for translating boot-protocol keyboard reports into
+/// `ps2::handle_scancode()` calls — only *changes* since the last report
+/// produce output (new key press, modifier press/release), matching how a
+/// real PS/2 controller only ever sends one make/break event per transition.
+struct KbdState {
+    prev_mods: u8,
+    prev_keys: [u8; 6],
+}
+
 pub struct Xhci {
     _cap: *mut u8, _op: *mut u8, rt: *mut u8, db: *mut u8,
 
@@ -83,22 +120,17 @@ pub struct Xhci {
 
     _erst_v: *mut u8,
     _dcbaa_v: *mut u8,
-    _dev_ctx_v: *mut u8,
-    _in_ctx_v: *mut u8,
 
-    ep0_v: *mut u8, ep0_p: u64, ep0_i: usize, ep0_c: u8,
-    hid_v: *mut u8, hid_p: u64, hid_i: usize, hid_c: u8,
-    hid_buf_v: *mut u8, hid_buf_p: u64,
-
-    slot: u8,
+    mouse: HidEp,
+    kbd: Option<(HidEp, KbdState)>,
 }
 
 unsafe impl Send for Xhci {}
 
 impl Xhci {
     unsafe fn ring_cmd(&self) { (self.db as *mut u32).write_volatile(0); }
-    unsafe fn ring_ep(&self, dci: u8) {
-        (self.db.add(self.slot as usize * 4) as *mut u32).write_volatile(dci as u32);
+    unsafe fn ring_ep(&self, slot: u8, dci: u8) {
+        (self.db.add(slot as usize * 4) as *mut u32).write_volatile(dci as u32);
     }
 
     unsafe fn push_cmd(&mut self, mut w: [u32; 4]) {
@@ -116,18 +148,18 @@ impl Xhci {
         }
     }
 
-    unsafe fn push_ep0(&mut self, mut w: [u32; 4]) {
-        w[3] = (w[3] & !1) | self.ep0_c as u32;
-        trb_w(self.ep0_v, self.ep0_i, w);
-        self.ep0_i += 1;
-        if self.ep0_i >= RING_N - 1 {
-            let tc = if self.ep0_c == 1 { 1u32 << 1 } else { 0 };
-            trb_w(self.ep0_v, self.ep0_i, [
-                self.ep0_p as u32, (self.ep0_p >> 32) as u32, 0,
-                TRB_LINK << 10 | tc | self.ep0_c as u32,
+    unsafe fn push_ep0(ep: &mut HidEp, mut w: [u32; 4]) {
+        w[3] = (w[3] & !1) | ep.ep0_c as u32;
+        trb_w(ep.ep0_v, ep.ep0_i, w);
+        ep.ep0_i += 1;
+        if ep.ep0_i >= RING_N - 1 {
+            let tc = if ep.ep0_c == 1 { 1u32 << 1 } else { 0 };
+            trb_w(ep.ep0_v, ep.ep0_i, [
+                ep.ep0_p as u32, (ep.ep0_p >> 32) as u32, 0,
+                TRB_LINK << 10 | tc | ep.ep0_c as u32,
             ]);
-            self.ep0_i = 0;
-            self.ep0_c ^= 1;
+            ep.ep0_i = 0;
+            ep.ep0_c ^= 1;
         }
     }
 
@@ -173,35 +205,86 @@ impl Xhci {
     }
 
     // No-data OUT control transfer (e.g. SET_CONFIGURATION)
-    unsafe fn ctrl_nodata(&mut self, bm: u8, req: u8, val: u16, idx: u16) {
+    unsafe fn ctrl_nodata(&mut self, ep: &mut HidEp, bm: u8, req: u8, val: u16, idx: u16) {
         let w0 = bm as u32 | ((req as u32) << 8) | ((val as u32) << 16);
         let w1 = idx as u32;
         // Setup TRB: IDT=bit6, IOC=0, TRT=0 (no data stage)
-        self.push_ep0([w0, w1, 8, TRB_SETUP << 10 | 1 << 6]);
+        Self::push_ep0(ep, [w0, w1, 8, TRB_SETUP << 10 | 1 << 6]);
         // Status TRB: DIR=IN (bit16), IOC=bit5
-        self.push_ep0([0, 0, 0, TRB_STATUS << 10 | 1 << 16 | 1 << 5]);
-        self.ring_ep(1);
+        Self::push_ep0(ep, [0, 0, 0, TRB_STATUS << 10 | 1 << 16 | 1 << 5]);
+        self.ring_ep(ep.slot, 1);
         self.wait_xfer();
     }
 
-    unsafe fn queue_hid(&mut self) {
-        let c = self.hid_c as u32;
-        trb_w(self.hid_v, self.hid_i, [
-            self.hid_buf_p as u32, (self.hid_buf_p >> 32) as u32,
+    unsafe fn queue_hid(&mut self, which: usize) {
+        let ep = if which == 0 { &mut self.mouse } else { &mut self.kbd.as_mut().unwrap().0 };
+        let c = ep.hid_c as u32;
+        trb_w(ep.hid_v, ep.hid_i, [
+            ep.hid_buf_p as u32, (ep.hid_buf_p >> 32) as u32,
             8, TRB_NORMAL << 10 | 1 << 5 | c,
         ]);
-        self.hid_i += 1;
-        if self.hid_i >= RING_N - 1 {
+        ep.hid_i += 1;
+        if ep.hid_i >= RING_N - 1 {
             // TC=1 (Toggle Cycle) ALWAYS so the XHC toggles PCS on every wrap.
             // cycle bit = c (current cycle, so XHC processes this link TRB now).
-            trb_w(self.hid_v, self.hid_i, [
-                self.hid_p as u32, (self.hid_p >> 32) as u32,
+            trb_w(ep.hid_v, ep.hid_i, [
+                ep.hid_p as u32, (ep.hid_p >> 32) as u32,
                 0, TRB_LINK << 10 | (1 << 1) | c,
             ]);
-            self.hid_i = 0;
-            self.hid_c ^= 1;
+            ep.hid_i = 0;
+            ep.hid_c ^= 1;
         }
-        self.ring_ep(3); // EP1 IN = DCI 3
+        let slot = ep.slot;
+        self.ring_ep(slot, 3); // EP1 IN = DCI 3
+    }
+
+    fn handle_mouse_report(buf: &[u8], fb_w: u32, fb_h: u32) {
+        let buttons = buf[0] & 0x07;
+        let abs_x   = u16::from_le_bytes([buf[1], buf[2]]) as u32;
+        let abs_y   = u16::from_le_bytes([buf[3], buf[4]]) as u32;
+        // Ignore (0,0) with no buttons — tablet sends this as initial report
+        // before the host cursor enters the QEMU window.
+        if abs_x != 0 || abs_y != 0 || buttons != 0 {
+            let sx = (abs_x.saturating_mul(fb_w)) / 32768;
+            let sy = (abs_y.saturating_mul(fb_h)) / 32768;
+            let mut m = crate::mouse::MOUSE.lock();
+            m.x = sx as i32;
+            m.y = sy as i32;
+            m.buttons = buttons;
+        }
+    }
+
+    fn handle_kbd_report(buf: &[u8], st: &mut KbdState) {
+        let mods = buf[0];
+        let mut keys = [0u8; 6];
+        keys.copy_from_slice(&buf[2..8]);
+
+        // Modifiers: PS/2's SHIFT/CTRL tracking needs both press *and*
+        // release edges (unlike regular keys, where ps2.rs ignores releases
+        // outright), so react to every bit that flipped either way.
+        let changed = st.prev_mods ^ mods;
+        for bit in 0..8u8 {
+            if changed & (1 << bit) == 0 { continue; }
+            let pressed = mods & (1 << bit) != 0;
+            let Some(ps2_sc) = modifier_to_ps2(bit) else { continue };
+            crate::ps2::handle_scancode(if pressed { ps2_sc } else { ps2_sc | 0x80 });
+        }
+        st.prev_mods = mods;
+
+        // Regular keys: only react to newly-pressed keycodes (not already in
+        // the previous report) — boot-protocol reports list every
+        // currently-held key on every report, so this is how "new key" edges
+        // are detected. Releases don't need an event: ps2.rs already ignores
+        // non-modifier key releases.
+        for &kc in &keys {
+            if kc == 0 || kc < 4 { continue; } // 0=none, 1-3=error/rollover codes
+            if st.prev_keys.contains(&kc) { continue; }
+            if let Some((ps2_sc, extended)) = keycode_to_ps2(kc) {
+                if extended { crate::ps2::handle_scancode(0xE0); }
+                crate::ps2::handle_scancode(ps2_sc);
+            }
+        }
+        st.prev_keys = keys;
     }
 
     pub fn poll(&mut self, fb_w: u32, fb_h: u32) {
@@ -209,27 +292,89 @@ impl Xhci {
             while let Some(t) = self.dequeue() {
                 let ty = (t[3] >> 10) & 0x3F;
                 let cc = (t[2] >> 24) & 0xFF;
-                if ty == TRB_EV_XFER && (cc == CC_SUCCESS || cc == CC_SHORT) {
-                    let buf = core::slice::from_raw_parts(self.hid_buf_v, 8);
-                    let buttons = buf[0] & 0x07;
-                    let abs_x   = u16::from_le_bytes([buf[1], buf[2]]) as u32;
-                    let abs_y   = u16::from_le_bytes([buf[3], buf[4]]) as u32;
-                    // Ignore (0,0) with no buttons — tablet sends this as initial report
-                    // before the host cursor enters the QEMU window.
-                    if abs_x != 0 || abs_y != 0 || buttons != 0 {
-                        let sx = (abs_x.saturating_mul(fb_w)) / 32768;
-                        let sy = (abs_y.saturating_mul(fb_h)) / 32768;
-                        let mut m = crate::mouse::MOUSE.lock();
-                        m.x = sx as i32;
-                        m.y = sy as i32;
-                        m.buttons = buttons;
+                if ty != TRB_EV_XFER || (cc != CC_SUCCESS && cc != CC_SHORT) { continue; }
+                let slot = (t[3] >> 24) as u8;
+
+                if slot == self.mouse.slot {
+                    let buf = core::slice::from_raw_parts(self.mouse.hid_buf_v, 8);
+                    Self::handle_mouse_report(buf, fb_w, fb_h);
+                    core::ptr::write_bytes(self.mouse.hid_buf_v, 0, 8);
+                    self.queue_hid(0);
+                } else if let Some((ep, st)) = self.kbd.as_mut() {
+                    if slot == ep.slot {
+                        let buf = core::slice::from_raw_parts(ep.hid_buf_v, 8);
+                        Self::handle_kbd_report(buf, st);
+                        core::ptr::write_bytes(ep.hid_buf_v, 0, 8);
+                        self.queue_hid(1);
                     }
-                    core::ptr::write_bytes(self.hid_buf_v, 0, 8);
-                    self.queue_hid();
                 }
             }
         }
     }
+}
+
+/// USB HID modifier bit (0-7, matching the boot-report byte0 layout: LCtrl,
+/// LShift, LAlt, LGui, RCtrl, RShift, RAlt, RGui) → PS/2 Set-1 make code.
+/// `None` for modifiers PS/2 has no equivalent state for (Gui/Win key).
+fn modifier_to_ps2(bit: u8) -> Option<u8> {
+    match bit {
+        0 => Some(0x1D), // LCtrl
+        1 => Some(0x2A), // LShift
+        2 => Some(0x38), // LAlt (unmapped in ps2.rs's tables, but harmless)
+        4 => Some(0x1D), // RCtrl — ps2.rs's Ctrl match doesn't distinguish L/R
+        5 => Some(0x36), // RShift
+        6 => Some(0x38), // RAlt
+        _ => None,       // LGui(3)/RGui(7) — no PS/2 equivalent tracked
+    }
+}
+
+/// USB HID Usage ID (boot-protocol keycode) → (PS/2 Set-1 make code, is_extended).
+/// `is_extended` means `ps2::handle_scancode(0xE0)` must be sent first, same
+/// as a real PS/2 keyboard would for that key (arrows, Home/End/PgUp/PgDn, Delete).
+fn keycode_to_ps2(kc: u8) -> Option<(u8, bool)> {
+    let sc = match kc {
+        0x04..=0x1D => { // a-z
+            const MAP: [u8; 26] = [
+                0x1E,0x30,0x2E,0x20,0x12,0x21,0x22,0x23,0x17,0x24, // a-j
+                0x25,0x26,0x32,0x31,0x18,0x19,0x10,0x13,0x1F,0x14, // k-t
+                0x16,0x2F,0x11,0x2D,0x15,0x2C,                     // u-z
+            ];
+            MAP[(kc - 0x04) as usize]
+        }
+        0x1E..=0x26 => 0x02 + (kc - 0x1E), // 1-9
+        0x27 => 0x0B,                       // 0
+        0x28 => 0x1C, // Enter
+        0x29 => 0x01, // Escape
+        0x2A => 0x0E, // Backspace
+        0x2B => 0x0F, // Tab
+        0x2C => 0x39, // Space
+        0x2D => 0x0C, // -
+        0x2E => 0x0D, // =
+        0x2F => 0x1A, // [
+        0x30 => 0x1B, // ]
+        0x31 => 0x2B, // backslash
+        0x33 => 0x27, // ;
+        0x34 => 0x28, // '
+        0x35 => 0x29, // `
+        0x36 => 0x33, // ,
+        0x37 => 0x34, // .
+        0x38 => 0x35, // /
+        0x39 => 0x3A, // CapsLock
+        0x3A..=0x43 => 0x3B + (kc - 0x3A), // F1-F10
+        0x44 => 0x57, // F11
+        0x45 => 0x58, // F12
+        0x4A => return Some((0x47, true)), // Home
+        0x4B => return Some((0x49, true)), // PageUp
+        0x4C => return Some((0x53, true)), // Delete
+        0x4D => return Some((0x4F, true)), // End
+        0x4E => return Some((0x51, true)), // PageDown
+        0x4F => return Some((0x4D, true)), // Right
+        0x50 => return Some((0x4B, true)), // Left
+        0x51 => return Some((0x50, true)), // Down
+        0x52 => return Some((0x48, true)), // Up
+        _ => return None,
+    };
+    Some((sc, false))
 }
 
 pub static XHCI: Mutex<Option<Xhci>> = Mutex::new(None);
@@ -240,6 +385,78 @@ pub fn poll_mouse(fb_w: u32, fb_h: u32) {
 
 /// Returns true if XHCI is initialized and ready.
 pub fn is_ready() -> bool { XHCI.lock().is_some() }
+
+/// Brings up one USB HID device already reset on `port` (1-based), returning
+/// its `HidEp` state with the interrupt-IN endpoint queued and ready. Shared
+/// by both the mouse and the (optional) keyboard in `init()` below — the
+/// per-device sequence (Enable Slot → Address Device → SET_CONFIGURATION →
+/// Configure Endpoint) is identical for either.
+unsafe fn bring_up_hid_device(x: &mut Xhci, dcbaa_v: *mut u8, port: u8, port_speed: u8, label: &str) -> Option<HidEp> {
+    serial::print("xhci: sending Enable Slot (");
+    serial::print(label);
+    serial::print(")...\n");
+    x.push_cmd([0, 0, 0, TRB_CMD_EN_SLOT << 10]);
+    x.ring_cmd();
+    let (cc, slot) = x.wait_cmd();
+    serial::print_hex("xhci: Enable Slot CC=", cc as u64);
+    if cc != CC_SUCCESS { return None; }
+    serial::print_hex("xhci: slot_id=", slot as u64);
+
+    let (dev_ctx_p, dev_ctx_v) = dma();
+    let (in_ctx_p, in_ctx_v)   = dma();
+    let (ep0_p, ep0_v)         = dma();
+    let (hid_p, hid_v)         = dma();
+    let (hid_buf_p, hid_buf_v) = dma();
+    let _ = dev_ctx_v; // kept alive via DCBAAP entry below; never read directly
+
+    trb_w(ep0_v, RING_N - 1, [ep0_p as u32, (ep0_p >> 32) as u32, 0, TRB_LINK << 10 | 1 << 1 | 1]);
+    trb_w(hid_v, RING_N - 1, [hid_p as u32, (hid_p >> 32) as u32, 0, TRB_LINK << 10 | 1 << 1 | 1]);
+
+    (dcbaa_v as *mut u64).add(slot as usize).write_volatile(dev_ctx_p);
+
+    let ic = in_ctx_v;
+    (ic.add(0x04) as *mut u32).write_volatile(0x3); // Add A0(slot)+A1(EP0)
+    (ic.add(0x20) as *mut u32).write_volatile(1 << 27 | (port_speed as u32) << 20);
+    (ic.add(0x24) as *mut u32).write_volatile((port as u32) << 16);
+    (ic.add(0x44) as *mut u32).write_volatile(3 << 1 | 4 << 3 | 64 << 16); // EP0: Cerr=3, Control, MPS=64
+    (ic.add(0x48) as *mut u64).write_volatile(ep0_p | 1);
+    (ic.add(0x50) as *mut u32).write_volatile(8);
+
+    serial::print("xhci: sending Address Device...\n");
+    x.push_cmd([in_ctx_p as u32 & !0xF, (in_ctx_p >> 32) as u32, 0, TRB_CMD_ADDR << 10 | (slot as u32) << 24]);
+    x.ring_cmd();
+    let (cc, _) = x.wait_cmd();
+    serial::print_hex("xhci: Address Device CC=", cc as u64);
+    if cc != CC_SUCCESS { return None; }
+    serial::print("xhci: device addressed\n");
+
+    let mut ep = HidEp { slot, ep0_v, ep0_p, ep0_i: 0, ep0_c: 1, hid_v, hid_p, hid_i: 0, hid_c: 1, hid_buf_v, hid_buf_p };
+
+    serial::print("xhci: sending SET_CONFIGURATION...\n");
+    x.ctrl_nodata(&mut ep, 0x00, 0x09, 1, 0);
+    serial::print("xhci: SET_CONFIGURATION done\n");
+
+    // Configure Endpoint — add EP1 IN (DCI 3), same input context reused in place.
+    (ic.add(0x00) as *mut u32).write_volatile(0);
+    (ic.add(0x04) as *mut u32).write_volatile(1 | 1 << 3); // Add A0(slot)+A3(EP1 IN)
+    (ic.add(0x20) as *mut u32).write_volatile(3 << 27 | (port_speed as u32) << 20); // Context Entries=3
+    (ic.add(0x80) as *mut u32).write_volatile(3 << 16); // Interval=3 (1ms @ HS)
+    (ic.add(0x84) as *mut u32).write_volatile(3 << 1 | 7 << 3 | 8 << 16); // Cerr=3, Interrupt IN, MPS=8
+    (ic.add(0x88) as *mut u64).write_volatile(hid_p | 1);
+    (ic.add(0x90) as *mut u32).write_volatile(8);
+
+    serial::print("xhci: sending Configure Endpoint...\n");
+    x.push_cmd([in_ctx_p as u32 & !0xF, (in_ctx_p >> 32) as u32, 0, TRB_CMD_CFG_EP << 10 | (slot as u32) << 24]);
+    x.ring_cmd();
+    let (cc, _) = x.wait_cmd();
+    serial::print_hex("xhci: Configure EP CC=", cc as u64);
+    if cc != CC_SUCCESS { return None; }
+    serial::print("xhci: EP1 IN ready (");
+    serial::print(label);
+    serial::print(")\n");
+
+    Some(ep)
+}
 
 pub fn init(devices: &[crate::pci::PciDevice]) {
     let d = match devices.iter().find(|d|
@@ -316,24 +533,9 @@ pub fn init(devices: &[crate::pci::PciDevice]) {
         let (evt_p, evt_v)         = dma();
         let (erst_p, erst_v)       = dma();
         let (dcbaa_p, dcbaa_v)     = dma();
-        let (dev_ctx_p, dev_ctx_v) = dma();
-        let (in_ctx_p, in_ctx_v)   = dma();
-        let (ep0_p, ep0_v)         = dma();
-        let (hid_p, hid_v)         = dma();
-        let (hid_buf_p, hid_buf_v) = dma();
 
-        // Place link TRBs at end of each ring
-        macro_rules! link_trb {
-            ($v:expr, $p:expr) => {
-                trb_w($v, RING_N - 1, [
-                    $p as u32, ($p >> 32) as u32,
-                    0, TRB_LINK << 10 | 1 << 1 | 1, // TC=1, cycle=1
-                ]);
-            }
-        }
-        link_trb!(cmd_v, cmd_p);
-        link_trb!(ep0_v, ep0_p);
-        link_trb!(hid_v, hid_p);
+        // Place link TRB at end of the command ring
+        trb_w(cmd_v, RING_N - 1, [cmd_p as u32, (cmd_p >> 32) as u32, 0, TRB_LINK << 10 | 1 << 1 | 1]);
 
         // ERST: 1 segment pointing to event ring
         (erst_v as *mut u64).write_volatile(evt_p);
@@ -363,9 +565,11 @@ pub fn init(devices: &[crate::pci::PciDevice]) {
         // Small delay for USB devices to appear on ports
         for _ in 0..1_000_000u32 { core::hint::spin_loop(); }
 
-        // Scan ports — print PORTSC for each, find first connected
-        let mut connected_port = 0u8;
-        let mut port_speed = 3u8; // default: High Speed
+        // Scan ports — print PORTSC for each, reset every connected one and
+        // collect them in order. Per the module doc: port order determines
+        // mouse-vs-keyboard, since this driver doesn't classify by descriptor.
+        let mut connected: [(u8, u8); 8] = [(0, 0); 8]; // (port 1-based, speed)
+        let mut n_connected = 0usize;
         for pi in 0..max_ports {
             let pb = op.add(0x400 + pi * 0x10);
             let sc = r32(pb as *const u8, 0);
@@ -378,9 +582,8 @@ pub fn init(devices: &[crate::pci::PciDevice]) {
             }
 
             let sc = r32(pb as *const u8, 0);
-            if sc & PORT_CCS != 0 && connected_port == 0 {
+            if sc & PORT_CCS != 0 && n_connected < connected.len() {
                 serial::print_hex("xhci: device on port (1-based)=", (pi + 1) as u64);
-                connected_port = (pi + 1) as u8;
 
                 // Reset port: clear W1C bits, set PR
                 w32(pb, 0, (sc & !PORT_W1C) | PORT_PR);
@@ -391,18 +594,21 @@ pub fn init(devices: &[crate::pci::PciDevice]) {
 
                 // Read port speed AFTER reset (bits[13:10])
                 let sc2 = r32(pb as *const u8, 0);
-                port_speed = ((sc2 >> 10) & 0xF) as u8;
-                if port_speed == 0 { port_speed = 3; } // default to HS if unknown
-                serial::print_hex("xhci: port speed=", port_speed as u64);
+                let mut speed = ((sc2 >> 10) & 0xF) as u8;
+                if speed == 0 { speed = 3; } // default to HS if unknown
+                serial::print_hex("xhci: port speed=", speed as u64);
                 serial::print_hex("xhci: PORTSC after reset=", sc2 as u64);
 
                 // Clear PRC change bit
                 w32(pb, 0, (sc2 & !PORT_W1C) | PORT_PRC);
                 serial::print("xhci: port reset done\n");
+
+                connected[n_connected] = ((pi + 1) as u8, speed);
+                n_connected += 1;
             }
         }
 
-        if connected_port == 0 {
+        if n_connected == 0 {
             serial::print("xhci: no device found on any port!\n");
             return;
         }
@@ -416,105 +622,33 @@ pub fn init(devices: &[crate::pci::PciDevice]) {
             evt_v, evt_p, evt_i: 0, evt_c: 1,
             _erst_v: erst_v,
             _dcbaa_v: dcbaa_v,
-            _dev_ctx_v: dev_ctx_v,
-            _in_ctx_v: in_ctx_v,
-            ep0_v, ep0_p, ep0_i: 0, ep0_c: 1,
-            hid_v, hid_p, hid_i: 0, hid_c: 1,
-            hid_buf_v, hid_buf_p,
-            slot: 0,
+            mouse: HidEp { slot: 0, ep0_v: core::ptr::null_mut(), ep0_p: 0, ep0_i: 0, ep0_c: 1,
+                           hid_v: core::ptr::null_mut(), hid_p: 0, hid_i: 0, hid_c: 1,
+                           hid_buf_v: core::ptr::null_mut(), hid_buf_p: 0 },
+            kbd: None,
         };
 
-        // ── Enable Slot ────────────────────────────────────────────────────────
-        serial::print("xhci: sending Enable Slot...\n");
-        x.push_cmd([0, 0, 0, TRB_CMD_EN_SLOT << 10]);
-        x.ring_cmd();
-        let (cc, slot) = x.wait_cmd();
-        serial::print_hex("xhci: Enable Slot CC=", cc as u64);
-        if cc != CC_SUCCESS { return; }
-        x.slot = slot;
-        serial::print_hex("xhci: slot_id=", slot as u64);
-
-        // DCBAAP[slot] → device context
-        (dcbaa_v as *mut u64).add(slot as usize).write_volatile(dev_ctx_p);
-
-        // ── Address Device ─────────────────────────────────────────────────────
-        // Input context layout (each section = 0x20 bytes):
-        //   0x00  Input Control Context
-        //   0x20  Slot Context
-        //   0x40  EP0 Context (DCI 1)
-        //   0x60  EP1 OUT Context (DCI 2) — unused
-        //   0x80  EP1 IN Context (DCI 3)  — added by Configure Endpoint
-        let ic = in_ctx_v;
-
-        // Input Control: Add A0 (slot) + A1 (EP0)
-        (ic.add(0x04) as *mut u32).write_volatile(0x3);
-
-        // Slot Context DW0: Context Entries=1, Speed from port, Route=0
-        (ic.add(0x20) as *mut u32).write_volatile(1 << 27 | (port_speed as u32) << 20);
-        // Slot Context DW1: Root Hub Port Number (1-based)
-        (ic.add(0x24) as *mut u32).write_volatile((connected_port as u32) << 16);
-
-        // EP0 Context DW1: Cerr=3, EP Type=4 (Control Bidir), Max Packet Size=64
-        (ic.add(0x44) as *mut u32).write_volatile(3 << 1 | 4 << 3 | 64 << 16);
-        // EP0 DW2+3: TR Dequeue Pointer + DCS=1
-        (ic.add(0x48) as *mut u64).write_volatile(ep0_p | 1);
-        // EP0 DW4: Average TRB Length=8
-        (ic.add(0x50) as *mut u32).write_volatile(8);
-
-        serial::print("xhci: sending Address Device...\n");
-        x.push_cmd([
-            in_ctx_p as u32 & !0xF,
-            (in_ctx_p >> 32) as u32,
-            0,
-            TRB_CMD_ADDR << 10 | (slot as u32) << 24,
-        ]);
-        x.ring_cmd();
-        let (cc, _) = x.wait_cmd();
-        serial::print_hex("xhci: Address Device CC=", cc as u64);
-        if cc != CC_SUCCESS { return; }
-        serial::print("xhci: device addressed\n");
-
-        // ── SET_CONFIGURATION(1) ───────────────────────────────────────────────
-        serial::print("xhci: sending SET_CONFIGURATION...\n");
-        x.ctrl_nodata(0x00, 0x09, 1, 0);
-        serial::print("xhci: SET_CONFIGURATION done\n");
-
-        // ── Configure Endpoint — add EP1 IN ────────────────────────────────────
-        // Update input context IN PLACE (don't zero — keep slot DW1 port number).
-        // Change Add flags to A0 (update slot) + A3 (add EP1 IN DCI 3).
-        (ic.add(0x00) as *mut u32).write_volatile(0);       // Drop flags: none
-        (ic.add(0x04) as *mut u32).write_volatile(1 | 1 << 3); // Add A0+A3
-
-        // Slot DW0: Context Entries=3 (covers DCI 3), keep speed from before
-        (ic.add(0x20) as *mut u32).write_volatile(3 << 27 | (port_speed as u32) << 20);
-        // Slot DW1: port number unchanged (already set)
-
-        // EP1 IN Context at offset 0x80 (DCI 3)
-        // DW0: Interval=3 (2^3 μframes = 1ms for HS) at bits[23:16]
-        (ic.add(0x80) as *mut u32).write_volatile(3 << 16);
-        // DW1: Cerr=3, EP Type=7 (Interrupt IN), Max Packet Size=8
-        (ic.add(0x84) as *mut u32).write_volatile(3 << 1 | 7 << 3 | 8 << 16);
-        // DW2+3: TR Dequeue Pointer + DCS=1
-        (ic.add(0x88) as *mut u64).write_volatile(hid_p | 1);
-        // DW4: Average TRB Length=8
-        (ic.add(0x90) as *mut u32).write_volatile(8);
-
-        serial::print("xhci: sending Configure Endpoint...\n");
-        x.push_cmd([
-            in_ctx_p as u32 & !0xF,
-            (in_ctx_p >> 32) as u32,
-            0,
-            TRB_CMD_CFG_EP << 10 | (slot as u32) << 24,
-        ]);
-        x.ring_cmd();
-        let (cc, _) = x.wait_cmd();
-        serial::print_hex("xhci: Configure EP CC=", cc as u64);
-        if cc != CC_SUCCESS { return; }
-        serial::print("xhci: EP1 IN ready\n");
-
-        // Queue first HID transfer TRB
-        x.queue_hid();
+        let (mouse_port, mouse_speed) = connected[0];
+        let Some(mouse_ep) = bring_up_hid_device(&mut x, dcbaa_v, mouse_port, mouse_speed, "mouse") else {
+            serial::print("xhci: mouse bring-up failed\n");
+            return;
+        };
+        x.mouse = mouse_ep;
+        x.queue_hid(0);
         serial::print("xhci: mouse ready!\n");
+
+        if n_connected > 1 {
+            let (kbd_port, kbd_speed) = connected[1];
+            match bring_up_hid_device(&mut x, dcbaa_v, kbd_port, kbd_speed, "keyboard") {
+                Some(kbd_ep) => {
+                    x.kbd = Some((kbd_ep, KbdState { prev_mods: 0, prev_keys: [0; 6] }));
+                    x.queue_hid(1);
+                    serial::print("xhci: keyboard ready!\n");
+                }
+                None => serial::print("xhci: keyboard bring-up failed (mouse still works)\n"),
+            }
+        }
+
         *XHCI.lock() = Some(x);
     }
 }
