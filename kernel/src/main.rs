@@ -4,6 +4,7 @@
 extern crate alloc;
 
 mod acpi;
+mod ahci;
 mod apic;
 mod audio;
 mod bootinfo;
@@ -363,6 +364,10 @@ extern "C" fn kmain(bi_ptr: *const bootinfo::BootInfo) -> ! {
     } else {
         serial::print("No NVMe device found\n");
     }
+
+    // AHCI/SATA — not yet mounted by HepFS (NVMe-only today), but the driver
+    // itself (detect, port init, IDENTIFY, read/write) is up and usable.
+    ahci::init(&pci_devices);
 
     // Intel HDA audio
     hda::init(&pci_devices);

@@ -48,12 +48,17 @@ if (-not (Test-Path $vars_fd)) {
     Copy-Item "$qemu_share\edk2-i386-vars.fd" $vars_fd
 }
 
-# ── 6. Create NVMe disk image if needed ─────────────────────────────────────
+# ── 6. Create NVMe + SATA disk images if needed ─────────────────────────────
 $disk = "$root\hepos_disk.img"
 $qemu_img = "C:\Program Files\qemu\qemu-img.exe"
 if (-not (Test-Path $disk)) {
     Write-Host "Creating 512MB NVMe disk..."
     & $qemu_img create -f raw $disk 512M
+}
+$sata_disk = "$root\hepos_sata.img"
+if (-not (Test-Path $sata_disk)) {
+    Write-Host "Creating 64MB SATA disk..."
+    & $qemu_img create -f raw $sata_disk 64M
 }
 
 # ── 7. Run in QEMU (UEFI boot via HepBL) ─────────────────────────────────────
@@ -70,10 +75,13 @@ $qemu = "C:\Program Files\qemu\qemu-system-x86_64.exe"
     -fw_cfg name=opt/ovmf/X-PciMmio64Mb,string=0 `
     -drive file=$disk,if=none,id=nvme0,format=raw `
     -device nvme,serial=heposv1,drive=nvme0 `
+    -device ahci,id=ahci0 `
+    -drive file=$sata_disk,if=none,id=sata0,format=raw `
+    -device ide-hd,drive=sata0,bus=ahci0.0 `
     -netdev user,id=net0 `
     -device rtl8139,netdev=net0 `
     -device intel-hda `
-    -device hda-duplex `
+    -device hda-output `
     -device qemu-xhci,id=xhci `
     -device usb-tablet,bus=xhci.0 `
     -vga std `

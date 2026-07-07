@@ -1,6 +1,7 @@
 iso_root/
 hepos.iso
 hepos_disk.img
+hepos_sata.img
 kernel/target/
 limine/
 hepbl/target/

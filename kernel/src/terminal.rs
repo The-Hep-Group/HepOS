@@ -29,7 +29,7 @@ const COMMAND_NAMES: &[&str] = &[
     "rm", "cp", "mv", "write", "edit", "uname", "mem", "date",
     "history", "lspci", "netdiag", "netstart", "netpoll", "ifconfig",
     "ping", "wget", "udp", "view", "play", "shutdown", "reboot", "echo",
-    "sysinfo", "syscallinfo", "runtest", "runhello", "exec", "ps", "newterm", "beep", "volume",
+    "sysinfo", "syscallinfo", "runtest", "runhello", "exec", "ps", "newterm", "beep", "volume", "sata",
 ];
 
 #[derive(Clone, Copy)]
@@ -937,6 +937,21 @@ impl Terminal {
                 } else {
                     self.print(&alloc::format!("beep: {} Hz for {} ms\n", freq, ms));
                     crate::hda::beep(freq, ms);
+                }
+            }
+
+            "sata" => {
+                if !crate::ahci::is_available() {
+                    self.print_colored("sata: no AHCI disk found\n", ERR);
+                } else {
+                    let ctrl = crate::ahci::CONTROLLER.lock();
+                    if let Some(c) = ctrl.as_ref() {
+                        let mb = (c.sectors * c.sector_size as u64) / 1024 / 1024;
+                        self.print(&alloc::format!(
+                            "AHCI/SATA disk: {} sectors x {} bytes (~{} MB)\n",
+                            c.sectors, c.sector_size, mb
+                        ));
+                    }
                 }
             }
 
