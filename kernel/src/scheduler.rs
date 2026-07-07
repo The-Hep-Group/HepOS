@@ -27,8 +27,8 @@ impl Task {
         //   [RSP+16] = r13
         //   [RSP+24] = r12
         //   [RSP+32] = rbp
-        //   [RSP+40] = rbx
-        //   [RSP+48] = return address  ← ret jumps here
+        //   [RSP+40] = rbx     ← entry fn ptr, consumed by task_trampoline
+        //   [RSP+48] = return address  ← ret jumps here (task_trampoline)
         //
         // After ret RSP = initial_rsp + 56.
         // For RSP+56 % 16 == 8 (ABI entry alignment), we need initial_rsp % 16 == 0.
@@ -41,8 +41,8 @@ impl Task {
             f.add(2).write(0); // r13
             f.add(3).write(0); // r12
             f.add(4).write(0); // rbp
-            f.add(5).write(0); // rbx
-            f.add(6).write(entry as *const () as u64); // ret addr
+            f.add(5).write(entry as *const () as u64); // rbx — entry, read by trampoline
+            f.add(6).write(task_trampoline as *const () as u64); // ret addr
         }
 
         Task { id, name, state: TaskState::Ready, _stack: stack, rsp: rsp as u64 }
@@ -102,6 +102,30 @@ pub fn tick() {
         // Lock is released here — safe to switch stacks.
         unsafe { context_switch(old_rsp, new_rsp); }
     }
+}
+
+/// Entered via `ret` from `context_switch` the first time a task runs — never
+/// via `iretq`. Two things the normal resume path (tick() returning into
+/// timer_stub's "call eoi; iretq") would have done never happen here, because
+/// this `ret` jumps straight into the new task instead of unwinding back
+/// through tick()/timer_stub:
+///   1. EOI for the interrupt that caused this very switch is never sent —
+///      the in-service bit for the timer vector stays set forever, so the
+///      LAPIC blocks all future timer interrupts. Without this, the very
+///      first task switch permanently kills the timer (TICK_COUNT freezes).
+///   2. RFLAGS.IF is never restored — it's whatever it was inside the timer
+///      ISR (0), so the new task would otherwise run with interrupts
+///      permanently off.
+/// `sti`'s one-instruction shadow covers the `jmp`, so IF only takes effect
+/// once the real entry point (left in rbx by `Task::new`) starts running.
+#[unsafe(naked)]
+unsafe extern "C" fn task_trampoline() {
+    core::arch::naked_asm!(
+        "call {eoi}",
+        "sti",
+        "jmp rbx",
+        eoi = sym crate::apic::eoi,
+    );
 }
 
 #[unsafe(naked)]

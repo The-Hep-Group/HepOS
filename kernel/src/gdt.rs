@@ -119,6 +119,38 @@ pub fn init() {
         };
         asm!("lgdt [{}]", in(reg) &gdtr, options(nostack, readonly));
 
+        // lgdt only repoints GDTR — it does NOT reload any segment register's
+        // hidden descriptor cache. CS/SS/DS/ES/FS/GS all keep whatever stale
+        // selectors HepBL/UEFI left them as (e.g. HepBL's own 64-bit code
+        // segment, wherever it happened to sit in HepBL's GDT). That's
+        // invisible during normal execution — the CPU only re-validates a
+        // segment selector against the *current* GDT when the register is
+        // explicitly reloaded (far call/jmp/ret, iretq, task switch) — but
+        // the first genuine `iretq` (resuming a preempted task) reloads CS
+        // from the interrupt frame's stale selector, which is almost
+        // certainly out of range for our much smaller GDT → #GP. Reload
+        // every segment register now, while nothing has taken a fault yet.
+        // CS can't be loaded via `mov`, so do it via a far return.
+        asm!(
+            "push {cs_sel}",
+            "lea rax, [rip + 2f]",
+            "push rax",
+            "retfq",
+            "2:",
+            cs_sel = const KERNEL_CS,
+            out("rax") _,
+            options(nostack),
+        );
+        asm!(
+            "mov ss, {sel:x}",
+            "mov ds, {sel:x}",
+            "mov es, {sel:x}",
+            "mov fs, {sel:x}",
+            "mov gs, {sel:x}",
+            sel = in(reg) KERNEL_SS as u16,
+            options(nostack),
+        );
+
         // Load the Task Register so the CPU can find RSP0 for ring-3→0 transitions.
         asm!("ltr {0:x}", in(reg) TSS_SEL, options(nostack));
     }
