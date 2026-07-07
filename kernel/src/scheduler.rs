@@ -1,17 +1,19 @@
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
 const STACK_SIZE: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum TaskState { Running, Ready, Dead }
+pub enum TaskState { Running, Ready, Blocked, Dead }
 
 pub struct Task {
-    pub id:    usize,
-    pub name:  &'static str,
-    pub state: TaskState,
-    _stack:    Vec<u8>,       // keeps the stack allocation alive
-    pub rsp:   u64,
+    pub id:      usize,
+    pub name:    &'static str,
+    pub state:   TaskState,
+    pub wake_at: u64,         // valid only while state == Blocked; in TICK_COUNT units
+    _stack:      Vec<u8>,       // keeps the stack allocation alive
+    pub rsp:     u64,
 }
 
 impl Task {
@@ -45,7 +47,7 @@ impl Task {
             f.add(6).write(task_trampoline as *const () as u64); // ret addr
         }
 
-        Task { id, name, state: TaskState::Ready, _stack: stack, rsp: rsp as u64 }
+        Task { id, name, state: TaskState::Ready, wake_at: 0, _stack: stack, rsp: rsp as u64 }
     }
 }
 
@@ -64,9 +66,24 @@ impl Scheduler {
     }
 
     /// Returns (old_rsp_ptr, new_rsp) without holding the lock during switch.
+    ///
+    /// The outgoing task (`self.current`) is only reset to `Ready` if it's
+    /// still `Running` — i.e. this is an ordinary timer-driven preemption.
+    /// `exit_current()`/`sleep_ms()` set a different terminal state (`Dead`/
+    /// `Blocked`) on themselves *before* calling this, and that must survive
+    /// the switch untouched — overwriting it back to `Ready` here would undo
+    /// the exit/sleep the instant it took effect.
     pub fn next(&mut self) -> Option<(*mut u64, u64)> {
         let n = self.tasks.len();
         if n < 2 { return None; }
+
+        // Blocked tasks whose wake time has passed become eligible again.
+        let now = TICK_COUNT.load(Ordering::Relaxed);
+        for t in self.tasks.iter_mut() {
+            if t.state == TaskState::Blocked && now >= t.wake_at {
+                t.state = TaskState::Ready;
+            }
+        }
 
         let mut next = (self.current + 1) % n;
         for _ in 0..n {
@@ -76,7 +93,9 @@ impl Scheduler {
         if self.tasks[next].state != TaskState::Ready { return None; }
         if next == self.current { return None; }
 
-        self.tasks[self.current].state = TaskState::Ready;
+        if self.tasks[self.current].state == TaskState::Running {
+            self.tasks[self.current].state = TaskState::Ready;
+        }
         self.tasks[next].state = TaskState::Running;
 
         let old_rsp = &mut self.tasks[self.current].rsp as *mut u64;
@@ -87,6 +106,68 @@ impl Scheduler {
 }
 
 pub static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::empty());
+
+// IDs 0/1 are the boot-registered idle/blink tasks (kmain, see main.rs).
+static NEXT_TASK_ID: AtomicUsize = AtomicUsize::new(2);
+
+/// Spawn a new task at runtime. Reuses a `Dead` task's slot (and its stack
+/// allocation) if one exists — same "evict an exited entry" pattern
+/// `process::exec()` uses for its process table — otherwise appends a new
+/// slot. Returns the new task's id.
+pub fn spawn(name: &'static str, entry: fn() -> !) -> usize {
+    let id = NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed);
+    let task = Task::new(id, name, entry);
+    let mut sched = SCHEDULER.lock();
+    if let Some(slot) = sched.tasks.iter_mut().find(|t| t.state == TaskState::Dead) {
+        *slot = task;
+    } else {
+        sched.tasks.push(task);
+    }
+    id
+}
+
+/// Terminate the calling task. Marks it `Dead` (its slot is reused by a
+/// future `spawn()`, freeing the old stack) and switches away — never
+/// returns. If no other task is currently `Ready`/`Blocked`-with-work, this
+/// is the last runnable task and the CPU halts.
+pub fn exit_current() -> ! {
+    let switch = {
+        let mut sched = SCHEDULER.lock();
+        let cur = sched.current;
+        sched.tasks[cur].state = TaskState::Dead;
+        sched.next()
+    };
+    if let Some((old_rsp, new_rsp)) = switch {
+        unsafe { context_switch(old_rsp, new_rsp); }
+    }
+    loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
+}
+
+/// Block the calling task for approximately `ms` milliseconds (rounded up to
+/// the nearest timer tick, ~10ms — see `TICK_COUNT`'s doc comment) and yield
+/// to another task. If no other task is `Ready` right now, falls straight
+/// through without actually blocking (a single-task system can't afford to
+/// sleep — there'd be nothing to wake it).
+pub fn sleep_ms(ms: u64) {
+    let ticks = (ms / 10).max(1);
+    let switch = {
+        let mut sched = SCHEDULER.lock();
+        let cur = sched.current;
+        let wake_at = TICK_COUNT.load(Ordering::Relaxed) + ticks;
+        sched.tasks[cur].wake_at = wake_at;
+        sched.tasks[cur].state = TaskState::Blocked;
+        sched.next()
+    };
+    if let Some((old_rsp, new_rsp)) = switch {
+        unsafe { context_switch(old_rsp, new_rsp); }
+    } else {
+        // No other task to run — undo the Blocked state we tentatively set,
+        // since nothing will ever call next() to promote us back to Ready.
+        let mut sched = SCHEDULER.lock();
+        let cur = sched.current;
+        sched.tasks[cur].state = TaskState::Running;
+    }
+}
 
 /// Wall-time tick counter — incremented every ~10 ms by the APIC timer ISR.
 /// Safe to poll from any context without MMIO or TSC calibration.
