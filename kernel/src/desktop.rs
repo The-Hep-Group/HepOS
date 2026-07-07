@@ -37,6 +37,12 @@ pub const WP_BLISS: u8 = 1;
 pub static WALLPAPER: core::sync::atomic::AtomicU8 =
     core::sync::atomic::AtomicU8::new(WP_DARK);
 
+// ── Settings sidebar page ─────────────────────────────────────────────────────
+pub const SETTINGS_PAGE_BACKGROUND: u8 = 0;
+pub const SETTINGS_PAGE_SOUND:      u8 = 1;
+pub static SETTINGS_PAGE: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(SETTINGS_PAGE_BACKGROUND);
+
 // ── Desktop icons ─────────────────────────────────────────────────────────────
 // Each icon: 48×48 box + 8px gap + 8px text label = 64px slot, 80px stride.
 const ICON_SIZE:   usize = 48;

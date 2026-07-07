@@ -52,6 +52,11 @@ pub static FOCUSED_WIN: Mutex<Option<usize>> = Mutex::new(None);
 /// drag-selection is in progress.
 static TEXT_DRAG_WIN: Mutex<Option<usize>> = Mutex::new(None);
 
+/// True while the Settings window's volume slider is being dragged (mouse
+/// button held since a fresh click landed on the slider) — lets the drag
+/// keep scrubbing volume even if the cursor moves off the slider's y-range.
+static VOLUME_DRAG: Mutex<bool> = Mutex::new(false);
+
 /// (window id, row, col, TSC timestamp) of the last fresh click in an
 /// editor/terminal content area — used to detect a double-click (same cell,
 /// within ~400ms) so it can select the whole line instead of just placing
@@ -849,20 +854,40 @@ fn task_blink() -> ! {
             }
         }
 
-        // Settings window: click on wallpaper thumbnail to change background
-        if fresh_click {
-            let settings_click = {
+        // Settings window: sidebar page switch, wallpaper thumbnail click, and
+        // the Sound page's volume slider (click-to-set, and drag-to-scrub
+        // while the button stays held — same held/fresh_click pattern as the
+        // editor/terminal text-selection drag above).
+        {
+            enum SettingsAction { Page(u8), Wallpaper(u8), Volume(u8) }
+            let btn_held = btn & 1 != 0;
+            let win_rel = {
                 let dt = desktop::DESKTOP.lock();
                 dt.as_ref().and_then(|d| {
                     let win = d.windows.iter().find(|w| w.id == 5 && !w.minimized)?;
                     if mx < win.x || mx >= win.x + win.w as i32 { return None; }
                     if my < win.y || my >= win.y + win.h as i32  { return None; }
-                    // Sidebar is 110px wide — clicks there are nav (only one page for now)
-                    let rel_x = (mx - win.x) as usize;
-                    let rel_y = (my - win.y) as usize;
-                    if rel_x < 110 { return None; } // sidebar click, no action
-                    // Thumbnails start at content_x=120, y=50 (relative)
-                    // Each thumb is 120×80 with 16px gap
+                    Some(((mx - win.x) as usize, (my - win.y) as usize))
+                })
+            };
+            let action = if fresh_click {
+                win_rel.and_then(|(rel_x, rel_y)| {
+                    if rel_x < 110 {
+                        let row = (rel_y.saturating_sub(SETTINGS_SIDEBAR_TOP)) / SETTINGS_SIDEBAR_ROW_H;
+                        return SETTINGS_SIDEBAR.get(row).map(|&(_, id)| SettingsAction::Page(id));
+                    }
+                    let page = desktop::SETTINGS_PAGE.load(core::sync::atomic::Ordering::Relaxed);
+                    if page == desktop::SETTINGS_PAGE_SOUND {
+                        let px = rel_x.saturating_sub(110 + 1);
+                        let py = rel_y;
+                        if py >= VOL_SLIDER_Y.saturating_sub(4) && py < VOL_SLIDER_Y + VOL_SLIDER_H + 4 {
+                            *VOLUME_DRAG.lock() = true;
+                            let frac = px.saturating_sub(VOL_SLIDER_X) as f32 / VOL_SLIDER_W as f32;
+                            return Some(SettingsAction::Volume((frac.clamp(0.0, 1.0) * 100.0) as u8));
+                        }
+                        return None;
+                    }
+                    // Background page: thumbnail click
                     let tx0 = 120usize; let ty0 = 50usize;
                     let tw = 120usize;  let th = 80usize; let tgap = 16usize;
                     for i in 0..2usize {
@@ -870,16 +895,36 @@ fn task_blink() -> ! {
                         if rel_x >= tleft && rel_x < tleft + tw
                             && rel_y >= ty0 && rel_y < ty0 + th + 14
                         {
-                            return Some(i as u8);
+                            return Some(SettingsAction::Wallpaper(i as u8));
                         }
                     }
                     None
                 })
+            } else if btn_held && *VOLUME_DRAG.lock() {
+                win_rel.map(|(rel_x, _)| {
+                    let px = rel_x.saturating_sub(110 + 1);
+                    let frac = (px.saturating_sub(VOL_SLIDER_X)) as f32 / VOL_SLIDER_W as f32;
+                    SettingsAction::Volume((frac.clamp(0.0, 1.0) * 100.0) as u8)
+                })
+            } else {
+                None
             };
-            if let Some(wp) = settings_click {
-                desktop::WALLPAPER.store(wp, core::sync::atomic::Ordering::Relaxed);
-                let mut dt = desktop::DESKTOP.lock();
-                if let Some(dt) = dt.as_mut() { dt.dirty = true; }
+            if !btn_held { *VOLUME_DRAG.lock() = false; }
+
+            match action {
+                Some(SettingsAction::Page(id)) => {
+                    desktop::SETTINGS_PAGE.store(id, core::sync::atomic::Ordering::Relaxed);
+                    if let Some(dt) = desktop::DESKTOP.lock().as_mut() { dt.dirty = true; }
+                }
+                Some(SettingsAction::Wallpaper(wp)) => {
+                    desktop::WALLPAPER.store(wp, core::sync::atomic::Ordering::Relaxed);
+                    if let Some(dt) = desktop::DESKTOP.lock().as_mut() { dt.dirty = true; }
+                }
+                Some(SettingsAction::Volume(v)) => {
+                    hda::set_volume(v);
+                    if let Some(dt) = desktop::DESKTOP.lock().as_mut() { dt.dirty = true; }
+                }
+                None => {}
             }
         }
 
@@ -1515,6 +1560,45 @@ fn make_demo_wav() -> alloc::vec::Vec<u8> {
     buf
 }
 
+/// Sidebar rows, top to bottom — shared between rendering and click hit-testing
+/// in main.rs's Settings click handler so the two never drift out of sync.
+const SETTINGS_SIDEBAR: &[(&str, u8)] = &[
+    ("Background", desktop::SETTINGS_PAGE_BACKGROUND),
+    ("Sound",      desktop::SETTINGS_PAGE_SOUND),
+];
+const SETTINGS_SIDEBAR_ROW_H: usize = 22;
+const SETTINGS_SIDEBAR_TOP:   usize = 30;
+
+// Volume slider geometry, relative to the Sound panel's origin (px, wy) —
+// shared between rendering and the click/drag hit-test in main.rs's mouse loop.
+const VOL_SLIDER_X: usize = 12;
+const VOL_SLIDER_Y: usize = 56;
+const VOL_SLIDER_W: usize = 220;
+const VOL_SLIDER_H: usize = 10;
+
+fn render_settings_sound(
+    display: &mut framebuffer::Display, px: usize, wy: usize, pw: usize,
+    acc: framebuffer::Color, text: framebuffer::Color, dim: framebuffer::Color,
+) {
+    use framebuffer::Color;
+    display.draw_text(px + 12, wy + 10, "Sound", acc, 1);
+    display.draw_text(px + 12, wy + 24, "Adjust output volume", dim, 1);
+    display.fill_rect(px, wy + 38, pw, 1, Color::from_hex(0x2A2A50));
+
+    let vol = if hda::is_available() { hda::get_volume() } else { 0 };
+    let label = alloc::format!("Volume: {}{}", vol, if hda::is_available() { "" } else { " (HDA unavailable)" });
+    display.draw_text(px + VOL_SLIDER_X, wy + VOL_SLIDER_Y - 14, &label, text, 1);
+
+    let sx = px + VOL_SLIDER_X;
+    let sy = wy + VOL_SLIDER_Y;
+    display.fill_rect(sx, sy, VOL_SLIDER_W, VOL_SLIDER_H, Color::from_hex(0x222244));
+    let fill_w = (VOL_SLIDER_W * vol as usize) / 100;
+    if fill_w > 0 { display.fill_rect(sx, sy, fill_w, VOL_SLIDER_H, acc); }
+    // Handle
+    let hx = sx + fill_w.min(VOL_SLIDER_W.saturating_sub(4));
+    display.fill_rect(hx, sy.saturating_sub(2), 4, VOL_SLIDER_H + 4, Color::from_hex(0xFFFFFF));
+}
+
 fn render_settings_window(display: &mut framebuffer::Display, wx: usize, wy: usize, ww: usize, wh: usize) {
     use framebuffer::Color;
     let bg       = Color::from_hex(0x0C0C0C);
@@ -1524,6 +1608,7 @@ fn render_settings_window(display: &mut framebuffer::Display, wx: usize, wy: usi
     let dim      = Color::from_hex(0x666688);
     let sel_bg   = Color::from_hex(0x1E1E40);
     let cur_wp   = desktop::WALLPAPER.load(core::sync::atomic::Ordering::Relaxed);
+    let page     = desktop::SETTINGS_PAGE.load(core::sync::atomic::Ordering::Relaxed);
 
     // Content background
     display.fill_rect(wx, wy, ww, wh, bg);
@@ -1537,14 +1622,23 @@ fn render_settings_window(display: &mut framebuffer::Display, wx: usize, wy: usi
     display.draw_text(wx + 8, wy + 10, "Settings", acc, 1);
     display.fill_rect(wx, wy + 24, SB_W, 1, Color::from_hex(0x2A2A50));
 
-    // Only item: "Background" — always selected
-    display.fill_rect(wx + 2, wy + 30, SB_W - 4, 22, sel_bg);
-    display.fill_rect(wx, wy + 30, 3, 22, acc); // accent left bar
-    display.draw_text(wx + 10, wy + 37, "Background", text, 1);
+    for (i, &(label, id)) in SETTINGS_SIDEBAR.iter().enumerate() {
+        let ry = wy + SETTINGS_SIDEBAR_TOP + i * SETTINGS_SIDEBAR_ROW_H;
+        if id == page {
+            display.fill_rect(wx + 2, ry, SB_W - 4, SETTINGS_SIDEBAR_ROW_H, sel_bg);
+            display.fill_rect(wx, ry, 3, SETTINGS_SIDEBAR_ROW_H, acc); // accent left bar
+        }
+        display.draw_text(wx + 10, ry + 7, label, if id == page { text } else { dim }, 1);
+    }
 
     // ── Right panel ──────────────────────────────────────────────────────────
     let px = wx + SB_W + 1; // panel left edge
     let pw = ww.saturating_sub(SB_W + 1);
+
+    if page == desktop::SETTINGS_PAGE_SOUND {
+        render_settings_sound(display, px, wy, pw, acc, text, dim);
+        return;
+    }
 
     display.draw_text(px + 12, wy + 10, "Background", acc, 1);
     display.draw_text(px + 12, wy + 24, "Choose your desktop background", dim, 1);

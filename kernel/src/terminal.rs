@@ -29,7 +29,7 @@ const COMMAND_NAMES: &[&str] = &[
     "rm", "cp", "mv", "write", "edit", "uname", "mem", "date",
     "history", "lspci", "netdiag", "netstart", "netpoll", "ifconfig",
     "ping", "wget", "udp", "view", "play", "shutdown", "reboot", "echo",
-    "sysinfo", "syscallinfo", "runtest", "runhello", "exec", "ps", "newterm", "beep",
+    "sysinfo", "syscallinfo", "runtest", "runhello", "exec", "ps", "newterm", "beep", "volume",
 ];
 
 #[derive(Clone, Copy)]
@@ -937,6 +937,22 @@ impl Terminal {
                 } else {
                     self.print(&alloc::format!("beep: {} Hz for {} ms\n", freq, ms));
                     crate::hda::beep(freq, ms);
+                }
+            }
+
+            "volume" => {
+                if !crate::hda::is_available() {
+                    self.print_colored("volume: HDA not available\n", ERR);
+                } else if arg1.is_empty() {
+                    self.print(&alloc::format!("volume: {}\n", crate::hda::get_volume()));
+                } else {
+                    match arg1.parse::<u8>() {
+                        Ok(v) if v <= 100 => {
+                            crate::hda::set_volume(v);
+                            self.print(&alloc::format!("volume: set to {}\n", v));
+                        }
+                        _ => self.print_colored("usage: volume [0-100]\n", ERR),
+                    }
                 }
             }
 

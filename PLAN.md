@@ -489,7 +489,7 @@ Range 0–32767 scaled to framebuffer size.
 | ✓ | Start Menu lists one row per *program*, not per window — grouped the same way as the taskbar ("(N)" suffix, "--" badge only when no instance is open, opens the same jump list if N>1) |
 | ✓ | Right-click "New Window" — right-click a taskbar button or a Start Menu entry to spawn another instance of that program |
 | ○ | Window animations — original plan called for 150–200ms ease-out on open/close/minimize; windows currently snap instantly |
-| ○ | Volume control — no adjustable audio gain or taskbar volume UI exists; HDA always plays at fixed gain |
+| ✓ | Volume control — `hda::set_volume()`/`get_volume()` (0-100), applied live; Settings app "Sound" page has a click/drag slider, `volume [0-100]` terminal command also available |
 | ○ | Dirty-rect (per-widget) tracking — current double-buffer scheme is a coarser two-tier system (full-scene redraw vs. ~20-row cursor-only partial flush), not literal per-widget dirty rectangles |
 
 ### Apps
@@ -501,7 +501,7 @@ Range 0–32767 scaled to framebuffer size.
 | ✓ | Text editor selection — drag-to-select and Shift+Arrow/Home/End/PgUp/PgDn extend a visible highlighted selection; typing, Enter, Backspace, and Delete all replace the selection like a normal editor (`Editor::select_anchor`, `selection_range()`, `delete_selection_if_any()`, `mouse_down()`/`mouse_drag()` wired from `main.rs`) |
 | ✓ | Terminal selection — drag-to-select and Shift+Left/Right extend a highlighted selection over the scrollback+input grid (`Terminal::select_anchor`/`select_head`, `hit_test()`/`mouse_down()`/`mouse_drag()`) |
 | ✓ | Clipboard — Ctrl+C/Ctrl+V and Ctrl+Shift+C/Ctrl+Shift+V copy/paste the editor's selection, and now also the terminal's (Ctrl+Shift+C/V bound in `terminal::on_key` too — Ctrl+C alone stays bound to "cancel input"); shared `CLIPBOARD` static in `clipboard.rs`; right-click Copy/Paste context menu in both the editor and terminal (`ContextMenuKind::EditText`, `Desktop::clipboard_action_requested`) |
-| ✓ | Double-click to select a line — in both the editor and terminal, double-clicking a line selects it whole (`select_line()`, double-click detected via `main::is_double_click()` using `scheduler::TICK_COUNT` for timing) |
+| ✓ | Double-click to select a line — in both the editor and terminal, double-clicking a line selects it whole (`select_line()`, double-click detected via `main::is_double_click()` using TSC for timing — switched from `scheduler::TICK_COUNT` after discovering it freezes; see Known Issues) |
 | ✓ | HepFS file manager — back/forward/path bar, click-to-navigate, click-to-open |
 | ✓ | Welcome window — system info |
 | ✓ | Sysmon window — RAM bar, uptime, PCI list, storage/net status |
@@ -515,7 +515,7 @@ Range 0–32767 scaled to framebuffer size.
 | ○ | Video player (MP4/H.264) — no video playback of any kind |
 | ○ | PDF viewer — not implemented |
 | ○ | ZIP/TAR archive support — not implemented |
-| ○ | Settings: volume control, resolution — Settings app currently only has a wallpaper picker |
+| 🟡 | Settings: volume control, resolution — volume control now exists ("Sound" sidebar page); resolution control still missing |
 
 ### Networking / Ecosystem
 | ✓/○ | Feature |
@@ -540,6 +540,7 @@ Range 0–32767 scaled to framebuffer size.
 | ACPI shutdown only on QEMU | Hardcoded port 0x604 — real hardware needs FADT parsing |
 | Terminal text doesn't reflow on resize | Existing output stays at old column width; new input uses current width |
 | ~~`beep` audio doesn't stop~~ | Fixed: after tone duration, zero DMA buffer in-place while stream still runs → QEMU next-period read returns silence → 200 ms SDL drain wait → stop with stream_id preserved in bits[23:20] so QEMU matches the running stream. |
+| ~~`beep` command freezes the whole desktop while the tone plays~~ | Fixed: `hda::beep()` used to spin-wait for the full tone duration plus the 200ms drain (blocking the entire main loop the whole time — same class of bug as the terminal network commands). Rewritten to generate the square wave into a buffer and hand it to the already-non-blocking `play_pcm()` (which starts the DMA stream and returns immediately; `hda::poll()` advances the zero-buffer→drain→stop sequence over subsequent frames). Verified via a boot-time test: `beep(440, 300)` returned in ~15ms instead of ~500ms, with `is_playing()` true immediately after. |
 | ~~Audio Player window shows no live "playing" indicator~~ | Fixed: `hda::play_pcm()` is now non-blocking — it starts the DMA stream and returns immediately; a small state machine (`hda::poll()`, called once per frame from the main render loop) advances zero-buffer → drain → stop over time instead of spin-waiting inside one call. `hda::progress_ms()`/`is_playing()` let the Audio Player window show a live "Playing... Xs / Ys" indicator + progress bar. `beep()` and `play_pcm()` both call a new `stop_now()` before starting, since the controller has only one output stream to share. Verified live: booted with a temporary instrumented test — `play()` returned immediately (target 500ms), the poll loop observed the "playing" state, then cleanly finished with no hang. |
 | ~~Terminal commands freeze the whole desktop while running (network ops, etc.)~~ | Fixed — avoided the scheduler entirely (see below) and instead converted `ping`/`wget`/`udp` into a `net::NetJob` state machine (`Ping`/`Resolve`/`Tcp`/`Udp` variants) polled once per frame from `task_blink`'s loop (`net::poll()`, called alongside `hda::poll()`), the same pattern already proven for audio playback. Commands return immediately after sending the first packet; the eventual result (success, error, or timeout) is delivered async via `Terminal::print_async()`, which reprints the prompt and re-inserts whatever the user had typed in the meantime. Verified live against the real SLiRP gateway/DNS: a successful ping, a timed-out ping to an unreachable on-subnet address, and a full DNS-resolve→TCP handoff (`wget example.com`) all completed without blocking, each confirmed via boot-time instrumented tests. Along the way, fixed a real data-corruption bug this surfaced: TCP payload extraction wasn't trimming Ethernet frame padding to the IP header's own Total Length field, so small response segments got phantom zero-byte padding appended to `wget` output. |
 | **`scheduler::TICK_COUNT` freezes after the very first tick** | Discovered while building the fix above. Confirmed via a TSC-calibrated 1.5-second busy-wait that `TICK_COUNT` never advances past its initial value — the APIC timer interrupt that bootstraps `kmain → task_blink` never meaningfully re-fires afterward (consistent with the fresh-task-entered-via-bare-`ret`-never-restores-RFLAGS.IF bug root-caused and reverted in an earlier session — that revert only undid the *experimental* multi-task changes, not this pre-existing 2-task idle/blink scheduler, which still has the bug). Practical effect: anything timed off `TICK_COUNT` never expires. The new `net::NetJob` deadlines and the double-click detector (`main::is_double_click()`) were both changed to use TSC (`hda::rdtsc()` + `hda::TSC_PER_MS`) instead, which has no dependency on the timer interrupt. Root fix (making the timer actually keep firing) is still open — see Next Steps. |
@@ -581,7 +582,7 @@ Range 0–32767 scaled to framebuffer size.
 30. **Real file format support** — PNG/JPG (image viewer), MP3/FLAC/OGG (audio player), MP4/H.264 (no video player exists at all), PDF viewer, Markdown rendering, ZIP/TAR archive support. All ❌ today; blocked in practice on #29 for the codec-heavy ones.
 31. **Two-pane file manager** — current HepFS file manager is single-pane with back/forward nav; original plan called for two-pane.
 32. **Window animations** — 150–200ms ease-out on open/close/minimize, per the original plan; windows currently snap instantly.
-33. **Volume control** — no adjustable audio gain or taskbar/Settings volume UI exists.
+33. ~~**Volume control**~~ ✓ done — `hda::set_volume()`/`get_volume()` (0-100, maps to the DAC output amp's 7-bit gain field, applied immediately via a live verb so it affects whatever's currently playing, not just the next clip); `volume [0-100]` terminal command; Settings app gained a second sidebar page ("Sound") with a click-to-set and drag-to-scrub slider. Verified via a boot-time test (default/set/clamp values, and that `beep()` stays non-blocking with volume changes applied).
 34. **Settings: resolution control** — Settings app currently only has the wallpaper picker.
 
 ---

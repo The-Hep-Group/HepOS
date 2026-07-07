@@ -183,6 +183,35 @@ fn verb12(mmio: *mut u8, nid: u8, opcode: u32, data: u32) -> u32 {
     send_verb(mmio, 0, nid, (opcode << 8) | (data & 0xFF))
 }
 
+// ── Volume ────────────────────────────────────────────────────────────────────
+// 0-100, applied to the DAC output amplifier's 7-bit gain field (0-127).
+// Persists across clips since `configure_codec()` re-sends the gain/mute verb
+// on every beep()/play_pcm() call; `set_volume()` also re-sends it immediately
+// so a volume change takes effect on whatever's already playing.
+static VOLUME: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(100);
+
+pub fn get_volume() -> u8 {
+    VOLUME.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set output volume (0-100, clamped) and apply it immediately if the codec
+/// is initialized — takes effect on whatever's currently playing, not just
+/// the next clip.
+pub fn set_volume(vol: u8) {
+    let vol = vol.min(100);
+    VOLUME.store(vol, core::sync::atomic::Ordering::Relaxed);
+    if let Some(hda) = HDA.lock().as_ref() {
+        send_amp_gain_mute_verb(hda.mmio, vol);
+    }
+}
+
+fn send_amp_gain_mute_verb(mmio: *mut u8, vol: u8) {
+    let gain = (vol as u32 * 127) / 100;
+    // Unmute + gain on DAC output amplifier (both channels, output).
+    // payload: bit 7=right, bit 6=left, bit 4=output, bits[5:0]=gain
+    verb4(mmio, 2, 0x3, 0xD000 | gain);
+}
+
 // ── Codec configuration ───────────────────────────────────────────────────────
 //
 // QEMU hda-duplex codec topology (hard-coded):
@@ -206,9 +235,7 @@ fn configure_codec(mmio: *mut u8, stream_id: u8, fmt: u16) {
     // Assign stream and channel (stream_id, channel 0)
     verb12(mmio, 2, 0x706, (stream_id as u32) << 4);
 
-    // Unmute + max gain on DAC output amplifier (both channels, output)
-    // payload: bit 7=right, bit 6=left, bit 4=output, bits[5:0]=gain
-    verb4(mmio, 2, 0x3, 0xD07F);
+    send_amp_gain_mute_verb(mmio, get_volume());
 
     // Enable output pin
     verb12(mmio, 4, 0x707, 0x40); // Pin Widget Control: HP-Out enable
@@ -282,102 +309,29 @@ pub fn init(devs: &[pci::PciDevice]) -> bool {
 
 /// Play a square-wave beep at `freq_hz` for `duration_ms` milliseconds.
 ///
-/// Stop strategy: after the tone duration, zero the DMA buffer IN-PLACE while
-/// the stream is still running.  QEMU's HDA timer reads guest memory each
-/// ~21 ms period, so the next read delivers silence to SDL.  We then wait
-/// 200 ms for SDL to drain before stopping the stream.  This adds 200 ms of
-/// inaudible tail but guarantees the tone stops cleanly regardless of SDL's
-/// internal buffer size.
-///
-/// The stop write preserves the stream-number field (bits [23:20]) so QEMU
-/// can match the running stream; writing 0 to those bits previously caused
-/// QEMU to look for "stream 0" (not running) and leave the stream active.
+/// Non-blocking — generates the tone into a buffer and hands it to
+/// `play_pcm()`, which starts the DMA stream and returns immediately;
+/// `poll()` (called once per frame from the main loop) advances the
+/// zero-buffer → drain → stop sequence in the background. `beep` used to
+/// spin-wait for the whole tone + a 200ms drain, freezing the entire desktop
+/// for the command's duration — see PLAN.md Known Issues.
 pub fn beep(freq_hz: u32, duration_ms: u32) {
-    // The controller has exactly one output stream — if an async play_pcm()
-    // clip is mid-playback, force it to a clean stop first so we don't race
-    // on the same SD_CTL registers / free its buffer out from under it.
-    stop_now();
+    let sample_rate: u32 = 48_000;
+    let total_samples = ((sample_rate * duration_ms) / 1_000) as usize;
+    let n = total_samples.min((1usize << 20) / 4); // cap to play_pcm's 1MB buffer
 
-    let guard  = HDA.lock();
-    let hda    = match guard.as_ref() { Some(h) => h, None => return };
-    let mmio   = hda.mmio;
-    let sd_off = hda.sd_off;
-    drop(guard);
-
-    let sample_rate:    u32 = 48_000;
-    let bytes_per_samp: u32 = 4; // stereo 16-bit
-    let total_samples = (sample_rate * duration_ms) / 1_000;
-    let buf_bytes = ((total_samples * bytes_per_samp) as usize).min(1 << 20).max(4096);
-    let buf_pages = (buf_bytes + 4095) / 4096;
-
-    let buf_phys = match pmm::alloc_contiguous(buf_pages) {
-        Some(p) => p,
-        None    => { serial::print("HDA: OOM\n"); return; }
-    };
-    let buf_virt = vmm::phys_to_virt(buf_phys) as *mut i16;
-
-    // Pre-zero so any unwritten tail is silent.
-    unsafe { core::ptr::write_bytes(buf_virt as *mut u8, 0, buf_bytes); }
-
-    // Generate square wave.
+    let mut samples = alloc::vec![0i16; n * 2];
     let period_samp = if freq_hz > 0 { sample_rate / freq_hz } else { 0 };
     if period_samp > 0 {
         let half = period_samp / 2;
-        let n    = (total_samples as usize).min(buf_bytes / 4);
         for i in 0..n {
             let val: i16 = if (i as u32) % period_samp < half { 0x7FFF } else { -0x7FFF };
-            unsafe { buf_virt.add(i*2).write(val); buf_virt.add(i*2+1).write(val); }
+            samples[i*2] = val;
+            samples[i*2 + 1] = val;
         }
     }
 
-    let bdl_phys = match pmm::alloc_page() {
-        Some(p) => p,
-        None    => { for i in 0..buf_pages as u64 { pmm::free_page(buf_phys + i*4096); } return; }
-    };
-    unsafe { (vmm::phys_to_virt(bdl_phys) as *mut BdlEntry).write(BdlEntry { addr: buf_phys, len: buf_bytes as u32, ioc: 1 }); }
-
-    let stream_id: u8 = 1;
-    let fmt: u16      = 0x0011; // 48 kHz, 16-bit, stereo
-    configure_codec(mmio, stream_id, fmt);
-
-    // Reset stream.
-    w32(mmio, sd_off + SD_CTL, SD_CTL_SRST); spin(5_000);
-    w32(mmio, sd_off + SD_CTL, 0);           spin(5_000);
-
-    // Program stream descriptor.
-    w32(mmio, sd_off + SD_BDPL, bdl_phys as u32);
-    w32(mmio, sd_off + SD_BDPU, (bdl_phys >> 32) as u32);
-    w32(mmio, sd_off + SD_CBL,  buf_bytes as u32);
-    w16(mmio, sd_off + SD_LVI,  0);
-    w16(mmio, sd_off + SD_FMT,  fmt);
-
-    // ctl_base keeps stream_id in bits [23:20] — must be preserved in every
-    // subsequent SD_CTL write so QEMU can identify the running stream.
-    let ctl_base = ((stream_id as u32) << 20) | SD_CTL_IOCE;
-    w32(mmio, sd_off + SD_CTL, ctl_base | SD_CTL_RUN);
-
-    let tsc_per_ms = TSC_PER_MS.load(core::sync::atomic::Ordering::Relaxed);
-
-    // Wait for the tone to play.
-    let tone_end = rdtsc().wrapping_add(tsc_per_ms.saturating_mul(duration_ms as u64));
-    while rdtsc().wrapping_sub(tone_end) > u64::MAX / 2 { core::hint::spin_loop(); }
-
-    // Zero the DMA buffer while the stream is still running.
-    // QEMU's HDA timer will read zeros on the next ~21 ms tick → SDL receives
-    // silence.  The stream keeps running (reading zeros) during the drain wait.
-    unsafe { core::ptr::write_bytes(buf_virt as *mut u8, 0, buf_bytes); }
-
-    // Wait 200 ms for SDL to drain its internal queue to silence.
-    let drain_end = rdtsc().wrapping_add(tsc_per_ms.saturating_mul(200));
-    while rdtsc().wrapping_sub(drain_end) > u64::MAX / 2 { core::hint::spin_loop(); }
-
-    // Stop stream — preserve stream_id so QEMU matches the running stream.
-    w32(mmio, sd_off + SD_CTL, ctl_base);                spin(50_000); // RUN=0
-    w32(mmio, sd_off + SD_CTL, ctl_base | SD_CTL_SRST);  spin(50_000); // SRST=1
-    w32(mmio, sd_off + SD_CTL, ctl_base);                spin(50_000); // SRST=0
-
-    pmm::free_page(bdl_phys);
-    for i in 0..buf_pages as u64 { pmm::free_page(buf_phys + i*4096); }
+    play_pcm(&samples);
 }
 
 // ── Async PCM playback ────────────────────────────────────────────────────────
