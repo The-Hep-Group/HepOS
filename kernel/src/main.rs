@@ -239,7 +239,7 @@ extern "C" fn kmain(bi_ptr: *const bootinfo::BootInfo) -> ! {
         if let Some(dt) = dt.as_mut() {
             for id in [3usize, 4, 5, 6, 7] {
                 if let Some(w) = dt.windows.iter_mut().find(|w| w.id == id) {
-                    w.minimized = true;
+                    w.hide_instant(); // starting hidden — never shown, nothing to animate
                 }
             }
         }
@@ -422,7 +422,7 @@ fn task_blink() -> ! {
                         let mut dt = desktop::DESKTOP.lock();
                         if let Some(dt) = dt.as_mut() {
                             if let Some(w) = dt.windows.iter_mut().find(|w| w.id == 3) {
-                                w.minimized = true;
+                                w.hide();
                             }
                             dt.dirty = true;
                         }
@@ -448,7 +448,7 @@ fn task_blink() -> ! {
                         let mut dt = desktop::DESKTOP.lock();
                         if let Some(dt) = dt.as_mut() {
                             if let Some(w) = dt.windows.iter_mut().find(|w| w.id == target_wid) {
-                                w.minimized = true;
+                                w.hide();
                             }
                             dt.dirty = true;
                         }
@@ -640,7 +640,7 @@ fn task_blink() -> ! {
                 let mut dt = desktop::DESKTOP.lock();
                 if let Some(dt) = dt.as_mut() {
                     if let Some(w) = dt.windows.iter_mut().find(|w| w.id == 5) {
-                        w.minimized = false;
+                        w.show();
                     }
                     dt.bring_to_front(5);
                     *FOCUSED_WIN.lock() = Some(5);
@@ -676,7 +676,7 @@ fn task_blink() -> ! {
                     let mut dt = desktop::DESKTOP.lock();
                     if let Some(dt) = dt.as_mut() {
                         if let Some(w) = dt.windows.iter_mut().find(|w| w.id == win_id) {
-                            w.minimized = false;
+                            w.show();
                         }
                         dt.bring_to_front(win_id);
                         dt.dirty = true;
@@ -836,7 +836,7 @@ fn task_blink() -> ! {
                                     let mut dt = desktop::DESKTOP.lock();
                                     if let Some(dt) = dt.as_mut() {
                                         if let Some(w) = dt.windows.iter_mut().find(|w| w.id == 7) {
-                                            w.minimized = false;
+                                            w.show();
                                         }
                                         dt.bring_to_front(7);
                                         dt.dirty = true;
@@ -957,11 +957,24 @@ fn task_blink() -> ! {
         //   mouse_only    → restore scene rows near cursor + repaint cursor + partial flush
         // The partial path updates only ~20 rows (~100 KB) instead of 3.5 MB, so
         // cursor movement is extremely cheap and runs at the full polling rate.
+        // Advance window open/close animations (cheap no-op when none are
+        // active); force a redraw every frame while any is in progress, since
+        // nothing else would otherwise mark the scene dirty mid-animation.
+        // Must also force it on the exact frame an animation *finishes* —
+        // tick_anims() clears the anim before any_animating() would see it,
+        // so relying on any_animating() alone skipped that final frame and
+        // left a just-closed window's last (shrunk) frame on screen
+        // indefinitely, until some unrelated input forced a redraw.
+        let animating = {
+            let mut dt = desktop::DESKTOP.lock();
+            dt.as_mut().map(|d| { let just_finished = d.tick_anims(); just_finished || d.any_animating() }).unwrap_or(false)
+        };
+
         let content_dirty = {
             let dd = desktop::DESKTOP.lock().as_ref().map(|d| d.dirty).unwrap_or(false);
             let td = terminal::TERMINAL.lock().as_ref().map(|t| t.dirty).unwrap_or(false);
             let ed = terminal::EXTRA_TERMINALS.lock().iter().any(|(_, t)| t.dirty);
-            dd || td || ed || ps2_had_input || hda::is_playing()
+            dd || td || ed || ps2_had_input || hda::is_playing() || animating
         };
         let mouse_moved = {
             let md = desktop::DESKTOP.lock().as_ref().map(|d| d.mouse_dirty).unwrap_or(false);
@@ -1060,12 +1073,17 @@ fn task_blink() -> ! {
                 { let mut dt = desktop::DESKTOP.lock();
                   if let Some(dt) = dt.as_mut() { dt.dirty = false; } }
 
-                // 2. Windows in z-order
+                // 2. Windows in z-order — includes windows still mid-close-animation
+                // (not yet actually `minimized`), rendered at their eased (shrinking
+                // or growing) rect instead of their real target geometry.
                 let win_order: alloc::vec::Vec<(usize, desktop::AppKind, bool, i32, i32, usize, usize)> = {
                     let dt = desktop::DESKTOP.lock();
                     dt.as_ref().map(|d| d.windows.iter()
-                        .filter(|w| !w.minimized)
-                        .map(|w| (w.id, w.app_kind, d.focused == Some(w.id), w.x, w.y, w.w, w.h))
+                        .filter(|w| !w.minimized || w.is_closing())
+                        .map(|w| {
+                            let (ex, ey, ew, eh) = w.eased_rect();
+                            (w.id, w.app_kind, d.focused == Some(w.id), ex, ey, ew, eh)
+                        })
                         .collect()
                     ).unwrap_or_default()
                 };
@@ -1073,7 +1091,7 @@ fn task_blink() -> ! {
                     { let dt = desktop::DESKTOP.lock();
                       if let Some(dt) = dt.as_ref() {
                           if let Some(win) = dt.windows.iter().find(|w| w.id == *id) {
-                              dt.draw_window(display, win, *focused);
+                              dt.draw_window(display, win, *focused, (*wx, *wy, *ww, *wh));
                           }
                       }
                     }

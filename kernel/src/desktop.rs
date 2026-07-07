@@ -97,6 +97,43 @@ const TASK_BTN_W:     usize = 120;
 const MENU_ENTRY_H:   usize = 26;
 const MENU_W:         usize = 160;
 
+// ── Window open/close animation ───────────────────────────────────────────────
+// 180ms ease-out scale, centered on the window's own position. `Opening` runs
+// on creation and on every unminimize; `Closing` runs on minimize/close and
+// keeps the window rendering (at a shrinking scale) until it finishes, at
+// which point `Desktop::tick_anims()` actually sets `minimized = true`.
+//
+// Timed via TSC rather than `scheduler::TICK_COUNT` (frozen after the first
+// tick — see PLAN.md Known Issues). TSC_PER_MS is calibrated fairly early in
+// boot (during `hda::init()`), but windows 0-7 are created just *before*
+// that — their very first Opening anim will see `TSC_PER_MS == 0`, which
+// `.max(1)` turns into a huge elapsed-ms value, so `progress()` reads as
+// "already done" and they simply appear at full size with no animation.
+// Harmless: only the boot-created windows are affected, and every animation
+// after boot (new windows, unminimize, close) times correctly.
+const ANIM_MS: u64 = 180;
+
+#[derive(Clone, Copy, PartialEq)]
+enum AnimKind {
+    Opening,
+    Closing,
+    /// Maximize/restore/snap — lerps from a stored old rect to the window's
+    /// current real (x, y, w, h), rather than scaling from/to a phantom
+    /// smaller rect centered on the window (that's Opening/Closing's job).
+    Transition { from: (i32, i32, usize, usize) },
+}
+
+#[derive(Clone, Copy)]
+struct WindowAnim { kind: AnimKind, start_tsc: u64 }
+
+impl WindowAnim {
+    fn progress(&self) -> f32 {
+        let tsc_per_ms = crate::hda::TSC_PER_MS.load(core::sync::atomic::Ordering::Relaxed).max(1);
+        let elapsed_ms = crate::hda::rdtsc().wrapping_sub(self.start_tsc) / tsc_per_ms;
+        (elapsed_ms as f32 / ANIM_MS as f32).min(1.0)
+    }
+}
+
 // ── Window ───────────────────────────────────────────────────────────────────
 pub struct Window {
     pub id:          usize,
@@ -124,6 +161,7 @@ pub struct Window {
     resize_orig_h:   usize,
     resize_orig_mx:  i32,
     resize_orig_my:  i32,
+    anim:            Option<WindowAnim>,
 }
 
 impl Window {
@@ -137,10 +175,84 @@ impl Window {
             resize_orig_x: x, resize_orig_y: y,
             resize_orig_w: w, resize_orig_h: h,
             resize_orig_mx: 0, resize_orig_my: 0,
+            anim: Some(WindowAnim { kind: AnimKind::Opening, start_tsc: crate::hda::rdtsc() }),
         }
     }
 
+    /// Unminimize (or reveal a just-created window) with an ease-out open animation.
+    pub fn show(&mut self) {
+        if self.minimized {
+            self.minimized = false;
+            self.anim = Some(WindowAnim { kind: AnimKind::Opening, start_tsc: crate::hda::rdtsc() });
+        }
+    }
+
+    /// Minimize/close with an ease-out shrink animation — `minimized` isn't
+    /// set until the animation finishes (see `Desktop::tick_anims()`), so the
+    /// window keeps rendering (at a shrinking scale) for the transition.
+    pub fn hide(&mut self) {
+        if !self.minimized {
+            self.anim = Some(WindowAnim { kind: AnimKind::Closing, start_tsc: crate::hda::rdtsc() });
+        }
+    }
+
+    /// Minimize with no animation — for boot-time setup (windows that start
+    /// minimized were never shown to the user, so there's nothing to animate).
+    pub fn hide_instant(&mut self) {
+        self.minimized = true;
+        self.anim = None;
+    }
+
+    /// True while a close animation is in progress — the render loop needs to
+    /// keep drawing these even though they're not yet `minimized`.
+    pub fn is_closing(&self) -> bool {
+        matches!(self.anim, Some(WindowAnim { kind: AnimKind::Closing, .. }))
+    }
+
+    /// Current on-screen geometry, eased toward/away from the real (x, y, w, h)
+    /// while `anim` is active. Content renderers already take explicit
+    /// (wx, wy, ww, wh) and adapt to whatever size they're given (same as
+    /// live window resize), so passing a scaled rect "just works" without any
+    /// content-side changes.
+    pub fn eased_rect(&self) -> (i32, i32, usize, usize) {
+        let Some(anim) = &self.anim else { return (self.x, self.y, self.w, self.h); };
+        let t = anim.progress();
+        let eased = 1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t); // ease-out cubic
+        match anim.kind {
+            AnimKind::Opening | AnimKind::Closing => {
+                let scale = match anim.kind {
+                    AnimKind::Opening => 0.7 + 0.3 * eased, // 70% -> 100%
+                    AnimKind::Closing => 1.0 - 0.3 * eased, // 100% -> 70%
+                    AnimKind::Transition { .. } => unreachable!(),
+                };
+                let cx = self.x + self.w as i32 / 2;
+                let cy = self.y + self.h as i32 / 2;
+                let nw = ((self.w as f32) * scale) as usize;
+                let nh = ((self.h as f32) * scale) as usize;
+                let nx = cx - nw as i32 / 2;
+                let ny = cy - nh as i32 / 2;
+                (nx, ny, nw, nh)
+            }
+            AnimKind::Transition { from: (fx, fy, fw, fh) } => {
+                let lerp = |a: f32, b: f32| a + (b - a) * eased;
+                let nx = lerp(fx as f32, self.x as f32) as i32;
+                let ny = lerp(fy as f32, self.y as f32) as i32;
+                let nw = lerp(fw as f32, self.w as f32).max(0.0) as usize;
+                let nh = lerp(fh as f32, self.h as f32).max(0.0) as usize;
+                (nx, ny, nw, nh)
+            }
+        }
+    }
+
+    /// Start a Transition anim from `from` (the window's geometry *before* the
+    /// caller changes x/y/w/h) to whatever x/y/w/h are set to next — used by
+    /// maximize/restore and edge-drag snap.
+    fn start_transition(&mut self, from: (i32, i32, usize, usize)) {
+        self.anim = Some(WindowAnim { kind: AnimKind::Transition { from }, start_tsc: crate::hda::rdtsc() });
+    }
+
     pub fn toggle_maximize(&mut self, sw: usize, sh: usize) {
+        let from = (self.x, self.y, self.w, self.h);
         if self.maximized {
             self.x = self.saved_x; self.y = self.saved_y;
             self.w = self.saved_w; self.h = self.saved_h;
@@ -154,12 +266,22 @@ impl Window {
             self.h = sh.saturating_sub(TITLE_H + TASKBAR_H + BORDER_W * 2);
             self.maximized = true;
         }
+        self.start_transition(from);
     }
 
     pub fn maximize_hit(&self, mx: i32, my: i32) -> bool {
         let tx = self.x.max(0);
         let ty = self.outer_y() + BORDER_W as i32;
         let bx = tx + self.w as i32 - 34;
+        let by = ty + 4;
+        mx >= bx && mx < bx + 14 && my >= by && my < by + 14
+    }
+
+    /// "_" minimize button — just left of the maximize button.
+    pub fn minimize_hit(&self, mx: i32, my: i32) -> bool {
+        let tx = self.x.max(0);
+        let ty = self.outer_y() + BORDER_W as i32;
+        let bx = tx + self.w as i32 - 50;
         let by = ty + 4;
         mx >= bx && mx < bx + 14 && my >= by && my < by + 14
     }
@@ -345,6 +467,32 @@ impl Desktop {
         }
     }
 
+    /// True while any window has an open/close animation in progress — the
+    /// caller should force a redraw every frame while this holds, since
+    /// nothing else would otherwise mark the scene dirty mid-animation.
+    pub fn any_animating(&self) -> bool {
+        self.windows.iter().any(|w| w.anim.is_some())
+    }
+
+    /// Advance window animations — call once per frame. Finishes any anim
+    /// whose 180ms has elapsed: a completed `Closing` anim actually sets
+    /// `minimized = true` here (that's what the render loop was waiting on to
+    /// stop drawing it); a completed `Opening` anim just clears itself.
+    /// Returns true if anything changed (caller should mark the scene dirty).
+    pub fn tick_anims(&mut self) -> bool {
+        let mut changed = false;
+        for w in &mut self.windows {
+            if let Some(anim) = &w.anim {
+                if anim.progress() >= 1.0 {
+                    if anim.kind == AnimKind::Closing { w.minimized = true; }
+                    w.anim = None;
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
     /// Returns true if a new terminal window should be spawned (caller must do it after dropping the DESKTOP lock).
     pub fn update_mouse(&mut self, mx: i32, my: i32, buttons: u8) -> bool {
         let mut spawn_terminal = false;
@@ -404,12 +552,15 @@ impl Desktop {
                         let by = TITLE_H as i32 + BORDER_W as i32;
                         let hw = sw / 2;
                         let fh = sh.saturating_sub(TITLE_H + TASKBAR_H + BORDER_W * 2);
+                        let from = (win.x, win.y, win.w, win.h);
                         match zone {
                             SnapZone::Left  => { win.x = bx; win.y = by;
-                                                 win.w = hw.saturating_sub(BORDER_W * 2); win.h = fh; }
+                                                 win.w = hw.saturating_sub(BORDER_W * 2); win.h = fh;
+                                                 win.start_transition(from); }
                             SnapZone::Right => { win.x = bx + hw as i32; win.y = by;
-                                                 win.w = hw.saturating_sub(BORDER_W * 2); win.h = fh; }
-                            SnapZone::Top   => { win.toggle_maximize(sw, sh); }
+                                                 win.w = hw.saturating_sub(BORDER_W * 2); win.h = fh;
+                                                 win.start_transition(from); }
+                            SnapZone::Top   => { win.toggle_maximize(sw, sh); } // toggle_maximize starts its own transition
                         }
                         self.dirty = true;
                     }
@@ -464,7 +615,7 @@ impl Desktop {
                     self.dirty              = true;
                 } else {
                     let on_window = self.windows.iter().rev().any(|w| {
-                        !w.minimized && (w.close_hit(mx, my) || w.maximize_hit(mx, my)
+                        !w.minimized && (w.close_hit(mx, my) || w.maximize_hit(mx, my) || w.minimize_hit(mx, my)
                             || w.newterm_hit(mx, my) || w.title_hit(mx, my)
                             || w.resize_hit(mx, my) || w.content_hit(mx, my))
                     });
@@ -508,7 +659,7 @@ impl Desktop {
             self.taskbar_jumplist = None;
             self.dirty = true;
             if let Some(id) = hit {
-                if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) { w.minimized = false; }
+                if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) { w.show(); }
                 self.bring_to_front(id);
                 return false;
             }
@@ -535,7 +686,7 @@ impl Desktop {
                 if ids.len() == 1 {
                     let id = ids[0];
                     if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
-                        w.minimized = false;
+                        w.show();
                     }
                     self.bring_to_front(id);
                 } else {
@@ -565,7 +716,7 @@ impl Desktop {
                         if self.focused == Some(wid) {
                             // Click focused window button = minimize it
                             if let Some(w) = self.windows.iter_mut().find(|w| w.id == wid) {
-                                w.minimized = true;
+                                w.hide();
                             }
                             self.focused = None;
                         } else {
@@ -588,7 +739,7 @@ impl Desktop {
         let mut hit_id = None;
         for win in self.windows.iter().rev() {
             if win.minimized { continue; }
-            if win.close_hit(mx, my) || win.maximize_hit(mx, my) || win.newterm_hit(mx, my)
+            if win.close_hit(mx, my) || win.maximize_hit(mx, my) || win.minimize_hit(mx, my) || win.newterm_hit(mx, my)
                 || win.title_hit(mx, my) || win.resize_hit(mx, my) || win.content_hit(mx, my)
             {
                 hit_id = Some(win.id);
@@ -603,7 +754,7 @@ impl Desktop {
                     && my >= iy && my < iy + ih as i32 + 12 // include label row
                 {
                     if let Some(w) = self.windows.iter_mut().find(|w| w.id == icon.win_id) {
-                        w.minimized = false;
+                        w.show();
                     }
                     self.bring_to_front(icon.win_id);
                     self.dirty = true;
@@ -618,7 +769,10 @@ impl Desktop {
             self.dirty = true;
             let win = self.windows.iter_mut().find(|w| w.id == id).unwrap();
             if win.close_hit(mx, my) {
-                win.minimized = true;
+                win.hide();
+                self.focused  = None;
+            } else if win.minimize_hit(mx, my) {
+                win.hide();
                 self.focused  = None;
             } else if win.newterm_hit(mx, my) {
                 spawn_terminal = true;
@@ -789,12 +943,16 @@ impl Desktop {
     }
 
     /// Draw a single window's chrome (title bar, border, content-area background).
-    /// Called per-window from the task_blink render loop in z-order.
-    pub fn draw_window(&self, display: &mut Display, win: &Window, focused: bool) {
-        let ox = win.outer_x();
-        let oy = win.outer_y();
-        let ow = win.outer_w();
-        let oh = win.outer_h();
+    /// Called per-window from the task_blink render loop in z-order. `rect` is
+    /// the window's on-screen (x, y, w, h) for this frame — normally just
+    /// `(win.x, win.y, win.w, win.h)`, but a shrunk/grown value from
+    /// `win.eased_rect()` while an open/close animation is in progress.
+    pub fn draw_window(&self, display: &mut Display, win: &Window, focused: bool, rect: (i32, i32, usize, usize)) {
+        let (wx, wy, ww, wh) = rect;
+        let ox = wx - BORDER_W as i32;
+        let oy = wy - TITLE_H as i32 - BORDER_W as i32;
+        let ow = ww + BORDER_W * 2;
+        let oh = wh + TITLE_H + BORDER_W * 2;
 
         // Border
         let border_col = if focused { pal::BORDER_ACT } else { pal::BORDER };
@@ -804,9 +962,9 @@ impl Desktop {
 
         // Title bar
         let title_col = if focused { pal::WIN_TITLE_A } else { pal::WIN_TITLE };
-        let tx = (win.x as usize).max(0);
-        let ty = (win.outer_y() + BORDER_W as i32).max(0) as usize;
-        display.fill_rect(tx, ty, win.w, TITLE_H, title_col);
+        let tx = (wx as usize).max(0);
+        let ty = oy.max(0) as usize;
+        display.fill_rect(tx, ty, ww, TITLE_H, title_col);
 
         // "+" new-terminal button (left side of title bar, terminal windows only)
         if win.is_terminal {
@@ -818,7 +976,7 @@ impl Desktop {
         }
 
         // Close button
-        let close_x = tx + win.w.saturating_sub(18);
+        let close_x = tx + ww.saturating_sub(18);
         display.fill_rect(close_x, ty + 4, 14, 14, pal::CLOSE_BTN);
         display.draw_text(close_x + 4, ty + 5, "x", pal::TEXT, 1);
 
@@ -832,14 +990,19 @@ impl Desktop {
         display.fill_rect(max_x + 2, ty + 6, 1, 10, pal::TEXT);     // left
         display.fill_rect(max_x + 11, ty + 6, 1, 10, pal::TEXT);    // right
 
+        // Minimize button (14×14, just left of maximize button)
+        let min_x = max_x.saturating_sub(16);
+        display.fill_rect(min_x, ty + 4, 14, 14, pal::TASKBAR_BTN);
+        display.fill_rect(min_x + 2, ty + 11, 10, 1, pal::TEXT); // "_" underline glyph
+
         // Content background
-        display.fill_rect(win.x.max(0) as usize, win.y.max(0) as usize, win.w, win.h, pal::WIN_BG);
-        display.fill_rect(win.x.max(0) as usize, win.y.max(0) as usize, win.w, 1, pal::BORDER);
+        display.fill_rect(wx.max(0) as usize, wy.max(0) as usize, ww, wh, pal::WIN_BG);
+        display.fill_rect(wx.max(0) as usize, wy.max(0) as usize, ww, 1, pal::BORDER);
 
         // Resize handle — only visible when not maximized
         if !win.maximized {
-            let rx = (win.x + win.w as i32 - 2).max(0) as usize;
-            let by = (win.y + win.h as i32 - 2).max(0) as usize;
+            let rx = (wx + ww as i32 - 2).max(0) as usize;
+            let by = (wy + wh as i32 - 2).max(0) as usize;
             let hc = if focused { pal::BORDER_ACT } else { pal::BORDER };
             for d in 0..3usize {
                 if rx >= d * 3 + 1 && by >= d + 1 {
@@ -1012,14 +1175,21 @@ impl Desktop {
 
         for (i, (kind, ids)) in groups.iter().enumerate() {
             let ey = menu_y + 8 + i * MENU_ENTRY_H;
-            let any_open   = ids.iter().any(|&id| self.windows.iter().any(|w| w.id == id && !w.minimized));
+            // `ids` is every window of this kind ever created (grouped_all_entries()
+            // deliberately includes minimized ones, so the jump list can still
+            // restore a hidden instance) — but the displayed "(N)" badge should
+            // track *currently open* windows, same as the taskbar, not the
+            // ever-growing total (which never shrinks since windows are only
+            // ever minimized, never destroyed).
+            let open_count = ids.iter().filter(|&&id| self.windows.iter().any(|w| w.id == id && !w.minimized)).count();
+            let any_open   = open_count > 0;
             let any_focused = ids.iter().any(|&id| self.focused == Some(id))
                 && self.windows.iter().any(|w| ids.contains(&w.id) && self.focused == Some(w.id) && !w.minimized);
             if any_focused {
                 display.fill_rect(2, ey, MENU_W - 4, MENU_ENTRY_H - 2, pal::MENU_HOVER);
             }
-            let label = if ids.len() > 1 {
-                alloc::format!("{} ({})", app_label(*kind), ids.len())
+            let label = if open_count > 1 {
+                alloc::format!("{} ({})", app_label(*kind), open_count)
             } else {
                 String::from(app_label(*kind))
             };

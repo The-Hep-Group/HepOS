@@ -72,7 +72,7 @@ The project started from a design doc with a specific target shape (libOS-in-use
 | Dirty rect tracking + double buffer | 🟡 | Close but not literal per-widget dirty rects — a two-tier scheme instead (full-scene redraw on any dirty flag vs. a ~20-row partial flush for cursor-only movement). Same goal, different mechanism. |
 | Floating WM, opaque windows, flat design | ✅ | |
 | Dark color scheme hardcoded | 🟡 | Dark by default, but Settings now lets you switch to a Bliss-style wallpaper (blue sky/green hills) — window chrome stays dark, background is no longer strictly one hardcoded scheme |
-| Simple 150–200ms ease-out animations (open/close/minimize) | ❌ | Not implemented — windows snap instantly, no easing |
+| Simple 150–200ms ease-out animations (open/close/minimize) | ✅ | 180ms ease-out scale on open (creation + unminimize) and close/minimize |
 | Taskbar: open apps, clock, volume control | 🟡 | Apps + clock yes; **no volume control** anywhere (HDA has no adjustable gain/UI) |
 | Desktop icons | ✅ | |
 
@@ -488,7 +488,7 @@ Range 0–32767 scaled to framebuffer size.
 | ✓ | Taskbar grouping + jump list — windows of the same app kind collapse into one taskbar button with a "(N)" count; clicking it with N>1 opens a jump-list popup listing each instance ("Terminal 1", "Terminal 2", ... or the real title if distinguishing, e.g. "Editor: foo.txt") to pick which to focus |
 | ✓ | Start Menu lists one row per *program*, not per window — grouped the same way as the taskbar ("(N)" suffix, "--" badge only when no instance is open, opens the same jump list if N>1) |
 | ✓ | Right-click "New Window" — right-click a taskbar button or a Start Menu entry to spawn another instance of that program |
-| ○ | Window animations — original plan called for 150–200ms ease-out on open/close/minimize; windows currently snap instantly |
+| ✓ | Window animations — 180ms ease-out scale on open (creation + unminimize) and close/minimize (`Window::show()`/`hide()`, `eased_rect()`, `Desktop::tick_anims()`) |
 | ✓ | Volume control — `hda::set_volume()`/`get_volume()` (0-100), applied live; Settings app "Sound" page has a click/drag slider, `volume [0-100]` terminal command also available |
 | ○ | Dirty-rect (per-widget) tracking — current double-buffer scheme is a coarser two-tier system (full-scene redraw vs. ~20-row cursor-only partial flush), not literal per-widget dirty rectangles |
 
@@ -581,7 +581,13 @@ Range 0–32767 scaled to framebuffer size.
 29. **Full `std` shim** — enough surface (`std::io`, error traits, etc.) for an unmodified real-world crate (e.g. Symphonia) to link; current shim only covers the `hello` demo's needs. Would unlock real audio/image codec support instead of hand-rolled BMP/WAV-only decoders.
 30. **Real file format support** — PNG/JPG (image viewer), MP3/FLAC/OGG (audio player), MP4/H.264 (no video player exists at all), PDF viewer, Markdown rendering, ZIP/TAR archive support. All ❌ today; blocked in practice on #29 for the codec-heavy ones.
 31. **Two-pane file manager** — current HepFS file manager is single-pane with back/forward nav; original plan called for two-pane.
-32. **Window animations** — 150–200ms ease-out on open/close/minimize, per the original plan; windows currently snap instantly.
+32. ~~**Window animations**~~ ✓ done — 180ms ease-out scale (centered on the window's own position) on open (creation + unminimize) and close/minimize. `Window::show()`/`hide()` replace direct `minimized` field writes at all 11 call sites; a `hide()`'d window keeps `minimized == false` and keeps rendering (at a shrinking scale, via `eased_rect()`) until `Desktop::tick_anims()` sees the animation finish and *then* sets `minimized = true` — that's what let the close animation reuse the existing render loop without a parallel "closing windows" list. Content renderers needed zero changes since they already accept arbitrary `(wx, wy, ww, wh)` and adapt (same code path as live window resize). `draw_window()` now takes an explicit rect instead of reading `win.x/y/w/h` so chrome tracks the eased geometry too. Boot-time windows (ids 0-7) skip the animation the very first time only, because `TSC_PER_MS` isn't calibrated yet when they're created (harmless self-heals — every animation after boot times correctly). Verified with a temporary boot-time test: Opening starts smaller and grows to full size, Closing stays un-minimized+rendering until its animation completes, both confirmed via forced-elapsed `tick_anims()` calls.
+    - **Follow-up fixes/additions (same feature, next session):**
+      - **Bug: closing windows stuck small until unrelated input.** `main.rs`'s per-frame `content_dirty` computation checked `any_animating()` *after* `tick_anims()` had already cleared the just-finished animation, so the exact frame a Closing anim completed was never rendered — the window visibly stayed at its shrunk size until some other event (keypress, mouse move) forced a redraw. Fixed by capturing `tick_anims()`'s own return value (`true` iff an anim just finished) and OR-ing that into `content_dirty` too, not just the "still animating" check.
+      - **Minimize button added.** Previously only close (✕) and maximize (□) existed; close was overloaded to mean "minimize to taskbar" (this WM never destroys windows). Added a proper "_" button (`Window::minimize_hit()`, drawn just left of maximize) that also calls `hide()` — visually matches conventional chrome, even though it's functionally identical to close today.
+      - **Bug: Start Menu "(N)" badge only ever grew.** `grouped_all_entries()` intentionally includes minimized windows (so its jump list can still restore a hidden instance), but the displayed count was `ids.len()` — the *total ever created* of that kind, which never shrinks since windows are only ever minimized, not destroyed. Now the badge/label counts only currently-open (non-minimized) instances, matching the taskbar's semantics, while the jump list still lists every instance including hidden ones.
+      - **Maximize/restore and edge-drag snap now animate too.** Generalized the animation system with a third kind, `AnimKind::Transition { from }`, which lerps from a captured pre-transition rect to the window's new real geometry (distinct from Opening/Closing's scale-from-center-point behavior). `toggle_maximize()` and the Left/Right edge-snap-on-release path both call `start_transition()`. Top-edge snap already routes through `toggle_maximize()` so it's covered too.
+      - Chrome-animation polish beyond this (e.g. Start Menu/taskbar popup transitions) intentionally not done — scoped to window geometry only.
 33. ~~**Volume control**~~ ✓ done — `hda::set_volume()`/`get_volume()` (0-100, maps to the DAC output amp's 7-bit gain field, applied immediately via a live verb so it affects whatever's currently playing, not just the next clip); `volume [0-100]` terminal command; Settings app gained a second sidebar page ("Sound") with a click-to-set and drag-to-scrub slider. Verified via a boot-time test (default/set/clamp values, and that `beep()` stays non-blocking with volume changes applied).
 34. **Settings: resolution control** — Settings app currently only has the wallpaper picker.
 
@@ -719,3 +725,27 @@ spin   = "0.9"   # Mutex without std — MIT
 ```
 
 All drivers, filesystem, networking, desktop, apps — and now the bootloader (HepBL) — written from scratch.
+
+---
+
+## Future Vision — Long-Term / Exploratory (not scheduled)
+
+Ideas for after the current roadmap (Next Steps above) is done. These are intentionally vague — captured so they aren't lost, not committed to or scoped in detail yet.
+
+### ".hal" — a per-program hardware abstraction layer
+
+**The idea (user's framing):** a separate, purpose-built layer — possibly its own small language/toolchain — that every userspace program targets instead of talking to the kernel directly. Each program would run isolated behind this layer, which exposes hardware/OS capabilities (files, network, display, audio, input) through a stable interface. The goal: make it realistic to port existing open-source programs onto HepOS by targeting `.hal` instead of rewriting them against HepOS's raw internals.
+
+**How this relates to what's already tracked:** this is a superset of two items already in Next Steps —
+- **#27 Move drivers to userspace libOS** (drivers behind an IPC/MMIO-passthrough boundary)
+- **#29 Full `std` shim** (enough of `std` that unmodified crates link)
+
+`.hal` is really "what do #27 and #29 look like once they're generalized into a first-class, stable, documented interface" rather than a wholly separate effort — the isolation boundary (userspace drivers) and the ABI surface (`std` shim) are the same underlying problems.
+
+**Two paths, worth deciding between when this becomes active work:**
+1. **ABI-first (lower risk):** define `.hal` as a syscall/library ABI in Rust (or C-compatible) — a real libc-equivalent — that existing programs compile against with minimal source changes. This is a large but well-understood undertaking (same category as writing a libc).
+2. **Language-first (higher risk, higher ceiling):** design `.hal` as its own small language with a compiler, so programs are *written* in it, not just linked against it. Bigger bet — new toolchain, no existing ecosystem, much longer runway before anything ports successfully.
+
+**Recommendation when this is picked up:** start with (1). It reuses #27/#29's groundwork, and a stable ABI can be validated by porting one real small open-source program end-to-end before investing in anything language-shaped. If the ABI turns out to be fundamentally limiting for the kinds of programs being ported, that's the point to revisit (2) — not before.
+
+**Open questions to resolve later:** what isolation mechanism backs "each program is isolated" (separate address space via existing ring-3/PML4 support already in `process.rs`? something stronger?); what the minimum viable capability set is (files/net/display/audio/input, per the drivers already built); whether porting targets C programs, Rust programs, or both.
