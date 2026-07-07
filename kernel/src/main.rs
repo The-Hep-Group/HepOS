@@ -372,9 +372,21 @@ extern "C" fn kmain(bi_ptr: *const bootinfo::BootInfo) -> ! {
     // itself (detect, port init, IDENTIFY, read/write) is up and usable.
     ahci::init(&pci_devices);
 
-    // virtio-gpu — independent of the real GOP boot display; not wired into
-    // the actual render path yet, see virtio_gpu.rs's module doc.
-    virtio_gpu::init(&pci_devices);
+    // virtio-gpu — runs alongside the real GOP boot display, not instead of
+    // it (HepBL's GOP framebuffer stays the safety net if virtio-gpu isn't
+    // present or the pixel format doesn't match). When available, mirror the
+    // exact same backbuffer memory to it — zero-copy, no synthetic test
+    // pattern — so the real desktop actually renders through it live.
+    if virtio_gpu::init(&pci_devices) {
+        let mirrored = DISPLAY.lock().as_ref()
+            .and_then(|d| d.backbuf_info())
+            .map(|(phys, w, h, is_bgrx8888)| {
+                is_bgrx8888 && virtio_gpu::mirror_display(w as u32, h as u32, phys)
+            })
+            .unwrap_or(false);
+        serial::print(if mirrored { "virtio-gpu: mirroring real backbuffer\n" }
+                      else { "virtio-gpu: backbuffer format unsupported, not mirroring\n" });
+    }
 
     // Intel HDA audio
     hda::init(&pci_devices);
@@ -1267,6 +1279,7 @@ fn task_blink() -> ! {
 
                 // 6. Full flush
                 display.flush();
+                virtio_gpu::present_mirror();
             }
         } else if mouse_moved {
             if let Some(display) = DISPLAY.lock().as_mut() {
@@ -1284,7 +1297,15 @@ fn task_blink() -> ! {
                 draw_cursor!(display, mx as usize, cy);
                 prev_cursor_y = cy;
 
-                // Flush only the affected rows (~100 KB vs 3.5 MB full flush)
+                // Flush only the affected rows (~100 KB vs 3.5 MB full flush).
+                // Deliberately NOT mirrored to virtio-gpu — present_mirror()
+                // always transfers the whole frame (no partial-rect support
+                // yet), and this path runs on every mouse-move event, so
+                // mirroring it too would turn the cheap ~100KB cursor-only
+                // path into a full-frame transfer on every mouse tick. The
+                // virtio-gpu output simply lags cursor-only moves until the
+                // next full (content-dirty) redraw — an acceptable tradeoff
+                // for a first cut, not a bug.
                 display.flush_rows(y0, rows);
             }
         }

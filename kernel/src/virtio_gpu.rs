@@ -383,3 +383,53 @@ pub fn show_resource(resource_id: u32, width: u32, height: u32, pixels_phys: u64
 
     true
 }
+
+/// Re-pushes the current contents of a resource's backing memory to its
+/// scanout — call this every frame after new pixels have been written into
+/// that memory. No separate copy: `mirror_display()` attaches the resource's
+/// backing directly to the real framebuffer backbuffer, so this just tells
+/// the host "re-read what's already there."
+fn present(resource_id: u32, width: u32, height: u32) -> bool {
+    let mut guard = GPU.lock();
+    let Some(gpu) = guard.as_mut() else { return false; };
+    let r = Rect { x: 0, y: 0, w: width, h: height };
+
+    #[repr(C)]
+    struct Transfer2D { hdr: CtrlHdr, r: Rect, offset: u64, resource_id: u32, padding: u32 }
+    let xfer = Transfer2D { hdr: ctrl_hdr(CMD_TRANSFER_TO_HOST_2D), r, offset: 0, resource_id, padding: 0 };
+    let Some(resp) = submit(gpu, as_bytes(&xfer), 24) else { return false; };
+    if u32::from_ne_bytes(resp[0..4].try_into().unwrap()) != RESP_OK_NODATA { return false; }
+
+    #[repr(C)]
+    struct Flush { hdr: CtrlHdr, r: Rect, resource_id: u32, padding: u32 }
+    let flush = Flush { hdr: ctrl_hdr(CMD_RESOURCE_FLUSH), r, resource_id, padding: 0 };
+    let Some(resp) = submit(gpu, as_bytes(&flush), 24) else { return false; };
+    u32::from_ne_bytes(resp[0..4].try_into().unwrap()) == RESP_OK_NODATA
+}
+
+/// Resource id used for the one mirrored resource (this driver never juggles
+/// more than one at a time). `Some((w, h))` once `mirror_display()` has
+/// successfully wired it up — `present_mirror()` no-ops until then.
+static MIRROR: Mutex<Option<(u32, u32)>> = Mutex::new(None);
+const MIRROR_RESOURCE_ID: u32 = 1;
+
+/// One-time setup: wires a resource backed directly by `phys` (the real
+/// framebuffer's backbuffer — zero-copy, no separate GPU-side buffer) to
+/// scanout 0. After this, call `present_mirror()` once per rendered frame to
+/// push whatever's currently in that memory to the virtio-gpu display.
+/// Only supports the B8G8R8X8 pixel layout — caller is expected to check
+/// `Display::backbuf_info()`'s format flag before calling this.
+pub fn mirror_display(width: u32, height: u32, phys: u64) -> bool {
+    if !show_resource(MIRROR_RESOURCE_ID, width, height, phys) { return false; }
+    *MIRROR.lock() = Some((width, height));
+    true
+}
+
+/// Push the current backbuffer contents to the virtio-gpu display — call
+/// once per rendered frame (after the CPU-side render is done) alongside the
+/// existing GOP `Display::flush()`. No-op (returns `false`) if
+/// `mirror_display()` was never called or the device isn't present.
+pub fn present_mirror() -> bool {
+    let Some((w, h)) = *MIRROR.lock() else { return false; };
+    present(MIRROR_RESOURCE_ID, w, h)
+}

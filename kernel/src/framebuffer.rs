@@ -30,9 +30,13 @@ pub struct Display {
     //   backbuf  — what's currently being rendered/displayed (scene + cursor)
     //   scene_buf — scene without cursor; saved after each full render so the
     //               cursor can be erased cheaply without a full redraw
-    backbuf:     *mut u32,
-    scene_buf:   *mut u32,
-    backbuf_len: usize,     // width * height
+    backbuf:      *mut u32,
+    scene_buf:    *mut u32,
+    backbuf_len:  usize,     // width * height
+    backbuf_phys: u64,       // physical address of `backbuf` — 0 if not allocated.
+                              // Lets virtio_gpu.rs attach it directly as a resource's
+                              // backing memory (zero-copy mirroring of the real
+                              // desktop, not just a synthetic test pattern).
 }
 
 unsafe impl Send for Display {}
@@ -48,9 +52,10 @@ impl Display {
             r_shift: bi.fb_red_shift,
             g_shift: bi.fb_green_shift,
             b_shift: bi.fb_blue_shift,
-            backbuf:     core::ptr::null_mut(),
-            scene_buf:   core::ptr::null_mut(),
-            backbuf_len: 0,
+            backbuf:      core::ptr::null_mut(),
+            scene_buf:    core::ptr::null_mut(),
+            backbuf_len:  0,
+            backbuf_phys: 0,
         }
     }
 
@@ -69,11 +74,22 @@ impl Display {
                     core::ptr::write_bytes(v1, 0, bytes);
                     core::ptr::write_bytes(v2, 0, bytes);
                 }
-                self.backbuf     = v1 as *mut u32;
-                self.scene_buf   = v2 as *mut u32;
-                self.backbuf_len = pixels;
+                self.backbuf      = v1 as *mut u32;
+                self.scene_buf    = v2 as *mut u32;
+                self.backbuf_len  = pixels;
+                self.backbuf_phys = p1;
             }
         }
+    }
+
+    /// (physical address, width, height, whether the pixel format is
+    /// B8G8R8X8 — the only layout `virtio_gpu::mirror_display()` understands)
+    /// of the backbuffer, for `virtio_gpu.rs` to attach directly as a
+    /// resource's backing memory. `None` if the backbuffer wasn't allocated.
+    pub fn backbuf_info(&self) -> Option<(u64, usize, usize, bool)> {
+        if self.backbuf_phys == 0 { return None; }
+        let is_bgrx8888 = self.r_shift == 16 && self.g_shift == 8 && self.b_shift == 0 && self.bpp == 4;
+        Some((self.backbuf_phys, self.width, self.height, is_bgrx8888))
     }
 
     /// Save the current backbuf (scene without cursor) into scene_buf.
