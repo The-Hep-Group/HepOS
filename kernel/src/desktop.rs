@@ -115,6 +115,20 @@ const ANIM_MS: u64 = 180;
 const MENU_ANIM_MS: u64 = 150;
 
 #[derive(Clone, Copy, PartialEq)]
+enum MenuAnimKind { Opening, Closing }
+
+#[derive(Clone, Copy)]
+struct MenuAnim { kind: MenuAnimKind, start_tsc: u64 }
+
+impl MenuAnim {
+    fn progress(&self) -> f32 {
+        let tsc_per_ms = crate::hda::TSC_PER_MS.load(core::sync::atomic::Ordering::Relaxed).max(1);
+        let elapsed_ms = crate::hda::rdtsc().wrapping_sub(self.start_tsc) / tsc_per_ms;
+        (elapsed_ms as f32 / MENU_ANIM_MS as f32).min(1.0)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
 enum AnimKind {
     Opening,
     Closing,
@@ -366,11 +380,12 @@ pub struct Desktop {
     pub prev_cx:          i32,
     pub prev_cy:          i32,
     pub start_menu_open:  bool,
-    /// TSC timestamp of the most recent Start Menu open — lets `draw_start_menu()`
-    /// slide the popup up from behind the taskbar over `MENU_ANIM_MS` instead of
-    /// snapping open instantly. `None` means "not mid-open-animation" (fully open
-    /// or closed — closing is still instant, only the open transition animates).
-    start_menu_anim_tsc:  Option<u64>,
+    /// Drives the Start Menu's slide animation in both directions. `start_menu_open`
+    /// flips to `false` immediately on close (so every other "is the menu open"
+    /// check — input routing, hit-testing — sees it as closed right away), but
+    /// `draw_start_menu()` also renders while this is `Some(Closing)`, sliding the
+    /// popup back down behind the taskbar instead of vanishing instantly.
+    start_menu_anim:      Option<MenuAnim>,
     dbl_click_pending:    Option<usize>,
     pub snap_zone:        Option<SnapZone>,
     pub context_menu:      Option<(i32, i32)>, // Some(x,y) = right-click menu position
@@ -393,7 +408,7 @@ impl Desktop {
             windows: Vec::new(), focused: None, next_id: 0,
             fb_w, fb_h, prev_btn: 0, dirty: true, mouse_dirty: false,
             prev_cx: 0, prev_cy: 0, start_menu_open: false,
-            start_menu_anim_tsc: None,
+            start_menu_anim: None,
             dbl_click_pending: None, snap_zone: None,
             context_menu: None, context_menu_kind: ContextMenuKind::Background,
             open_settings_requested: false, new_window_requested: None,
@@ -499,19 +514,41 @@ impl Desktop {
         self.windows.iter().any(|w| w.anim.is_some())
     }
 
-    /// 0.0-1.0 progress through the Start Menu's open-slide animation (always
-    /// 1.0 once it's finished, or if the menu's never been animated-open yet).
+    /// 0.0-1.0 progress through the Start Menu's current slide animation
+    /// (always 1.0 if there isn't one — fully settled open or closed).
     fn start_menu_progress(&self) -> f32 {
-        let Some(start) = self.start_menu_anim_tsc else { return 1.0; };
-        let tsc_per_ms = crate::hda::TSC_PER_MS.load(core::sync::atomic::Ordering::Relaxed).max(1);
-        let elapsed_ms = crate::hda::rdtsc().wrapping_sub(start) / tsc_per_ms;
-        (elapsed_ms as f32 / MENU_ANIM_MS as f32).min(1.0)
+        self.start_menu_anim.as_ref().map(|a| a.progress()).unwrap_or(1.0)
     }
 
-    /// True while the Start Menu's open-slide animation is still in progress —
-    /// same "force a redraw" role as `any_animating()`.
+    /// True while the Start Menu is still mid-slide (either direction) — the
+    /// caller should force a redraw every frame while this holds, same role
+    /// as `any_animating()`.
     pub fn start_menu_animating(&self) -> bool {
-        self.start_menu_open && self.start_menu_progress() < 1.0
+        self.start_menu_progress() < 1.0
+    }
+
+    /// True while a close-slide is in progress — `draw_start_menu()` needs to
+    /// keep rendering (sliding back down) even though `start_menu_open` has
+    /// already flipped to `false` for every other purpose.
+    fn start_menu_closing(&self) -> bool {
+        matches!(self.start_menu_anim, Some(MenuAnim { kind: MenuAnimKind::Closing, .. }))
+    }
+
+    /// Open the Start Menu with a slide-up animation.
+    pub fn open_start_menu(&mut self) {
+        self.start_menu_open = true;
+        self.start_menu_anim = Some(MenuAnim { kind: MenuAnimKind::Opening, start_tsc: crate::hda::rdtsc() });
+    }
+
+    /// Close the Start Menu — `start_menu_open` flips immediately (so input
+    /// routing/hit-testing treat it as closed right away), but a close-slide
+    /// animation keeps it rendering (sliding back down) for `MENU_ANIM_MS`.
+    /// No-op (no animation) if it wasn't open to begin with.
+    pub fn close_start_menu(&mut self) {
+        if self.start_menu_open {
+            self.start_menu_anim = Some(MenuAnim { kind: MenuAnimKind::Closing, start_tsc: crate::hda::rdtsc() });
+        }
+        self.start_menu_open = false;
     }
 
     /// Advance window animations — call once per frame. Finishes any anim
@@ -528,6 +565,12 @@ impl Desktop {
                     w.anim = None;
                     changed = true;
                 }
+            }
+        }
+        if let Some(anim) = &self.start_menu_anim {
+            if anim.progress() >= 1.0 {
+                self.start_menu_anim = None;
+                changed = true;
             }
         }
         changed
@@ -662,7 +705,7 @@ impl Desktop {
                     if !on_window {
                         self.context_menu      = Some((mx, my));
                         self.context_menu_kind = ContextMenuKind::Background;
-                        self.start_menu_open    = false;
+                        self.close_start_menu();
                         self.taskbar_jumplist   = None;
                         self.dirty               = true;
                     }
@@ -722,7 +765,7 @@ impl Desktop {
         if in_menu {
             let entry = (my as usize - menu_top) / MENU_ENTRY_H;
             if let Some((kind, ids)) = start_groups.get(entry) {
-                self.start_menu_open = false;
+                self.close_start_menu();
                 if ids.len() == 1 {
                     let id = ids[0];
                     if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
@@ -741,13 +784,12 @@ impl Desktop {
         if in_taskbar {
             if (mx as usize) < START_W {
                 // Start button
-                self.start_menu_open = !self.start_menu_open;
-                if self.start_menu_open { self.start_menu_anim_tsc = Some(crate::hda::rdtsc()); }
+                if self.start_menu_open { self.close_start_menu(); } else { self.open_start_menu(); }
                 self.dirty = true;
             } else {
                 // Window button — grouped by app kind; a group with >1 window opens
                 // a jump list instead of directly toggling a single window.
-                self.start_menu_open = false;
+                self.close_start_menu();
                 let groups = self.grouped_taskbar_entries();
                 let btn_x  = mx as usize - START_W;
                 let slot   = btn_x / TASK_BTN_W;
@@ -783,7 +825,7 @@ impl Desktop {
         }
 
         // Desktop / window click — close start menu, hit-test windows top-to-bottom
-        self.start_menu_open = false;
+        self.close_start_menu();
         let mut hit_id = None;
         for win in self.windows.iter().rev() {
             if win.minimized { continue; }
@@ -1235,19 +1277,27 @@ impl Desktop {
     /// Lists one row per *program* (grouped by app kind), not one per window —
     /// several open instances of the same app still show as a single entry.
     pub fn draw_start_menu(&self, display: &mut Display) {
-        if !self.start_menu_open { return; }
+        // Keep rendering through a close-slide even though `start_menu_open`
+        // already flipped to false (see `close_start_menu()`) — that's what
+        // lets it slide back down instead of vanishing instantly.
+        if !self.start_menu_open && !self.start_menu_closing() { return; }
 
         let groups = self.grouped_all_entries();
         let menu_h = groups.len() * MENU_ENTRY_H + 8;
         let target_menu_y = (self.fb_h - TASKBAR_H).saturating_sub(menu_h);
-        // Slide up from behind the taskbar on open (150ms ease-out); closing
-        // stays instant. Hit-testing (in update_mouse) always uses target_menu_y
-        // directly, not this eased value — you can't click precisely during a
-        // 150ms slide anyway, so there's no reason to chase a moving target.
+        // Slides up from behind the taskbar on open, and back down on close
+        // (150ms ease-out each way). Hit-testing (in update_mouse) always uses
+        // target_menu_y directly, not this eased value — you can't click
+        // precisely during a 150ms slide anyway, so there's no reason to chase
+        // a moving target.
         let t = self.start_menu_progress();
         let eased = 1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t);
         let start_y = self.fb_h - TASKBAR_H;
-        let menu_y = (start_y as f32 + (target_menu_y as f32 - start_y as f32) * eased) as usize;
+        let menu_y = if self.start_menu_closing() {
+            (target_menu_y as f32 + (start_y as f32 - target_menu_y as f32) * eased) as usize
+        } else {
+            (start_y as f32 + (target_menu_y as f32 - start_y as f32) * eased) as usize
+        };
 
         // Background + border
         display.fill_rect(0, menu_y, MENU_W, menu_h, pal::MENU_BG);

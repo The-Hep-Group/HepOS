@@ -256,7 +256,11 @@ pub fn init(devices: &[pci::PciDevice]) -> Option<NvmeController> {
     let cap = unsafe { (regs as *const u64).read_volatile() };
     serial::print_hex("NVMe: CAP", cap);
     let dstrd  = ((cap >> 32) & 0xF) as usize;
-    let to_ms  = (((cap >> 24) & 0xFF) as u64) * 500; // CSTS.RDY timeout in ms
+    // CSTS.RDY timeout in ms. `.max(500)` guards against a controller that
+    // reports CAP.TO == 0 (undefined/unusual, but seen on some emulators) —
+    // without a floor, the panic threshold below would be 0 and the very
+    // first spin iteration where RDY hasn't already flipped would panic.
+    let to_ms  = ((((cap >> 24) & 0xFF) as u64) * 500).max(500);
 
     // Disable controller
     let csts0 = unsafe { (regs.add(REG_CSTS) as *const u32).read_volatile() };
@@ -266,12 +270,23 @@ pub fn init(devices: &[pci::PciDevice]) -> Option<NvmeController> {
     let cc = unsafe { (regs.add(REG_CC) as *const u32).read_volatile() };
     unsafe { (regs.add(REG_CC) as *mut u32).write_volatile(cc & !1); }
 
-    // Wait for RDY = 0
+    // Wait for RDY = 0. Uses the same generous per-spin budget as the RDY=1
+    // wait below (`to_ms * 10_000_000`) — this used to be `to_ms * 1_000`,
+    // ~10,000x smaller for no good reason (both loops wait on the same
+    // CAP.TO-bounded hardware condition). `spin_loop()` iterations don't
+    // reliably correspond to a fixed amount of wall-clock time, so that
+    // undersized budget could — and, per user reports, intermittently did —
+    // panic well before the controller's real spec'd timeout had elapsed on
+    // slower/busier host machines. Since panic() only prints to serial and
+    // then spins forever (see panic.rs), this looked exactly like the whole
+    // boot silently hanging on the splash screen (the last thing drawn to
+    // the framebuffer before all driver init runs) — not a crash dialog, not
+    // a reboot, just a permanently frozen screen requiring a manual restart.
     let mut spins = 0u64;
     while unsafe { (regs.add(REG_CSTS) as *const u32).read_volatile() } & 1 != 0 {
         core::hint::spin_loop();
         spins += 1;
-        if spins > to_ms * 1_000 { panic!("NVMe disable timeout"); }
+        if spins > to_ms * 10_000_000 { panic!("NVMe disable timeout"); }
     }
     serial::print("NVMe: controller disabled\n");
 
