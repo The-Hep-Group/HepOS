@@ -12,6 +12,14 @@ pub struct Task {
     pub name:    &'static str,
     pub state:   TaskState,
     pub wake_at: u64,         // valid only while state == Blocked; in TICK_COUNT units
+    /// Set while `state == Blocked` by `block_on_irq()` — which interrupt
+    /// vector this task is waiting on. `None` for an ordinary `sleep_ms()`
+    /// block (time-based, woken by `next()`'s own `wake_at` check) or any
+    /// non-blocked task. A task blocked this way is *not* time-woken — only
+    /// `wake_irq_waiters(vector)` (called from that interrupt's handler)
+    /// promotes it back to `Ready`, so `wake_at` is set to `u64::MAX` here
+    /// to keep it out of the ordinary sleep-expiry check entirely.
+    pub waiting_irq: Option<u8>,
     _stack:      Vec<u8>,       // keeps the stack allocation alive
     pub rsp:     u64,
 }
@@ -47,7 +55,7 @@ impl Task {
             f.add(6).write(task_trampoline as *const () as u64); // ret addr
         }
 
-        Task { id, name, state: TaskState::Ready, wake_at: 0, _stack: stack, rsp: rsp as u64 }
+        Task { id, name, state: TaskState::Ready, wake_at: 0, waiting_irq: None, _stack: stack, rsp: rsp as u64 }
     }
 }
 
@@ -77,10 +85,14 @@ impl Scheduler {
         let n = self.tasks.len();
         if n < 2 { return None; }
 
-        // Blocked tasks whose wake time has passed become eligible again.
+        // Blocked tasks whose wake time has passed become eligible again —
+        // but not one blocked on an IRQ instead (`waiting_irq.is_some()`):
+        // that one is only ever woken by `wake_irq_waiters()`, and its
+        // `wake_at` is deliberately `u64::MAX` so it'd never match here
+        // anyway, but the explicit check keeps this loop's own logic honest.
         let now = TICK_COUNT.load(Ordering::Relaxed);
         for t in self.tasks.iter_mut() {
-            if t.state == TaskState::Blocked && now >= t.wake_at {
+            if t.state == TaskState::Blocked && t.waiting_irq.is_none() && now >= t.wake_at {
                 t.state = TaskState::Ready;
             }
         }
@@ -169,6 +181,49 @@ pub fn sleep_ms(ms: u64) {
     }
 }
 
+/// Block the calling task until interrupt vector `vector` fires (some other
+/// context calls `wake_irq_waiters(vector)`), then yield to another task —
+/// the event-driven counterpart to `sleep_ms()`'s time-driven block. Backs
+/// `SYS_WAIT_IRQ`: a ring-3 process that wants to wait for its device's
+/// interrupt instead of busy-polling makes that syscall, which calls this
+/// from within the handler — blocking *this* (the syscall's own) task, same
+/// as `sleep_ms()` already does from inside other syscalls-that-block.
+/// Falls straight through without blocking if no other task is `Ready`
+/// (same reasoning as `sleep_ms()`: nothing would ever wake a lone task).
+pub fn block_on_irq(vector: u8) {
+    let switch = {
+        let mut sched = SCHEDULER.lock();
+        let cur = sched.current;
+        sched.tasks[cur].waiting_irq = Some(vector);
+        sched.tasks[cur].wake_at = u64::MAX;
+        sched.tasks[cur].state = TaskState::Blocked;
+        sched.next()
+    };
+    if let Some((old_rsp, new_rsp)) = switch {
+        unsafe { context_switch(old_rsp, new_rsp); }
+    } else {
+        let mut sched = SCHEDULER.lock();
+        let cur = sched.current;
+        sched.tasks[cur].state = TaskState::Running;
+        sched.tasks[cur].waiting_irq = None;
+    }
+}
+
+/// Promote every task blocked on `vector` (via `block_on_irq()`) back to
+/// `Ready`. Meant to be called from that interrupt's own handler — currently
+/// only the timer ISR does (see `tick()` below), since it's the only
+/// interrupt source with a real handler at all today; any future real device
+/// IRQ handler would call this the same way to wake its waiters.
+pub fn wake_irq_waiters(vector: u8) {
+    let mut sched = SCHEDULER.lock();
+    for t in sched.tasks.iter_mut() {
+        if t.state == TaskState::Blocked && t.waiting_irq == Some(vector) {
+            t.waiting_irq = None;
+            t.state = TaskState::Ready;
+        }
+    }
+}
+
 /// Wall-time tick counter — incremented every ~10 ms by the APIC timer ISR.
 /// Safe to poll from any context without MMIO or TSC calibration.
 pub static TICK_COUNT: core::sync::atomic::AtomicU64 =
@@ -177,6 +232,7 @@ pub static TICK_COUNT: core::sync::atomic::AtomicU64 =
 /// Called from timer ISR. Drops the lock BEFORE switching stacks.
 pub fn tick() {
     TICK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    wake_irq_waiters(crate::apic::timer_vector());
     // Acquire lock, compute switch, then DROP lock before context_switch.
     let switch = SCHEDULER.lock().next();
     if let Some((old_rsp, new_rsp)) = switch {

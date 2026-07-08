@@ -33,9 +33,49 @@ pub const SYS_GETPID: u64 = 39;
 pub const SYS_MMAP_MMIO: u64 = 500; // (phys_addr, len)         -> user VA (0 = fail)
 pub const SYS_PORT_IN:   u64 = 501; // (port, width 1/2/4)      -> value
 pub const SYS_PORT_OUT:  u64 = 502; // (port, width 1/2/4, val) -> 0
+pub const SYS_WAIT_IRQ:  u64 = 503; // (vector)                 -> 0 once it fires
 
 const ENOSYS: i64 = -38;
 const EBADF:  i64 = -9;
+const EPERM:  i64 = -1;
+
+// ── MMIO/port-I/O capability allowlist ────────────────────────────────────────
+//
+// Previously `sys_mmap_mmio`/`sys_port_in`/`sys_port_out` let any process
+// touch any physical address or I/O port at all — fine for a single
+// proof-of-concept program (`userspace/hwtest`), not once more than one
+// process can reach these. This is a real (if intentionally minimal) fix:
+// every request is checked against a fixed allowlist before it's allowed to
+// proceed, and anything outside it is refused instead of silently granted.
+//
+// **Scoped simplification, not hidden:** these ranges are a hardcoded table,
+// not per-process *granted* capabilities (no process manifest/registration
+// exists to hand out narrower or wider access to different processes) — they
+// cover exactly what this project's one real userspace client
+// (`userspace/hwtest`) actually needs: the RTC index/data ports (`0x70`/
+// `0x71`, read via `SYS_PORT_IN`) and the Local APIC's 4 KB MMIO page
+// (`0xFEE00000`, mapped via `SYS_MMAP_MMIO`). A real capability system would
+// let each process declare (or be granted) its own ranges instead of every
+// process sharing one global table — worth building before a second
+// concurrently-untrusted userspace driver ever needs *different* hardware
+// than this one does.
+const ALLOWED_PORTS: &[(u16, u16)] = &[
+    (0x70, 0x71), // RTC index/data
+];
+const ALLOWED_MMIO: &[(u64, u64)] = &[
+    (0xFEE0_0000, 0xFEE0_1000), // Local APIC, 4 KB
+];
+
+fn port_allowed(port: u16) -> bool {
+    ALLOWED_PORTS.iter().any(|&(lo, hi)| port >= lo && port <= hi)
+}
+
+/// `[phys, phys+len)` must fall entirely within one allowed range — no
+/// partial overlap lets a request straddle into disallowed territory.
+fn mmio_allowed(phys: u64, len: u64) -> bool {
+    let Some(end) = phys.checked_add(len) else { return false };
+    ALLOWED_MMIO.iter().any(|&(lo, hi)| phys >= lo && end <= hi)
+}
 
 // Kernel stack for syscall handling (16 KB, 4 pages)
 const KSTACK_PAGES: usize = 4;
@@ -198,6 +238,7 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a
         SYS_MMAP_MMIO  => sys_mmap_mmio(a1, a2),
         SYS_PORT_IN    => sys_port_in(a1, a2),
         SYS_PORT_OUT   => sys_port_out(a1, a2, a3),
+        SYS_WAIT_IRQ   => sys_wait_irq(a1),
         _              => ENOSYS as u64,
     }
 }
@@ -237,19 +278,23 @@ fn sys_exit(code: u64) -> u64 {
 
 /// mmap_mmio(phys_addr, len) — maps a physical MMIO region into the calling
 /// process's own page tables and returns the user virtual address (0 = fail:
-/// no process running, or a too-large/zero request). Once mapped, the caller
-/// reads/writes it directly with no further syscalls — the actual point of
-/// "passthrough", since a real driver needs fast polled MMIO access.
+/// no process running, a too-large/zero request, or `phys..phys+len` isn't
+/// entirely covered by `ALLOWED_MMIO`). Once mapped, the caller reads/writes
+/// it directly with no further syscalls — the actual point of "passthrough",
+/// since a real driver needs fast polled MMIO access.
 fn sys_mmap_mmio(phys: u64, len: u64) -> u64 {
+    if !mmio_allowed(phys, len) { return 0; }
     crate::process::map_mmio_for_user(phys, len)
 }
 
 /// port_in(port, width) — privileged IN, done here (not in ring 3) because
 /// ring-3 IN/OUT needs IOPL=3 or a TSS I/O bitmap, neither of which this
 /// project sets up; the syscall boundary *is* the permission check for now.
-/// width must be 1, 2, or 4 (bytes); anything else returns -ENOSYS.
+/// width must be 1, 2, or 4 (bytes); `port` must be in `ALLOWED_PORTS`;
+/// anything else returns -ENOSYS/-EPERM respectively.
 fn sys_port_in(port: u64, width: u64) -> u64 {
     let port = port as u16;
+    if !port_allowed(port) { return EPERM as u64; }
     unsafe {
         match width {
             1 => { let v: u8;  asm!("in al, dx",  out("al")  v, in("dx") port, options(nomem, nostack)); v as u64 }
@@ -261,9 +306,11 @@ fn sys_port_in(port: u64, width: u64) -> u64 {
 }
 
 /// port_out(port, width, value) — privileged OUT; see `sys_port_in` for why
-/// this runs in the kernel rather than granting ring-3 IOPL.
+/// this runs in the kernel rather than granting ring-3 IOPL, and for the
+/// same `ALLOWED_PORTS` check.
 fn sys_port_out(port: u64, width: u64, val: u64) -> u64 {
     let port = port as u16;
+    if !port_allowed(port) { return EPERM as u64; }
     unsafe {
         match width {
             1 => { asm!("out dx, al",  in("dx") port, in("al")  val as u8,  options(nomem, nostack)); 0 }
@@ -272,5 +319,20 @@ fn sys_port_out(port: u64, width: u64, val: u64) -> u64 {
             _ => ENOSYS as u64,
         }
     }
+}
+
+/// wait_irq(vector) — blocks the calling process until interrupt `vector`
+/// fires, instead of busy-polling for it. Backed by
+/// `scheduler::block_on_irq()`/`wake_irq_waiters()`: this blocks the
+/// scheduler task hosting the calling ring-3 process the same way
+/// `sleep_ms()` already blocks a task from inside a syscall, just woken by
+/// an interrupt firing instead of a deadline passing. Always returns 0 —
+/// there's no failure mode (any `u8` vector value is a legal thing to wait
+/// on, even one nothing ever signals; if there's no other task ready to run
+/// meanwhile, `block_on_irq()` falls straight through without blocking at
+/// all instead, same as `sleep_ms()`'s own documented fallback).
+fn sys_wait_irq(vector: u64) -> u64 {
+    crate::scheduler::block_on_irq(vector as u8);
+    0
 }
 

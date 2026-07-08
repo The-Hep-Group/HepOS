@@ -4,12 +4,13 @@ extern crate alloc;
 extern crate hepos_rt; // pulls in global allocator + panic handler
 
 // Proof-of-concept "userspace driver": touches real hardware entirely
-// through SYS_PORT_IN/OUT and SYS_MMAP_MMIO — the foundational primitives
-// for PLAN.md's "move drivers to userspace" item — without any direct
-// kernel-side driver code involved. See PLAN.md for what this does and
-// doesn't prove (in particular: this still runs synchronously inside a
-// single blocking `exec()`, not as a real concurrent process — that needs
-// dynamic task spawn, a separate unimplemented item).
+// through SYS_PORT_IN/OUT, SYS_MMAP_MMIO, and SYS_WAIT_IRQ — the
+// foundational primitives for PLAN.md's "move drivers to userspace" item —
+// without any direct kernel-side driver code involved. Launched via the
+// terminal's `runhwtest` command, which runs this as its own background
+// scheduler task (`process::exec_async()`) rather than blocking the
+// desktop, so `sys_wait_irq` below genuinely blocks *this* process without
+// freezing anything else. See PLAN.md for what this does and doesn't prove.
 
 use hepos_std::println;
 
@@ -35,6 +36,16 @@ pub unsafe extern "C" fn _start() -> ! {
         let id_reg = core::ptr::read_volatile((va + 0x20) as *const u32);
         println!("Local APIC ID via SYS_MMAP_MMIO: {}", id_reg >> 24);
     }
+
+    // IRQ wait: block until the timer interrupt fires instead of
+    // busy-polling for it — no real device IRQ exists to wait on yet (every
+    // driver in this kernel still polls), but the timer is a real, already-
+    // firing interrupt this can prove the mechanism against. Vector 0x20
+    // matches the kernel's `apic::TIMER_VECTOR` (see `sys_wait_irq`'s doc
+    // comment in hepos-rt for why it's hardcoded here instead of queried).
+    println!("hwtest: waiting for a timer interrupt via SYS_WAIT_IRQ...");
+    hepos_rt::sys_wait_irq(0x20);
+    println!("hwtest: woke up from SYS_WAIT_IRQ");
 
     println!("hwtest: done");
     hepos_rt::sys_exit(0);

@@ -172,3 +172,27 @@ pub fn sys_port_out(port: u16, width: u8, value: u32) {
         );
     }
 }
+
+/// Block until interrupt `vector` fires, instead of busy-polling for it.
+/// No real device IRQ exists to wait on yet (every driver in this kernel
+/// still polls) — the one real, always-firing interrupt today is the timer
+/// (vector 0x20, `apic::TIMER_VECTOR` kernel-side; hardcoded here the same
+/// way the RTC ports/Local APIC physical address above are, since userspace
+/// can't `use` a kernel-crate constant across the ELF boundary).
+pub fn sys_wait_irq(vector: u8) {
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inout("rax") 503u64 => _,
+            inout("rdi") vector as u64 => _,
+            out("rsi") _,
+            out("rdx") _,
+            out("r8") _,
+            out("r9") _,
+            out("r10") _,
+            out("rcx") _,
+            out("r11") _,
+            options(preserves_flags),
+        );
+    }
+}
