@@ -147,7 +147,7 @@ fn program_win_id(kind: AppKind) -> Option<usize> {
 /// "rename" apart without a distinct keyboard shortcut for either.
 // pub — the file manager (main.rs) reuses these same thresholds so its own
 // select/open/rename click semantics feel identical to the desktop's.
-pub const ICON_DBLCLICK_TICKS: u64 = 40;   // ~400ms
+pub const ICON_DBLCLICK_TICKS: u64 = 60;   // ~600ms — generous margin for real click speed
 pub const ICON_RENAME_TICKS:   u64 = 300;  // ~3s — beyond this, treat as a fresh, unrelated click
 
 #[derive(Clone, Copy, PartialEq)]
@@ -556,6 +556,10 @@ pub struct Desktop {
     /// Extra context for `PromptKind::RenameFsPane` — (win_id, parent_ino,
     /// old_name). Kept out of `PromptKind` itself so that enum can stay `Copy`.
     fs_rename_ctx:         Option<(usize, u32, String)>,
+    /// Set when an `FsEntry` desktop icon is opened (double-clicked) —
+    /// (ino, is_dir, name). Consumed once per frame by main.rs, which
+    /// actually opens it (new Files window, or editor/image/audio dispatch).
+    pub open_fs_entry_requested: Option<(u32, bool, String)>,
 
     // ── Taskbar button drag-to-reorder ──────────────────────────────────────
     // Mousedown arms this instead of firing the click immediately, mirroring
@@ -600,6 +604,7 @@ impl Desktop {
             icons, icon_dragging: None, icon_drag_off: (0, 0), icon_drag_moved: false,
             icon_selected: None, icon_selected_at: 0, icon_message: None,
             text_prompt: None, prompt_result: None, fs_rename_ctx: None,
+            open_fs_entry_requested: None,
             taskbar_dragging: None, taskbar_drag_start_x: 0, taskbar_drag_moved: false,
         }
     }
@@ -685,12 +690,20 @@ impl Desktop {
                 if let Some(w) = self.windows.iter_mut().find(|w| w.id == win_id) { w.show(); }
                 self.bring_to_front(win_id);
             }
-            IconKind::FsEntry { .. } => {
-                // Real "open a file" needs main.rs (editor/image/audio dispatch) —
-                // left for a follow-up pass; directories will get the same
-                // treatment once that's wired up.
+            IconKind::FsEntry { ino, is_dir } => {
+                // desktop.rs has no access to the block device or to
+                // editor/image/audio state — main.rs polls this once per
+                // frame and does the actual open (new Files window navigated
+                // in, or editor/image/audio dispatch by extension).
+                self.open_fs_entry_requested = Some((ino, is_dir, icon.label.clone()));
             }
         }
+        // Clear selection so a follow-up click starts a fresh selection
+        // cycle instead of being measured against *this* open — otherwise
+        // an open that doesn't immediately show something new on screen
+        // (nothing to visibly confirm it worked) invites another click,
+        // which would land in the rename window instead of re-opening.
+        self.icon_selected = None;
         self.dirty = true;
     }
 

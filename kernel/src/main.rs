@@ -799,6 +799,55 @@ fn task_blink() -> ! {
             }
         }
 
+        // Handle a double-clicked FsEntry desktop icon — desktop.rs has no
+        // access to the block device or to editor/image/audio state, so it
+        // just records what was opened and main.rs does the actual work,
+        // same pattern as new_window_requested/open_settings_requested above.
+        {
+            let opened = {
+                let mut dt = desktop::DESKTOP.lock();
+                dt.as_mut().and_then(|dt| dt.open_fs_entry_requested.take())
+            };
+            if let Some((ino, is_dir, name)) = opened {
+                if is_dir {
+                    let win_id = spawn_files();
+                    if win_id != usize::MAX {
+                        let mut navs = HEPFS_NAVS.lock();
+                        if let Some((_, nav)) = navs.iter_mut().find(|(id, _)| *id == win_id) {
+                            nav.ino  = ino;
+                            nav.path = alloc::format!("/home/desktop/{}", name);
+                        }
+                        drop(navs);
+                        let mut dt = desktop::DESKTOP.lock();
+                        if let Some(dt) = dt.as_mut() {
+                            if let Some(w) = dt.windows.iter_mut().find(|w| w.id == win_id) { w.show(); }
+                            dt.bring_to_front(win_id);
+                            dt.dirty = true;
+                        }
+                        *FOCUSED_WIN.lock() = Some(win_id);
+                    }
+                } else {
+                    let file_path = alloc::format!("/home/desktop/{}", name);
+                    let lower = name.to_lowercase();
+                    if lower.ends_with(".bmp") {
+                        image::open_smart(&file_path);
+                    } else if lower.ends_with(".wav") {
+                        audio::play(&file_path);
+                        let mut dt = desktop::DESKTOP.lock();
+                        if let Some(dt) = dt.as_mut() {
+                            if let Some(w) = dt.windows.iter_mut().find(|w| w.id == 7) { w.show(); }
+                            dt.bring_to_front(7);
+                            dt.dirty = true;
+                        }
+                        drop(dt);
+                        *FOCUSED_WIN.lock() = Some(7);
+                    } else {
+                        editor::open_smart(&file_path);
+                    }
+                }
+            }
+        }
+
         // Handle a confirmed desktop New File/New Folder/rename prompt — the
         // actual HepFS op (desktop.rs has no access to the block device).
         {
