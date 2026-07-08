@@ -66,13 +66,14 @@ static TEXT_DRAG_WIN: Mutex<Option<usize>> = Mutex::new(None);
 /// keep scrubbing volume even if the cursor moves off the slider's y-range.
 static VOLUME_DRAG: Mutex<bool> = Mutex::new(false);
 
-/// A file/folder row's drag-and-drop between (or within) Files windows.
-/// Armed on mousedown over a row (alongside — not instead of — that click's
-/// normal select/open/rename action, same "click still fires, drag is a
-/// layered extra" tradeoff `desktop.rs`'s taskbar drag-to-reorder made) and
-/// resolved on release: dropping anywhere inside a Files window (the same
-/// one or a different one) moves the entry into whatever directory that
-/// window is currently browsing.
+/// A file/folder row's drag-and-drop between (or within) Files windows —
+/// AND the row's own click action (open/navigate/rename), deferred here from
+/// mousedown to release exactly like `desktop.rs`'s taskbar buttons: arming
+/// a drag must NOT also fire the row's click action, or holding down to drag
+/// a row would navigate into it / open it / start a rename before the drag
+/// even got anywhere. `pending_action` is fixed at mousedown time (it depends
+/// on the click's own timing, not on when it's resolved); it only actually
+/// runs on release, and only if the row was never dragged.
 struct FileDrag {
     from_parent: u32,
     ino:  u32,
@@ -80,7 +81,12 @@ struct FileDrag {
     start_x: i32,
     start_y: i32,
     moved: bool,
+    win_id: usize,
+    is_dir: bool,
+    pending_action: FileRowAction,
 }
+#[derive(Clone, Copy, PartialEq)]
+enum FileRowAction { None, Open, Rename }
 static FILE_DRAG: Mutex<Option<FileDrag>> = Mutex::new(None);
 
 /// (window id, row, col, TSC timestamp) of the last fresh click in an
@@ -1122,21 +1128,14 @@ fn task_blink() -> ! {
                             })
                         };
                         if let Some((ino, name, flags)) = entry {
-                            // Arm a possible drag-and-drop — resolved on release
-                            // further down in the main loop. Doesn't replace the
-                            // select/open/rename click handling below; both fire
-                            // from the same mousedown, same tradeoff the taskbar's
-                            // drag-to-reorder made.
-                            *FILE_DRAG.lock() = Some(FileDrag {
-                                from_parent: cur_ino, ino, name: name.clone(),
-                                start_x: mx, start_y: my, moved: false,
-                            });
-
                             // Select-then-click-again semantics, same thresholds
                             // the desktop's own icons use (ICON_DBLCLICK_TICKS/
                             // ICON_RENAME_TICKS) so both feel identical: a fast
                             // second click on the already-selected row opens it,
                             // a slower one renames it, anything else just selects.
+                            // The select itself (highlight) applies immediately —
+                            // only the open/navigate/rename *action* is deferred
+                            // to release (see FileDrag::pending_action).
                             let now = scheduler::TICK_COUNT.load(core::sync::atomic::Ordering::Relaxed);
                             let click_state = {
                                 let mut navs = HEPFS_NAVS.lock();
@@ -1149,68 +1148,23 @@ fn task_blink() -> ! {
                                 })
                             };
                             let Some((was_selected, elapsed)) = click_state else { continue; };
-
-                            if was_selected && elapsed <= desktop::ICON_DBLCLICK_TICKS {
-                                if flags == hepfs::F_DIR {
-                                    // Navigate into directory
-                                    let mut navs = HEPFS_NAVS.lock();
-                                    if let Some((_, nav)) = navs.iter_mut().find(|(id, _)| *id == win_id) {
-                                        let cur_ino2 = nav.ino;
-                                        let cur_path = nav.path.clone();
-                                        nav.back.push((cur_ino2, cur_path));
-                                        nav.fwd.clear();
-                                        nav.ino = ino;
-                                        nav.path = if nav.path == "/" {
-                                            alloc::format!("/{}", name)
-                                        } else {
-                                            alloc::format!("{}/{}", nav.path, name)
-                                        };
-                                        nav.selected = None;
-                                    }
-                                    drop(navs);
-                                    let mut dt = desktop::DESKTOP.lock();
-                                    if let Some(dt) = dt.as_mut() { dt.dirty = true; }
-                                } else {
-                                    // Open file in editor, or in the image viewer for .bmp
-                                    // (only reachable from the right/full-listing pane)
-                                    let cur_path = HEPFS_NAVS.lock().iter()
-                                        .find(|(id, _)| *id == win_id).map(|(_, n)| n.path.clone())
-                                        .unwrap_or_else(|| alloc::string::String::from("/"));
-                                    let file_path = if cur_path == "/" {
-                                        alloc::format!("/{}", name)
-                                    } else {
-                                        alloc::format!("{}/{}", cur_path, name)
-                                    };
-                                    let lower = name.to_lowercase();
-                                    if lower.ends_with(".bmp") {
-                                        image::open_smart(&file_path);
-                                    } else if lower.ends_with(".wav") {
-                                        // All Audio Player windows show the same global "now playing"
-                                        // state, so just bring the main one (id=7) forward.
-                                        audio::play(&file_path);
-                                        let mut dt = desktop::DESKTOP.lock();
-                                        if let Some(dt) = dt.as_mut() {
-                                            if let Some(w) = dt.windows.iter_mut().find(|w| w.id == 7) {
-                                                w.show();
-                                            }
-                                            dt.bring_to_front(7);
-                                            dt.dirty = true;
-                                        }
-                                        drop(dt);
-                                        *FOCUSED_WIN.lock() = Some(7);
-                                    } else {
-                                        editor::open_smart(&file_path);
-                                    }
-                                }
+                            let action = if was_selected && elapsed <= desktop::ICON_DBLCLICK_TICKS {
+                                FileRowAction::Open
                             } else if was_selected && elapsed <= desktop::ICON_RENAME_TICKS {
-                                let mut dt = desktop::DESKTOP.lock();
-                                if let Some(dt) = dt.as_mut() {
-                                    dt.begin_rename_fs_pane(win_id, cur_ino, name);
-                                }
+                                FileRowAction::Rename
                             } else {
-                                let mut dt = desktop::DESKTOP.lock();
-                                if let Some(dt) = dt.as_mut() { dt.dirty = true; }
-                            }
+                                FileRowAction::None
+                            };
+                            let mut dt = desktop::DESKTOP.lock();
+                            if let Some(dt) = dt.as_mut() { dt.dirty = true; }
+                            drop(dt);
+
+                            *FILE_DRAG.lock() = Some(FileDrag {
+                                from_parent: cur_ino, ino, name: name.clone(),
+                                start_x: mx, start_y: my, moved: false,
+                                win_id, is_dir: flags == hepfs::F_DIR,
+                                pending_action: action,
+                            });
                         }
                     }
                 }
@@ -1346,6 +1300,68 @@ fn task_blink() -> ! {
                                 refresh_desktop_icons();
                                 let mut dt = desktop::DESKTOP.lock();
                                 if let Some(dt) = dt.as_mut() { dt.dirty = true; }
+                            }
+                        }
+                    } else {
+                        // Not dragged — run whatever action this click resolved
+                        // to at mousedown (see FileDrag::pending_action).
+                        match fd.pending_action {
+                            FileRowAction::None => {}
+                            FileRowAction::Open if fd.is_dir => {
+                                let mut navs = HEPFS_NAVS.lock();
+                                if let Some((_, nav)) = navs.iter_mut().find(|(id, _)| *id == fd.win_id) {
+                                    let cur_ino2 = nav.ino;
+                                    let cur_path = nav.path.clone();
+                                    nav.back.push((cur_ino2, cur_path));
+                                    nav.fwd.clear();
+                                    nav.ino = fd.ino;
+                                    nav.path = if nav.path == "/" {
+                                        alloc::format!("/{}", fd.name)
+                                    } else {
+                                        alloc::format!("{}/{}", nav.path, fd.name)
+                                    };
+                                    nav.selected = None;
+                                }
+                                drop(navs);
+                                let mut dt = desktop::DESKTOP.lock();
+                                if let Some(dt) = dt.as_mut() { dt.dirty = true; }
+                            }
+                            FileRowAction::Open => {
+                                // Open file in editor, or in the image viewer for
+                                // .bmp / audio player for .wav.
+                                let cur_path = HEPFS_NAVS.lock().iter()
+                                    .find(|(id, _)| *id == fd.win_id).map(|(_, n)| n.path.clone())
+                                    .unwrap_or_else(|| alloc::string::String::from("/"));
+                                let file_path = if cur_path == "/" {
+                                    alloc::format!("/{}", fd.name)
+                                } else {
+                                    alloc::format!("{}/{}", cur_path, fd.name)
+                                };
+                                let lower = fd.name.to_lowercase();
+                                if lower.ends_with(".bmp") {
+                                    image::open_smart(&file_path);
+                                } else if lower.ends_with(".wav") {
+                                    // All Audio Player windows show the same global
+                                    // "now playing" state, so just bring the main
+                                    // one (id=7) forward.
+                                    audio::play(&file_path);
+                                    let mut dt = desktop::DESKTOP.lock();
+                                    if let Some(dt) = dt.as_mut() {
+                                        if let Some(w) = dt.windows.iter_mut().find(|w| w.id == 7) { w.show(); }
+                                        dt.bring_to_front(7);
+                                        dt.dirty = true;
+                                    }
+                                    drop(dt);
+                                    *FOCUSED_WIN.lock() = Some(7);
+                                } else {
+                                    editor::open_smart(&file_path);
+                                }
+                            }
+                            FileRowAction::Rename => {
+                                let mut dt = desktop::DESKTOP.lock();
+                                if let Some(dt) = dt.as_mut() {
+                                    dt.begin_rename_fs_pane(fd.win_id, fd.from_parent, fd.name);
+                                }
                             }
                         }
                     }

@@ -545,8 +545,18 @@ pub struct Desktop {
     icon_dragging:       Option<usize>,   // index into `icons`
     icon_drag_off:       (i32, i32),
     icon_drag_moved:     bool,            // did this drag move far enough to not also count as a click?
-    pub icon_selected:   Option<usize>,
+    /// Every currently-selected icon (rubber-band/Shift+click multi-select).
+    /// Dragging any one of them moves the whole set together.
+    pub icon_selected:   Vec<usize>,
+    /// Which icon fast/slow-click timing is measured against — separate from
+    /// `icon_selected` since a Shift+click toggles membership without
+    /// resetting this, and multi-selecting several icons shouldn't make an
+    /// unrelated later click on one of them look like a double-click.
+    icon_last_clicked:   Option<usize>,
     icon_selected_at:    u64,             // TICK_COUNT at last selection/click
+    /// Rubber-band select: start corner of the drag, while active. The
+    /// current corner is just (mx, my) at the time, no need to store it.
+    marquee_start:       Option<(i32, i32)>,
     /// Transient message (e.g. "Programs can't be renamed"), with the
     /// `TICK_COUNT` value it should disappear at.
     pub icon_message:    Option<(String, u64)>,
@@ -569,6 +579,10 @@ pub struct Desktop {
     taskbar_dragging:       Option<AppKind>,
     taskbar_drag_start_x:   i32,
     taskbar_drag_moved:     bool,
+    /// (kind, slot, jumplist-just-closed-by-this-same-mousedown) captured at
+    /// mousedown, resolved into the real open/focus/minimize/jump-list action
+    /// on release — only if the button wasn't dragged.
+    taskbar_click_pending:  Option<(AppKind, usize, Option<AppKind>)>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -602,10 +616,12 @@ impl Desktop {
             volume_popup_open: false,
             volume_drag: false,
             icons, icon_dragging: None, icon_drag_off: (0, 0), icon_drag_moved: false,
-            icon_selected: None, icon_selected_at: 0, icon_message: None,
+            icon_selected: Vec::new(), icon_last_clicked: None, icon_selected_at: 0,
+            marquee_start: None, icon_message: None,
             text_prompt: None, prompt_result: None, fs_rename_ctx: None,
             open_fs_entry_requested: None,
             taskbar_dragging: None, taskbar_drag_start_x: 0, taskbar_drag_moved: false,
+            taskbar_click_pending: None,
         }
     }
 
@@ -683,6 +699,39 @@ impl Desktop {
     /// by its type needs main.rs (which owns the editor/image/audio state),
     /// so files are left for a follow-up; only the desktop-level bits
     /// (select/drag/rename) are handled in this pass.
+    /// The actual taskbar-button click action (open/focus/minimize/jump-list),
+    /// deferred from mousedown to release so that dragging a button never
+    /// also triggers it. `slot`/`jumplist_just_closed_for` are as captured at
+    /// mousedown; `ids` is re-fetched fresh here rather than reused from
+    /// mousedown, since window state could in principle change during the hold.
+    fn taskbar_button_click(&mut self, kind: AppKind, slot: usize, jumplist_just_closed_for: Option<AppKind>) {
+        let groups = self.taskbar_entries();
+        let Some((_, ids)) = groups.get(slot).filter(|(k, _)| *k == kind) else { return };
+        let ids = ids.clone();
+        if ids.is_empty() {
+            // Pinned, not running — launch a new instance.
+            self.new_window_requested = Some(kind);
+        } else if ids.len() == 1 {
+            let wid = ids[0];
+            let is_minimized = self.windows.iter().find(|w| w.id == wid).map(|w| w.minimized).unwrap_or(false);
+            if is_minimized {
+                if let Some(w) = self.windows.iter_mut().find(|w| w.id == wid) { w.show(); }
+                self.bring_to_front(wid);
+            } else if self.focused == Some(wid) {
+                if let Some(w) = self.windows.iter_mut().find(|w| w.id == wid) { w.hide(); }
+                self.focused = None;
+            } else {
+                self.bring_to_front(wid);
+            }
+        } else if jumplist_just_closed_for == Some(kind) {
+            // This click just dismissed this exact jump list — leave it closed.
+        } else {
+            let btn_left = START_W + slot * TASK_BTN_W;
+            self.taskbar_jumplist = Some((kind, btn_left));
+        }
+        self.dirty = true;
+    }
+
     fn open_icon(&mut self, idx: usize) {
         let Some(icon) = self.icons.get(idx) else { return };
         match icon.kind {
@@ -703,7 +752,8 @@ impl Desktop {
         // an open that doesn't immediately show something new on screen
         // (nothing to visibly confirm it worked) invites another click,
         // which would land in the rename window instead of re-opening.
-        self.icon_selected = None;
+        self.icon_selected.clear();
+        self.icon_last_clicked = None;
         self.dirty = true;
     }
 
@@ -1015,15 +1065,45 @@ impl Desktop {
         }
         if held {
             if let Some(idx) = self.icon_dragging {
-                if let Some(icon) = self.icons.get_mut(idx) {
-                    let new_x = (mx - self.icon_drag_off.0).max(0).min(self.fb_w as i32 - ICON_SIZE as i32);
-                    let new_y = (my - self.icon_drag_off.1).max(0).min(self.fb_h as i32 - TASKBAR_H as i32 - ICON_SIZE as i32 - 12);
-                    if (new_x - icon.x).abs() > 3 || (new_y - icon.y).abs() > 3 { self.icon_drag_moved = true; }
-                    icon.x = new_x;
-                    icon.y = new_y;
+                if let Some(icon) = self.icons.get(idx) {
+                    let max_x = self.fb_w as i32 - ICON_SIZE as i32;
+                    let max_y = self.fb_h as i32 - TASKBAR_H as i32 - ICON_SIZE as i32 - 12;
+                    let new_x = (mx - self.icon_drag_off.0).clamp(0, max_x.max(0));
+                    let new_y = (my - self.icon_drag_off.1).clamp(0, max_y.max(0));
+                    let dx = new_x - icon.x;
+                    let dy = new_y - icon.y;
+                    if dx.abs() > 3 || dy.abs() > 3 { self.icon_drag_moved = true; }
+                    // Dragging one of several selected icons moves the whole
+                    // group together by the same delta; dragging a lone icon
+                    // (or one that isn't part of the current multi-selection)
+                    // only moves itself.
+                    let group_drag = self.icon_selected.len() > 1 && self.icon_selected.contains(&idx);
+                    if group_drag {
+                        let targets = self.icon_selected.clone();
+                        for i in targets {
+                            if let Some(ic) = self.icons.get_mut(i) {
+                                ic.x = (ic.x + dx).clamp(0, max_x.max(0));
+                                ic.y = (ic.y + dy).clamp(0, max_y.max(0));
+                            }
+                        }
+                    } else if let Some(ic) = self.icons.get_mut(idx) {
+                        ic.x = new_x;
+                        ic.y = new_y;
+                    }
                     self.dirty = true;
                     return false;
                 }
+            }
+            if let Some((sx, sy)) = self.marquee_start {
+                let (rx0, rx1) = (sx.min(mx), sx.max(mx));
+                let (ry0, ry1) = (sy.min(my), sy.max(my));
+                self.icon_selected = self.icons.iter().enumerate().filter(|(_, icon)| {
+                    let (ix, iy, iw, ih) = Self::icon_rect_at(icon);
+                    ix < rx1 && ix + iw as i32 > rx0 && iy < ry1 && iy + ih as i32 > ry0
+                }).map(|(i, _)| i).collect();
+                self.icon_last_clicked = None;
+                self.dirty = true;
+                return false;
             }
         }
         if held && self.volume_drag {
@@ -1037,6 +1117,7 @@ impl Desktop {
             return false;
         }
         if released {
+            let pending = self.taskbar_click_pending.take();
             if let Some(kind) = self.taskbar_dragging.take() {
                 if self.taskbar_drag_moved {
                     // Dropped after a real drag — reorder (and, if it wasn't
@@ -1048,22 +1129,35 @@ impl Desktop {
                     pinned.insert(at, kind);
                     drop(pinned);
                     self.dirty = true;
+                } else if let Some((pend_kind, slot, jl_guard)) = pending {
+                    if pend_kind == kind {
+                        self.taskbar_button_click(pend_kind, slot, jl_guard);
+                    }
                 }
             }
+            self.marquee_start = None;
             if let Some(idx) = self.icon_dragging.take() {
                 if self.icon_drag_moved {
-                    // Dropped after a real drag — snap to the nearest grid
-                    // cell instead of leaving it wherever the cursor let go,
-                    // same as a real desktop's icon grid.
-                    if let Some(icon) = self.icons.get_mut(idx) {
-                        let (sx, sy) = icon_snap(icon.x, icon.y);
-                        icon.x = sx;
-                        icon.y = sy;
+                    // Dropped after a real drag — snap every icon that moved
+                    // (the whole group, if this was a group drag) to the
+                    // nearest grid cell instead of leaving it wherever the
+                    // cursor let go, same as a real desktop's icon grid.
+                    let targets = if self.icon_selected.len() > 1 && self.icon_selected.contains(&idx) {
+                        self.icon_selected.clone()
+                    } else {
+                        alloc::vec![idx]
+                    };
+                    for i in targets {
+                        if let Some(icon) = self.icons.get_mut(i) {
+                            let (sx, sy) = icon_snap(icon.x, icon.y);
+                            icon.x = sx;
+                            icon.y = sy;
+                        }
                     }
                     self.dirty = true;
                 } else {
                     let now = crate::scheduler::TICK_COUNT.load(core::sync::atomic::Ordering::Relaxed);
-                    if self.icon_selected == Some(idx) {
+                    if self.icon_last_clicked == Some(idx) {
                         let elapsed = now.saturating_sub(self.icon_selected_at);
                         if elapsed <= ICON_DBLCLICK_TICKS {
                             self.open_icon(idx);
@@ -1072,7 +1166,7 @@ impl Desktop {
                         }
                         self.icon_selected_at = now;
                     } else {
-                        self.icon_selected = Some(idx);
+                        self.icon_last_clicked = Some(idx);
                         self.icon_selected_at = now;
                     }
                     self.dirty = true;
@@ -1310,48 +1404,20 @@ impl Desktop {
                 self.volume_popup_open = !self.volume_popup_open;
                 self.dirty = true;
             } else {
-                // Window button — grouped by app kind; a group with >1 window opens
-                // a jump list instead of directly toggling a single window.
+                // Window button — arm a possible drag-to-reorder AND remember
+                // which button this was; the actual click action (open/focus/
+                // minimize/jump-list) is resolved on *release*, not here, so
+                // that dragging a button never also toggles/minimizes the
+                // window it belongs to just because the drag started there.
                 self.close_start_menu();
                 let groups = self.taskbar_entries();
                 let btn_x  = mx as usize - START_W;
                 let slot   = btn_x / TASK_BTN_W;
-                if let Some((kind, ids)) = groups.get(slot) {
-                    if ids.is_empty() {
-                        // Pinned, not running — launch a new instance.
-                        self.new_window_requested = Some(*kind);
-                    } else if ids.len() == 1 {
-                        let wid = ids[0];
-                        let is_minimized = self.windows.iter().find(|w| w.id == wid).map(|w| w.minimized).unwrap_or(false);
-                        if is_minimized {
-                            // Minimized (but shown before, hence its taskbar button
-                            // still exists) — restore it, same as clicking it in the
-                            // Start Menu or a jump list would.
-                            if let Some(w) = self.windows.iter_mut().find(|w| w.id == wid) { w.show(); }
-                            self.bring_to_front(wid);
-                        } else if self.focused == Some(wid) {
-                            // Click focused window button = minimize it
-                            if let Some(w) = self.windows.iter_mut().find(|w| w.id == wid) {
-                                w.hide();
-                            }
-                            self.focused = None;
-                        } else {
-                            self.bring_to_front(wid);
-                        }
-                    } else if jumplist_just_closed_for == Some(*kind) {
-                        // This click just dismissed this exact jump list — leave it closed.
-                    } else {
-                        let btn_left = START_W + slot * TASK_BTN_W;
-                        self.taskbar_jumplist = Some((*kind, btn_left));
-                    }
-                    // Arm a possible drag-to-reorder — resolved on release. The
-                    // action above already fired at mousedown (same as it always
-                    // has); a drag doesn't undo that, it just also repositions
-                    // the button once you let go. Simpler than deferring the
-                    // click itself to release, at the cost of that one quirk.
+                if let Some((kind, _)) = groups.get(slot) {
                     self.taskbar_dragging     = Some(*kind);
                     self.taskbar_drag_start_x = mx;
                     self.taskbar_drag_moved   = false;
+                    self.taskbar_click_pending = Some((*kind, slot, jumplist_just_closed_for));
                     self.dirty = true;
                 }
             }
@@ -1374,9 +1440,30 @@ impl Desktop {
         // on an already-selected icon, opens/renames depending on how fast
         // the second click landed — see ICON_DBLCLICK_TICKS/ICON_RENAME_TICKS);
         // every click also arms a possible drag, resolved on release below.
+        // Shift+click toggles an icon in/out of a multi-selection instead
+        // (no open/rename/drag semantics for that click); a plain click on
+        // empty desktop space starts a rubber-band marquee select.
         if hit_id.is_none() {
             let hit_idx = self.icon_at(mx, my);
+            let shift = crate::ps2::shift_held();
             if let Some(idx) = hit_idx {
+                if shift {
+                    if let Some(pos) = self.icon_selected.iter().position(|&i| i == idx) {
+                        self.icon_selected.remove(pos);
+                    } else {
+                        self.icon_selected.push(idx);
+                    }
+                    self.icon_last_clicked = None;
+                    self.dirty = true;
+                    return false;
+                }
+                // Clicking an icon already part of a multi-selection keeps
+                // the whole group selected (so it can be dragged together);
+                // clicking an unselected one narrows to just it, like any
+                // normal desktop.
+                if !self.icon_selected.contains(&idx) {
+                    self.icon_selected = alloc::vec![idx];
+                }
                 // Click semantics (select / open / rename) are resolved on
                 // release, not here — so a real drag never also fires an
                 // open/rename just because it started on a selected icon.
@@ -1386,8 +1473,10 @@ impl Desktop {
                 self.icon_drag_moved = false;
                 self.dirty = true;
                 return false;
-            } else if self.icon_selected.is_some() {
-                self.icon_selected = None;
+            } else if !shift {
+                self.icon_selected.clear();
+                self.icon_last_clicked = None;
+                self.marquee_start = Some((mx, my));
                 self.dirty = true;
             }
         }
@@ -1575,7 +1664,7 @@ impl Desktop {
             let (ix, iy, iw, ih) = Self::icon_rect_at(icon);
             if iy < 0 { continue; }
             let ix = ix as usize; let iy = iy as usize;
-            let selected = self.icon_selected == Some(idx);
+            let selected = self.icon_selected.contains(&idx);
             // Selection highlight — a lighter panel behind the whole icon+label.
             if selected {
                 display.fill_rect(ix.saturating_sub(4), iy.saturating_sub(4), iw + 8, ih + 24, pal::MENU_HOVER);
@@ -1606,6 +1695,19 @@ impl Desktop {
                 } else { ix };
                 display.draw_text(label_x, label_y, &icon.label, pal::TEXT, 1);
             }
+        }
+        // Rubber-band marquee select — a hollow rectangle from the drag's
+        // start corner to wherever the cursor is now.
+        if let Some((sx, sy)) = self.marquee_start {
+            let (mx, my) = (self.prev_cx, self.prev_cy);
+            let x0 = sx.min(mx).max(0) as usize;
+            let y0 = sy.min(my).max(0) as usize;
+            let w  = (sx - mx).unsigned_abs() as usize;
+            let h  = (sy - my).unsigned_abs() as usize;
+            display.fill_rect(x0, y0, w, 1, pal::ACCENT);
+            display.fill_rect(x0, y0.saturating_add(h), w, 1, pal::ACCENT);
+            display.fill_rect(x0, y0, 1, h, pal::ACCENT);
+            display.fill_rect(x0.saturating_add(w), y0, 1, h, pal::ACCENT);
         }
         // Transient message (e.g. "Programs can't be renamed") — small toast
         // near the top-left of the desktop icon column.
