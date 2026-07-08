@@ -76,6 +76,11 @@ static VOLUME_DRAG: Mutex<bool> = Mutex::new(false);
 /// runs on release, and only if the row was never dragged.
 struct FileDrag {
     from_parent: u32,
+    /// Path of `from_parent`, captured at drag-arm time (HepFS inodes have
+    /// no reverse pointer, so this can't be reconstructed later) — needed
+    /// only if the drop lands on the pin dock, which stores pinned items by
+    /// path rather than just ino for the same reason (see `PINNED_FILES`).
+    from_path: alloc::string::String,
     ino:  u32,
     name: alloc::string::String,
     start_x: i32,
@@ -305,7 +310,9 @@ fn resolve_file_drop(fd: &FileDrag, mx: i32, my: i32) -> bool {
             Some((win.id, win.x, win.y, win.w))
         })
     };
-    let Some((target_win, wx, wy, ww)) = win_rect else { return false };
+    let Some((target_win, wx, wy, ww)) = win_rect else {
+        return resolve_file_drop_outside_windows(fd, mx, my);
+    };
     let Some(browsing_ino) = HEPFS_NAVS.lock().iter()
         .find(|(id, _)| *id == target_win).map(|(_, n)| n.ino) else { return false };
 
@@ -358,6 +365,60 @@ fn resolve_file_drop(fd: &FileDrag, mx: i32, my: i32) -> bool {
     refresh_desktop_icons();
     let mut dt = desktop::DESKTOP.lock();
     if let Some(dt) = dt.as_mut() { dt.dirty = true; }
+    true
+}
+
+/// Resolves a file/folder drag dropped somewhere that ISN'T a Files window —
+/// called by `resolve_file_drop()` once it's ruled that out. Two valid
+/// targets: the left pin dock (pins the dragged entry/entries in place,
+/// without moving them — same as the right-click "Pin" menu item) or open
+/// desktop background (moves them into `/home/desktop`, same as dragging a
+/// file onto the desktop in a conventional OS). Dropping on the taskbar or
+/// any other window is a no-op.
+fn resolve_file_drop_outside_windows(fd: &FileDrag, mx: i32, my: i32) -> bool {
+    let (on_dock, on_window, in_taskbar) = {
+        let dt = desktop::DESKTOP.lock();
+        let Some(d) = dt.as_ref() else { return false };
+        let on_dock = desktop::in_pin_dock(mx, my, d.fb_h);
+        let in_taskbar = my >= d.fb_h as i32 - desktop::TASKBAR_H as i32;
+        let on_window = d.windows.iter().rev().any(|w| {
+            !w.minimized && (w.close_hit(mx, my) || w.maximize_hit(mx, my) || w.minimize_hit(mx, my)
+                || w.newterm_hit(mx, my) || w.title_hit(mx, my)
+                || w.resize_hit(mx, my) || w.content_hit(mx, my))
+        });
+        (on_dock, on_window, in_taskbar)
+    };
+
+    if on_dock {
+        desktop::pin_file(fd.ino, fd.from_path.clone(), fd.name.clone(), fd.is_dir);
+        for (ino, name, is_dir) in &fd.extra {
+            desktop::pin_file(*ino, fd.from_path.clone(), name.clone(), *is_dir);
+        }
+        if let Some(dt) = desktop::DESKTOP.lock().as_mut() { dt.dirty = true; }
+        return true;
+    }
+
+    if on_window || in_taskbar {
+        return false;
+    }
+
+    // Open desktop background — move into /home/desktop, same directory
+    // desktop icons already mirror (see `sync_fs_icons()`).
+    let mut ctrl = nvme::CONTROLLER.lock();
+    if let Some(ctrl) = ctrl.as_mut() {
+        let ctrl = &mut hepfs::BlockDev::Nvme(ctrl);
+        if let Some(desktop_ino) = hepfs::lookup(ctrl, "/home/desktop") {
+            if desktop_ino != fd.from_parent {
+                hepfs::move_entry(ctrl, fd.from_parent, desktop_ino, &fd.name);
+                for (_, name, _) in &fd.extra {
+                    hepfs::move_entry(ctrl, fd.from_parent, desktop_ino, name);
+                }
+            }
+        }
+    }
+    drop(ctrl);
+    refresh_desktop_icons();
+    if let Some(dt) = desktop::DESKTOP.lock().as_mut() { dt.dirty = true; }
     true
 }
 
@@ -1256,9 +1317,9 @@ fn task_blink() -> ! {
                 }
                 Some((win_id, pane @ (3 | 4), idx)) => {
                     // Directory-tree (pane==3) or full-listing (pane==4) entry click.
-                    let cur_ino = HEPFS_NAVS.lock().iter()
-                        .find(|(id, _)| *id == win_id).map(|(_, n)| n.ino)
-                        .unwrap_or(hepfs::ROOT_INO);
+                    let (cur_ino, cur_path) = HEPFS_NAVS.lock().iter()
+                        .find(|(id, _)| *id == win_id).map(|(_, n)| (n.ino, n.path.clone()))
+                        .unwrap_or((hepfs::ROOT_INO, alloc::string::String::from("/")));
                     let at_root = cur_ino == hepfs::ROOT_INO;
 
                     // ".." row (only shown when not at root) — same on both panes
@@ -1372,7 +1433,7 @@ fn task_blink() -> ! {
                                 alloc::vec::Vec::new()
                             };
                             *FILE_DRAG.lock() = Some(FileDrag {
-                                from_parent: cur_ino, ino, name: name.clone(),
+                                from_parent: cur_ino, from_path: cur_path.clone(), ino, name: name.clone(),
                                 start_x: mx, start_y: my, moved: false,
                                 win_id, is_dir: flags == hepfs::F_DIR,
                                 pending_action: action, extra,

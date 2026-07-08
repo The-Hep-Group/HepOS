@@ -75,6 +75,25 @@ pub fn toggle_pinned_file(ino: u32, parent_path: String, name: String, is_dir: b
     }
 }
 
+/// Idempotent pin — always adds (never removes). Used by drag-onto-dock,
+/// where the intent is unambiguously "pin this", unlike the right-click
+/// menu's `toggle_pinned_file()` where the label itself flips between
+/// "Pin"/"Unpin" so toggling is the right call. A drag that happened to
+/// land on an already-pinned item shouldn't unpin it.
+pub fn pin_file(ino: u32, parent_path: String, name: String, is_dir: bool) {
+    let mut p = PINNED_FILES.lock();
+    if !p.iter().any(|(i, _, _, _)| *i == ino) {
+        p.push((ino, parent_path, name, is_dir));
+    }
+}
+
+/// Hit-test for the left pin dock, for callers outside this module (the
+/// file-drag drop resolver in `main.rs`) that need to know "did this drop
+/// land on the dock" without duplicating `DOCK_W`'s value.
+pub fn in_pin_dock(mx: i32, my: i32, fb_h: usize) -> bool {
+    mx >= 0 && (mx as usize) < DOCK_W && my >= 0 && (my as usize) < fb_h.saturating_sub(TASKBAR_H)
+}
+
 /// Files-and-directories clipboard — one `(parent_ino, ino, name, is_dir)`
 /// per copied entry (empty = nothing copied). A `Vec` rather than a single
 /// `Option` so copying a multi-selection (see "Copy" on a row that's part of
