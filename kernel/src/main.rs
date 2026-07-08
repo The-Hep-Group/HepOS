@@ -109,6 +109,18 @@ static FILE_DRAG: Mutex<Option<FileDrag>> = Mutex::new(None);
 /// row count (`desktop.rs` doesn't touch the block device).
 static FS_SCROLL_DRAG: Mutex<Option<(usize, i32, usize, usize)>> = Mutex::new(None);
 
+/// Armed on mousedown over the right (icon-grid) pane's *empty* space —
+/// `(win_id, start_x, start_y)`, both in absolute screen coordinates. Every
+/// held frame after, `fs_marquee_hits()` recomputes which grid cells the
+/// rectangle from here to the current cursor position overlaps and stuffs
+/// them straight into `HepfsNav::selected`/`range_selected` — the same
+/// group-selection fields Shift+click already populates, so a marquee
+/// selection can be dragged/copied exactly like one (see `resolve_fs_row()`/
+/// `selected_fs_entries()`). Mirrors the desktop's own `marquee_start`, just
+/// living in `main.rs` since it needs `hepfs::list_dir()` to know how many
+/// grid cells exist (`desktop.rs` doesn't touch the block device).
+static FS_MARQUEE: Mutex<Option<(usize, i32, i32)>> = Mutex::new(None);
+
 /// (window id, row, col, TSC timestamp) of the last fresh click in an
 /// editor/terminal content area — used to detect a double-click (same cell,
 /// within ~400ms) so it can select the whole line instead of just placing
@@ -1310,6 +1322,41 @@ fn task_blink() -> ! {
             }
         }
 
+        // File manager rubber-band marquee select — recomputes the covered
+        // grid cells every held frame (see `fs_marquee_hits()`), same
+        // "live-updating while dragging" model the desktop's own marquee
+        // uses. Selection persists after release; only the drag state itself
+        // is cleared then (see `FS_MARQUEE`'s doc comment).
+        {
+            let btn_held = btn & 1 != 0;
+            if btn_held {
+                if let Some((win_id, sx, sy)) = *FS_MARQUEE.lock() {
+                    let win_rect = {
+                        let dt = desktop::DESKTOP.lock();
+                        dt.as_ref().and_then(|d| d.windows.iter().find(|w| w.id == win_id).map(|w| (w.x, w.y, w.w, w.h)))
+                    };
+                    if let Some((wx, wy, ww, wh)) = win_rect {
+                        let (rx0, rx1) = (sx.min(mx), sx.max(mx));
+                        let (ry0, ry1) = (sy.min(my), sy.max(my));
+                        let hits = fs_marquee_hits(win_id, wx, wy, ww, wh, rx0, rx1, ry0, ry1);
+                        if let Some((_, nav)) = HEPFS_NAVS.lock().iter_mut().find(|(id, _)| *id == win_id) {
+                            if hits.is_empty() {
+                                nav.selected = None;
+                                nav.range_selected.clear();
+                            } else {
+                                nav.selected = Some((4, hits[0]));
+                                nav.range_selected = hits;
+                            }
+                        }
+                        let mut dt = desktop::DESKTOP.lock();
+                        if let Some(dt) = dt.as_mut() { dt.dirty = true; }
+                    }
+                }
+            } else {
+                *FS_MARQUEE.lock() = None;
+            }
+        }
+
         // HepFS window: navigate directories and open files on click.
         // Any Files window can be clicked (not just id=1) — each has its own
         // independent navigator entry in HEPFS_NAVS, shared by both panes
@@ -1516,6 +1563,22 @@ fn task_blink() -> ! {
                                 win_id, is_dir: flags == hepfs::F_DIR,
                                 pending_action: action, extra,
                             });
+                        } else if pane == 4 {
+                            // Clicked empty grid space in the right pane (no
+                            // entry at this idx) — start a rubber-band
+                            // marquee select instead of doing nothing, same
+                            // as clicking empty desktop space does. Clears
+                            // the current selection immediately, same as the
+                            // desktop's own marquee-start.
+                            let mut navs = HEPFS_NAVS.lock();
+                            if let Some((_, nav)) = navs.iter_mut().find(|(id, _)| *id == win_id) {
+                                nav.selected = None;
+                                nav.range_selected.clear();
+                            }
+                            drop(navs);
+                            *FS_MARQUEE.lock() = Some((win_id, mx, my));
+                            let mut dt = desktop::DESKTOP.lock();
+                            if let Some(dt) = dt.as_mut() { dt.dirty = true; }
                         }
                     }
                 }
@@ -1834,11 +1897,16 @@ fn task_blink() -> ! {
         // desktop.rs) — it has to visibly track the cursor, and nothing else
         // here would otherwise mark the scene dirty from mouse movement alone.
         let file_dragging = FILE_DRAG.lock().as_ref().map(|fd| fd.moved).unwrap_or(false);
+        // Same reason: a live marquee rectangle (or scrollbar thumb drag)
+        // has to visibly track the cursor too.
+        let fs_marqueeing = FS_MARQUEE.lock().is_some();
+        let fs_scrolling  = FS_SCROLL_DRAG.lock().is_some();
         let content_dirty = {
             let dd = desktop::DESKTOP.lock().as_ref().map(|d| d.dirty).unwrap_or(false);
             let td = terminal::TERMINAL.lock().as_ref().map(|t| t.dirty).unwrap_or(false);
             let ed = terminal::EXTRA_TERMINALS.lock().iter().any(|(_, t)| t.dirty);
-            dd || td || ed || ps2_had_input || hda::is_playing() || animating || file_dragging
+            dd || td || ed || ps2_had_input || hda::is_playing() || animating
+                || file_dragging || fs_marqueeing || fs_scrolling
         };
         let mouse_moved = {
             let md = desktop::DESKTOP.lock().as_ref().map(|d| d.mouse_dirty).unwrap_or(false);
@@ -2344,6 +2412,24 @@ fn render_hepfs_window(display: &mut framebuffer::Display, wx: usize, wy: usize,
     } else {
         display.draw_text(wx + 4, list_top + 4, "No NVMe", dim, 1);
     }
+
+    // Rubber-band marquee select — a hollow rectangle from the drag's start
+    // corner to wherever the cursor is now, same look as the desktop's own
+    // marquee select. Reads the live cursor position directly rather than
+    // being passed one, since this function only gets `win_id`.
+    if let Some((mwin, sx, sy)) = *FS_MARQUEE.lock() {
+        if mwin == win_id {
+            let (mcx, mcy) = { let m = mouse::MOUSE.lock(); (m.x, m.y) };
+            let x0 = sx.min(mcx).max(0) as usize;
+            let y0 = sy.min(mcy).max(0) as usize;
+            let mw  = (sx - mcx).unsigned_abs() as usize;
+            let mh  = (sy - mcy).unsigned_abs() as usize;
+            display.fill_rect(x0, y0, mw, 1, acc);
+            display.fill_rect(x0, y0.saturating_add(mh), mw, 1, acc);
+            display.fill_rect(x0, y0, 1, mh, acc);
+            display.fill_rect(x0.saturating_add(mw), y0, 1, mh, acc);
+        }
+    }
 }
 
 /// Everything `render_hepfs_window()`'s scrollbar needs to convert a click/
@@ -2362,6 +2448,49 @@ fn hepfs_scroll_max(win_id: usize, right_w: usize, list_h: usize) -> Option<usiz
     let visible_rows = list_h.div_ceil(GRID_CELL_H).max(1);
     let max_scroll = total_rows.saturating_sub(visible_rows);
     if max_scroll == 0 { None } else { Some(max_scroll) }
+}
+
+/// Recomputes which pane-4 (icon-grid) cells a marquee rectangle — given in
+/// absolute screen coordinates, same frame the rectangle itself is drawn in
+/// — overlaps for `win_id`, returning their flat indices in the same
+/// numbering `grid_idx_at()`/`resolve_fs_row()` use. Only considers rows
+/// actually on screen (matches `render_hepfs_window()`'s own "does this row
+/// fully fit" check), same as a marquee can't select something that isn't
+/// visible.
+fn fs_marquee_hits(win_id: usize, wx: i32, wy: i32, ww: usize, wh: usize, rx0: i32, rx1: i32, ry0: i32, ry1: i32) -> alloc::vec::Vec<usize> {
+    let left_w   = (ww * HEPFS_TREE_W_NUM) / HEPFS_TREE_W_DEN;
+    let right_w  = ww.saturating_sub(left_w + 1);
+    let right_x  = wx + left_w as i32 + 1;
+    let list_top: i32 = wy + 23;
+    let list_h   = (wh as i32 - 23).max(0) as usize;
+
+    let Some((cur_ino, scroll)) = HEPFS_NAVS.lock().iter().find(|(id, _)| *id == win_id)
+        .map(|(_, n)| (n.ino, n.scroll)) else { return alloc::vec::Vec::new() };
+    let at_root = cur_ino == hepfs::ROOT_INO;
+    let total = {
+        let mut ctrl = nvme::CONTROLLER.lock();
+        let Some(ctrl) = ctrl.as_mut() else { return alloc::vec::Vec::new() };
+        let ctrl = &mut hepfs::BlockDev::Nvme(ctrl);
+        hepfs::list_dir(ctrl, cur_ino).len() + if at_root { 0 } else { 1 }
+    };
+    let cols = grid_cols(right_w);
+
+    let mut hits = alloc::vec::Vec::new();
+    for idx in 0..total {
+        let row = idx / cols;
+        if row < scroll { continue; }
+        let visual_row = row - scroll;
+        let cy = list_top + (visual_row * GRID_CELL_H) as i32;
+        if cy + GRID_CELL_H as i32 > list_top + list_h as i32 { continue; }
+        let col = idx % cols;
+        let cx = right_x + (col * GRID_CELL_W) as i32;
+        let (ix0, iy0) = (cx, cy);
+        let (ix1, iy1) = (cx + GRID_CELL_W as i32, cy + GRID_CELL_H as i32);
+        if ix0 < rx1 && ix1 > rx0 && iy0 < ry1 && iy1 > ry0 {
+            hits.push(idx);
+        }
+    }
+    hits
 }
 
 /// Format a byte count into a compact string (e.g. "1.2 KB").
