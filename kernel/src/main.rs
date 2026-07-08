@@ -777,7 +777,6 @@ fn task_idle() -> ! {
     loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
 }
 
-/// TEMPORARY boot-time self-test for the async ping job — exercised via
 fn task_blink() -> ! {
     let mut mx: i32 = 400;
     let mut my: i32 = 300;
@@ -1863,6 +1862,21 @@ fn task_blink() -> ! {
         // net::poll() docs. Delivers the result to whichever terminal window
         // issued the command once it finishes (success, error, or timeout).
         if let Some((win_id, msg)) = net::poll() {
+            if win_id == 2 {
+                if let Some(t) = terminal::TERMINAL.lock().as_mut() { t.print_async(&msg); }
+            } else if let Some((_, t)) = terminal::EXTRA_TERMINALS.lock().iter_mut().find(|(wid, _)| *wid == win_id) {
+                t.print_async(&msg);
+            }
+            if let Some(dt) = desktop::DESKTOP.lock().as_mut() { dt.dirty = true; }
+        }
+
+        // Advance any in-progress background process (runtest/runhello/
+        // runhwtest/exec) — see `process::poll_async()` docs. Same delivery
+        // model as the network jobs just above: the process now runs as its
+        // own scheduler task (see process.rs's "Async process execution"),
+        // so this loop keeps running the whole time it's in flight instead
+        // of blocking on it.
+        if let Some((win_id, msg)) = process::poll_async() {
             if win_id == 2 {
                 if let Some(t) = terminal::TERMINAL.lock().as_mut() { t.print_async(&msg); }
             } else if let Some((_, t)) = terminal::EXTRA_TERMINALS.lock().iter_mut().find(|(wid, _)| *wid == win_id) {
