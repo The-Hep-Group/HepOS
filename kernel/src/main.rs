@@ -323,6 +323,29 @@ fn resolve_file_drop(fd: &FileDrag, mx: i32, my: i32) -> bool {
     true
 }
 
+/// Floating drag ghost for an in-progress file/folder drag — the file
+/// manager equivalent of the taskbar's dragged-button ghost (`desktop.rs`'s
+/// `dragged_ghost`). Before this, a file drag gave no visual feedback at all
+/// until you dropped it; the row didn't even look picked up. Draws the same
+/// icon+label a Files window row would, floating near the cursor, whenever
+/// `FILE_DRAG` is armed and has actually moved (not just clicked).
+fn draw_file_drag_ghost(display: &mut framebuffer::Display, mx: i32, my: i32) {
+    let Some(fd) = FILE_DRAG.lock().as_ref().map(|fd| (fd.moved, fd.is_dir, fd.name.clone())) else { return };
+    let (moved, is_dir, name) = fd;
+    if !moved { return; }
+
+    let label = if name.len() > 20 { alloc::format!("{}…", &name[..20]) } else { name.clone() };
+    let w = label.len() * 9 + 22;
+    let h = 18usize;
+    let gx = (mx + 12).max(0) as usize;
+    let gy = (my + 12).max(0) as usize;
+    display.fill_rect(gx + 2, gy + 2, w, h, framebuffer::Color::from_hex(0x000000));
+    display.fill_rect(gx, gy, w, h, framebuffer::Color::from_hex(0x1E1E40));
+    display.fill_rect(gx, gy, w, 1, framebuffer::Color::from_hex(0x6C8EFF));
+    icons::draw_file_icon(display, gx + 3, gy + 3, 12, is_dir, &name);
+    display.draw_text(gx + 20, gy + 5, &label, framebuffer::Color::from_hex(0xE8E8E8), 1);
+}
+
 #[no_mangle]
 extern "C" fn kmain(bi_ptr: *const bootinfo::BootInfo) -> ! {
     serial::init();
@@ -729,12 +752,15 @@ fn task_blink() -> ! {
                                     let mut ctrl = nvme::CONTROLLER.lock();
                                     if let Some(ctrl) = ctrl.as_mut() {
                                         let ctrl = &mut hepfs::BlockDev::Nvme(ctrl);
-                                        // Same name if free, else "<name> (copy)" once — if
-                                        // that's *also* taken, the paste is silently skipped
-                                        // rather than endlessly renaming.
-                                        if hepfs::copy_entry(ctrl, from_parent, target_ino, &name, &name).is_none() {
-                                            let alt = alloc::format!("{} (copy)", name);
-                                            hepfs::copy_entry(ctrl, from_parent, target_ino, &name, &alt);
+                                        // Same name if free, else "<name> (1)", "(2)", ...
+                                        // until one's free (capped so a pathological case
+                                        // can't loop forever instead of just giving up).
+                                        let mut candidate = name.clone();
+                                        let mut n = 0u32;
+                                        while hepfs::copy_entry(ctrl, from_parent, target_ino, &name, &candidate).is_none() {
+                                            n += 1;
+                                            if n > 100 { break; }
+                                            candidate = alloc::format!("{} ({})", name, n);
                                         }
                                     }
                                     drop(ctrl);
@@ -1035,6 +1061,7 @@ fn task_blink() -> ! {
                 dt.as_mut().and_then(|dt| dt.take_prompt_result())
             };
             if let Some(outcome) = result {
+                let mut rename_failed: Option<alloc::string::String> = None;
                 {
                     let mut ctrl = nvme::CONTROLLER.lock();
                     if let Some(ctrl) = ctrl.as_mut() {
@@ -1052,11 +1079,15 @@ fn task_blink() -> ! {
                             }
                             desktop::PromptOutcome::Rename { old_name, new_name } => {
                                 if let Some(desktop_ino) = hepfs::lookup(ctrl, "/home/desktop") {
-                                    hepfs::rename(ctrl, desktop_ino, &old_name, &new_name);
+                                    if !hepfs::rename(ctrl, desktop_ino, &old_name, &new_name) {
+                                        rename_failed = Some(new_name);
+                                    }
                                 }
                             }
                             desktop::PromptOutcome::RenameFsPane { parent_ino, old_name, new_name, .. } => {
-                                hepfs::rename(ctrl, parent_ino, &old_name, &new_name);
+                                if !hepfs::rename(ctrl, parent_ino, &old_name, &new_name) {
+                                    rename_failed = Some(new_name);
+                                }
                             }
                         }
                     }
@@ -1066,7 +1097,15 @@ fn task_blink() -> ! {
                 // cheap enough to just always re-sync rather than track which.
                 refresh_desktop_icons();
                 let mut dt = desktop::DESKTOP.lock();
-                if let Some(dt) = dt.as_mut() { dt.dirty = true; }
+                if let Some(dt) = dt.as_mut() {
+                    dt.dirty = true;
+                    // `rename()` only fails on a name collision (or a missing
+                    // source, which can't happen here) — say so instead of
+                    // just silently leaving the old name in place.
+                    if let Some(new_name) = rename_failed {
+                        dt.show_message(alloc::format!("'{}' already exists", new_name));
+                    }
+                }
             }
         }
 
@@ -1485,11 +1524,16 @@ fn task_blink() -> ! {
             }).unwrap_or(false)
         };
 
+        // A file/folder being actively dragged needs a full redraw every
+        // frame too, same reason the taskbar's drag ghost does (see
+        // desktop.rs) — it has to visibly track the cursor, and nothing else
+        // here would otherwise mark the scene dirty from mouse movement alone.
+        let file_dragging = FILE_DRAG.lock().as_ref().map(|fd| fd.moved).unwrap_or(false);
         let content_dirty = {
             let dd = desktop::DESKTOP.lock().as_ref().map(|d| d.dirty).unwrap_or(false);
             let td = terminal::TERMINAL.lock().as_ref().map(|t| t.dirty).unwrap_or(false);
             let ed = terminal::EXTRA_TERMINALS.lock().iter().any(|(_, t)| t.dirty);
-            dd || td || ed || ps2_had_input || hda::is_playing() || animating
+            dd || td || ed || ps2_had_input || hda::is_playing() || animating || file_dragging
         };
         let mouse_moved = {
             let md = desktop::DESKTOP.lock().as_ref().map(|d| d.mouse_dirty).unwrap_or(false);
@@ -1704,6 +1748,7 @@ fn task_blink() -> ! {
                   if let Some(dt) = dt.as_ref() { dt.draw_context_menu(display); } }
                 { let dt = desktop::DESKTOP.lock();
                   if let Some(dt) = dt.as_ref() { dt.draw_new_entry_prompt(display); } }
+                draw_file_drag_ghost(display, mx, my);
 
                 // 4. Save scene (no cursor yet) so cursor-only path can erase later
                 display.save_scene();

@@ -769,16 +769,26 @@ impl Desktop {
     /// Start renaming an icon, or show the "can't rename" message for a
     /// program icon.
     fn begin_rename(&mut self, idx: usize) {
-        let now = crate::scheduler::TICK_COUNT.load(core::sync::atomic::Ordering::Relaxed);
         let Some(icon) = self.icons.get(idx) else { return };
         match icon.kind {
             IconKind::Program(_, _) => {
-                self.icon_message = Some((String::from("Programs can't be renamed"), now + 150));
+                self.show_message(String::from("Programs can't be renamed"));
             }
             IconKind::FsEntry { .. } => {
                 self.text_prompt = Some(TextPrompt { kind: PromptKind::RenameIcon(idx), buf: icon.label.clone() });
             }
         }
+        self.dirty = true;
+    }
+
+    /// Show a transient toast message near the top-left of the desktop
+    /// (same spot/style as the "Programs can't be renamed" message) — used
+    /// for anything main.rs needs to report back after acting on a
+    /// `prompt_result` (e.g. a rename that failed because the new name was
+    /// already taken).
+    pub fn show_message(&mut self, msg: String) {
+        let now = crate::scheduler::TICK_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+        self.icon_message = Some((msg, now + 150));
         self.dirty = true;
     }
 
