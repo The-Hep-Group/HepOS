@@ -544,6 +544,14 @@ pub struct Desktop {
     pub icons:          Vec<DesktopIcon>,
     icon_dragging:       Option<usize>,   // index into `icons`
     icon_drag_off:       (i32, i32),
+    /// The dragged icon's position at the moment the drag was armed —
+    /// "has this drag moved" must be measured cumulatively from *here*, not
+    /// frame-to-frame (comparing against the icon's continuously-updated
+    /// current position made the threshold reset every frame, so only a
+    /// single large jump between two polls would ever register as a real
+    /// drag — slow, steady mouse movement never crossed it, and the release
+    /// would fall through to click semantics instead of finishing the move).
+    icon_drag_start_pos: (i32, i32),
     icon_drag_moved:     bool,            // did this drag move far enough to not also count as a click?
     /// Every currently-selected icon (rubber-band/Shift+click multi-select).
     /// Dragging any one of them moves the whole set together.
@@ -616,6 +624,7 @@ impl Desktop {
             volume_popup_open: false,
             volume_drag: false,
             icons, icon_dragging: None, icon_drag_off: (0, 0), icon_drag_moved: false,
+            icon_drag_start_pos: (0, 0),
             icon_selected: Vec::new(), icon_last_clicked: None, icon_selected_at: 0,
             marquee_start: None, icon_message: None,
             text_prompt: None, prompt_result: None, fs_rename_ctx: None,
@@ -1072,7 +1081,13 @@ impl Desktop {
                     let new_y = (my - self.icon_drag_off.1).clamp(0, max_y.max(0));
                     let dx = new_x - icon.x;
                     let dy = new_y - icon.y;
-                    if dx.abs() > 3 || dy.abs() > 3 { self.icon_drag_moved = true; }
+                    // Cumulative displacement from where the drag started —
+                    // NOT from last frame's position (see icon_drag_start_pos's
+                    // doc comment for why that was the actual bug).
+                    if (new_x - self.icon_drag_start_pos.0).abs() > 3
+                        || (new_y - self.icon_drag_start_pos.1).abs() > 3 {
+                        self.icon_drag_moved = true;
+                    }
                     // Dragging one of several selected icons moves the whole
                     // group together by the same delta; dragging a lone icon
                     // (or one that isn't part of the current multi-selection)
@@ -1468,9 +1483,10 @@ impl Desktop {
                 // release, not here — so a real drag never also fires an
                 // open/rename just because it started on a selected icon.
                 let icon = &self.icons[idx];
-                self.icon_dragging   = Some(idx);
-                self.icon_drag_off   = (mx - icon.x, my - icon.y);
-                self.icon_drag_moved = false;
+                self.icon_dragging       = Some(idx);
+                self.icon_drag_off       = (mx - icon.x, my - icon.y);
+                self.icon_drag_moved     = false;
+                self.icon_drag_start_pos = (icon.x, icon.y);
                 self.dirty = true;
                 return false;
             } else if !shift {

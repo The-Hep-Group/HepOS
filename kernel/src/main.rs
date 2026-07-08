@@ -136,6 +136,12 @@ struct HepfsNav {
     /// feel identical).
     selected:    Option<(u8, usize)>,
     selected_at: u64,
+    /// Shift+click range-select: every row index (within `selected`'s pane)
+    /// highlighted between the anchor (`selected`) and the shift-clicked row.
+    /// Highlight-only — doesn't change what open/rename/drag act on (that's
+    /// still just `selected`); file-manager multi-*move* isn't implemented,
+    /// unlike the desktop's Shift+click/marquee (see PLAN.md).
+    range_selected: alloc::vec::Vec<usize>,
 }
 
 // One entry per Files window, keyed by window id — same pattern as
@@ -148,7 +154,7 @@ fn hepfs_nav_new() -> HepfsNav {
         path: alloc::string::String::from("/"),
         back: alloc::vec::Vec::new(),
         fwd:  alloc::vec::Vec::new(),
-        selected: None, selected_at: 0,
+        selected: None, selected_at: 0, range_selected: alloc::vec::Vec::new(),
     }
 }
 
@@ -249,6 +255,72 @@ fn topmost_window_id_at(d: &desktop::Desktop, mx: i32, my: i32) -> Option<usize>
                 || w.resize_hit(mx, my) || w.content_hit(mx, my)
         )
     }).map(|w| w.id)
+}
+
+/// Resolves a completed file/folder drag: finds the topmost Files window
+/// under (mx, my) and moves the dragged entry into whichever directory it
+/// should land in — if the drop point is over a *specific directory row* in
+/// that window's list, into that subdirectory (the natural first thing
+/// anyone would try — drag a file onto a folder); otherwise into whatever
+/// directory the window is currently browsing. Returns true if a valid drop
+/// target was found and a move was attempted. Factored out of the main loop
+/// so it's directly testable.
+fn resolve_file_drop(fd: &FileDrag, mx: i32, my: i32) -> bool {
+    let win_rect = {
+        let dt = desktop::DESKTOP.lock();
+        dt.as_ref().and_then(|d| {
+            let win = d.windows.iter().rev().find(|w| {
+                w.app_kind == desktop::AppKind::Files && !w.minimized
+                    && mx >= w.x && mx < w.x + w.w as i32
+                    && my >= w.y && my < w.y + w.h as i32
+                    && topmost_window_id_at(d, mx, my) == Some(w.id)
+            })?;
+            Some((win.id, win.x, win.y, win.w))
+        })
+    };
+    let Some((target_win, wx, wy, ww)) = win_rect else { return false };
+    let Some(browsing_ino) = HEPFS_NAVS.lock().iter()
+        .find(|(id, _)| *id == target_win).map(|(_, n)| n.ino) else { return false };
+
+    // Did the drop land on a specific directory row? Same nav-bar/pane/row
+    // geometry the click handler itself uses.
+    let rel_x = (mx - wx) as usize;
+    let rel_y = my - wy;
+    let target_ino = if rel_y >= 22 {
+        let left_w = (ww * HEPFS_TREE_W_NUM) / HEPFS_TREE_W_DEN;
+        let entry_idx = ((rel_y - 22) / 14).max(0) as usize;
+        let at_root = browsing_ino == hepfs::ROOT_INO;
+        let real_idx = if !at_root { entry_idx.checked_sub(1) } else { Some(entry_idx) };
+        real_idx.and_then(|real_idx| {
+            let mut ctrl = nvme::CONTROLLER.lock();
+            ctrl.as_mut().and_then(|ctrl| {
+                let ctrl = &mut hepfs::BlockDev::Nvme(ctrl);
+                let entries = hepfs::list_dir(ctrl, browsing_ino);
+                let row_ino = if rel_x <= left_w {
+                    entries.iter().filter(|(ino, _)| hepfs::read_inode(ctrl, *ino).flags == hepfs::F_DIR)
+                        .nth(real_idx).map(|(ino, _)| *ino)
+                } else {
+                    entries.get(real_idx).filter(|(ino, _)| hepfs::read_inode(ctrl, *ino).flags == hepfs::F_DIR)
+                        .map(|(ino, _)| *ino)
+                };
+                // Dropping a directory onto itself isn't a real move.
+                row_ino.filter(|&ino| ino != fd.ino)
+            })
+        }).unwrap_or(browsing_ino)
+    } else {
+        browsing_ino
+    };
+
+    let mut ctrl = nvme::CONTROLLER.lock();
+    if let Some(ctrl) = ctrl.as_mut() {
+        let ctrl = &mut hepfs::BlockDev::Nvme(ctrl);
+        hepfs::move_entry(ctrl, fd.from_parent, target_ino, &fd.name);
+    }
+    drop(ctrl);
+    refresh_desktop_icons();
+    let mut dt = desktop::DESKTOP.lock();
+    if let Some(dt) = dt.as_mut() { dt.dirty = true; }
+    true
 }
 
 #[no_mangle]
@@ -1062,6 +1134,7 @@ fn task_blink() -> ! {
                             nav.fwd.push((cur_ino, cur_path));
                             nav.ino  = pino;
                             nav.path = ppath;
+                            nav.range_selected.clear();
                         }
                     }
                     drop(navs);
@@ -1078,6 +1151,7 @@ fn task_blink() -> ! {
                             nav.back.push((cur_ino, cur_path));
                             nav.ino  = nino;
                             nav.path = npath;
+                            nav.range_selected.clear();
                         }
                     }
                     drop(navs);
@@ -1101,6 +1175,7 @@ fn task_blink() -> ! {
                                 nav.fwd.push((ci, cp));
                                 nav.ino  = pino;
                                 nav.path = ppath;
+                                nav.range_selected.clear();
                             }
                         }
                         drop(navs);
@@ -1128,6 +1203,28 @@ fn task_blink() -> ! {
                             })
                         };
                         if let Some((ino, name, flags)) = entry {
+                            // Shift+click range-selects every row between the
+                            // current anchor (nav.selected) and this one, in
+                            // the same pane — highlight only, doesn't move the
+                            // anchor and doesn't arm a drag/open/rename (a
+                            // Shift+click is purely a selection modifier, same
+                            // as the desktop's own Shift+click).
+                            if ps2::shift_held() {
+                                let mut navs = HEPFS_NAVS.lock();
+                                if let Some((_, nav)) = navs.iter_mut().find(|(id, _)| *id == win_id) {
+                                    if let Some((anchor_pane, anchor_idx)) = nav.selected {
+                                        if anchor_pane == pane {
+                                            let (lo, hi) = (anchor_idx.min(idx), anchor_idx.max(idx));
+                                            nav.range_selected = (lo..=hi).collect();
+                                        }
+                                    }
+                                }
+                                drop(navs);
+                                let mut dt = desktop::DESKTOP.lock();
+                                if let Some(dt) = dt.as_mut() { dt.dirty = true; }
+                                continue;
+                            }
+
                             // Select-then-click-again semantics, same thresholds
                             // the desktop's own icons use (ICON_DBLCLICK_TICKS/
                             // ICON_RENAME_TICKS) so both feel identical: a fast
@@ -1144,6 +1241,7 @@ fn task_blink() -> ! {
                                     let elapsed = now.saturating_sub(nav.selected_at);
                                     nav.selected    = Some((pane, idx));
                                     nav.selected_at = now;
+                                    nav.range_selected.clear();
                                     (was_selected, elapsed)
                                 })
                             };
@@ -1270,38 +1368,7 @@ fn task_blink() -> ! {
                 let drag = FILE_DRAG.lock().take();
                 if let Some(fd) = drag {
                     if fd.moved {
-                        // Drop target: whatever directory the topmost Files
-                        // window under the cursor is currently browsing —
-                        // dropping on a *specific* row to go one level deeper
-                        // isn't implemented, just "drop anywhere in a Files
-                        // window" = "move into whatever it's showing".
-                        let target = {
-                            let dt = desktop::DESKTOP.lock();
-                            dt.as_ref().and_then(|d| {
-                                let win = d.windows.iter().rev().find(|w| {
-                                    w.app_kind == desktop::AppKind::Files && !w.minimized
-                                        && mx >= w.x && mx < w.x + w.w as i32
-                                        && my >= w.y && my < w.y + w.h as i32
-                                        && topmost_window_id_at(d, mx, my) == Some(w.id)
-                                })?;
-                                Some(win.id)
-                            })
-                        };
-                        if let Some(target_win) = target {
-                            let target_ino = HEPFS_NAVS.lock().iter()
-                                .find(|(id, _)| *id == target_win).map(|(_, n)| n.ino);
-                            if let Some(target_ino) = target_ino {
-                                let mut ctrl = nvme::CONTROLLER.lock();
-                                if let Some(ctrl) = ctrl.as_mut() {
-                                    let ctrl = &mut hepfs::BlockDev::Nvme(ctrl);
-                                    hepfs::move_entry(ctrl, fd.from_parent, target_ino, &fd.name);
-                                }
-                                drop(ctrl);
-                                refresh_desktop_icons();
-                                let mut dt = desktop::DESKTOP.lock();
-                                if let Some(dt) = dt.as_mut() { dt.dirty = true; }
-                            }
-                        }
+                        resolve_file_drop(&fd, mx, my);
                     } else {
                         // Not dragged — run whatever action this click resolved
                         // to at mousedown (see FileDrag::pending_action).
@@ -1321,6 +1388,7 @@ fn task_blink() -> ! {
                                         alloc::format!("{}/{}", nav.path, fd.name)
                                     };
                                     nav.selected = None;
+                                    nav.range_selected.clear();
                                 }
                                 drop(navs);
                                 let mut dt = desktop::DESKTOP.lock();
@@ -1727,12 +1795,19 @@ fn render_hepfs_window(display: &mut framebuffer::Display, wx: usize, wy: usize,
     let nav_h: usize = 22;
     display.fill_rect(wx, wy, ww, nav_h, nav_bg);
 
-    let (has_back, has_fwd, cur_path, cur_ino, selected) = {
+    let (has_back, has_fwd, cur_path, cur_ino, selected, range_selected) = {
         let navs = HEPFS_NAVS.lock();
         match navs.iter().find(|(id, _)| *id == win_id) {
-            Some((_, n)) => (!n.back.is_empty(), !n.fwd.is_empty(), n.path.clone(), n.ino, n.selected),
-            None => (false, false, alloc::string::String::from("/"), hepfs::ROOT_INO, None),
+            Some((_, n)) => (!n.back.is_empty(), !n.fwd.is_empty(), n.path.clone(), n.ino, n.selected, n.range_selected.clone()),
+            None => (false, false, alloc::string::String::from("/"), hepfs::ROOT_INO, None, alloc::vec::Vec::new()),
         }
+    };
+    // A row is highlighted if it's the click-anchor OR part of a Shift+click
+    // range — the range only applies within `selected`'s own pane (a range in
+    // one pane shouldn't bleed into the other).
+    let is_highlighted = |pane: u8, row: usize| {
+        selected == Some((pane, row))
+            || (selected.map(|(p, _)| p) == Some(pane) && range_selected.contains(&row))
     };
 
     // Back button
@@ -1779,14 +1854,14 @@ fn render_hepfs_window(display: &mut framebuffer::Display, wx: usize, wy: usize,
         let mut y = list_top + 2;
         let mut row = 0usize;
         if !at_root {
-            if selected == Some((3, row)) { display.fill_rect(wx, y.saturating_sub(1), left_w, 13, hover); }
+            if is_highlighted(3, row) { display.fill_rect(wx, y.saturating_sub(1), left_w, 13, hover); }
             icons::draw_file_icon(display, wx + 3, y.saturating_sub(1), 12, true, "..");
             display.draw_text(wx + 18, y, "..", dir_col, 1);
             y += 14; row += 1;
         }
         for (_, name) in &dirs {
             if y + 12 > list_top + list_h { break; }
-            if selected == Some((3, row)) { display.fill_rect(wx, y.saturating_sub(1), left_w, 13, hover); }
+            if is_highlighted(3, row) { display.fill_rect(wx, y.saturating_sub(1), left_w, 13, hover); }
             icons::draw_file_icon(display, wx + 3, y.saturating_sub(1), 12, true, name);
             display.draw_text(wx + 18, y, name, dir_col, 1);
             y += 14; row += 1;
@@ -1799,7 +1874,7 @@ fn render_hepfs_window(display: &mut framebuffer::Display, wx: usize, wy: usize,
         let mut y = list_top + 2;
         let mut row = 0usize;
         if !at_root {
-            if selected == Some((4, row)) { display.fill_rect(right_x, y.saturating_sub(1), right_w, 13, hover); }
+            if is_highlighted(4, row) { display.fill_rect(right_x, y.saturating_sub(1), right_w, 13, hover); }
             icons::draw_file_icon(display, right_x + 3, y.saturating_sub(1), 12, true, "..");
             display.draw_text(right_x + 18, y, "..", dir_col, 1);
             y += 14; row += 1;
@@ -1809,7 +1884,7 @@ fn render_hepfs_window(display: &mut framebuffer::Display, wx: usize, wy: usize,
             let inode = hepfs::read_inode(ctrl, *ino);
             let is_dir = inode.flags == hepfs::F_DIR;
             let col = if is_dir { dir_col } else { text };
-            if selected == Some((4, row)) { display.fill_rect(right_x, y.saturating_sub(1), right_w, 13, hover); }
+            if is_highlighted(4, row) { display.fill_rect(right_x, y.saturating_sub(1), right_w, 13, hover); }
             icons::draw_file_icon(display, right_x + 3, y.saturating_sub(1), 12, is_dir, name);
             display.draw_text(right_x + 18, y, name, col, 1);
             if !is_dir {
