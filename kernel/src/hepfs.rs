@@ -625,6 +625,49 @@ pub fn rename(ctrl: &mut BlockDev, parent_ino: u32, old_name: &str, new_name: &s
     false
 }
 
+/// Move an entry from one directory to another (drag-and-drop in the file
+/// manager). Re-parents the `DirEntry` — the inode (and, for a directory,
+/// its contents) is untouched, same "just rewrite the directory entry, don't
+/// touch what it points to" approach `rename()` uses. Returns false if
+/// `name` doesn't exist in `from_parent`, if `to_parent` already has an
+/// entry with that name, or if `to_parent == from_parent` (nothing to do).
+///
+/// No cycle check — moving a directory into its own descendant would create
+/// an unreachable loop. Not guarded against: the file manager only ever
+/// offers a drop target that's a *currently listed* directory, and a
+/// directory's own descendants aren't listed inside its own pane, so this
+/// isn't reachable through the UI today. Worth real cycle detection if a
+/// programmatic caller (e.g. a future `mv` shell command) starts calling
+/// this directly with arbitrary paths.
+pub fn move_entry(ctrl: &mut BlockDev, from_parent: u32, to_parent: u32, name: &str) -> bool {
+    if from_parent == to_parent { return false; }
+    if find_in_dir(ctrl, to_parent, name).is_some() { return false; }
+    let Some(ino) = find_in_dir(ctrl, from_parent, name) else { return false; };
+
+    // Remove the entry from its old parent (mirrors remove()'s dir-entry
+    // wipe, but leaves the inode/data blocks alone).
+    let parent = read_inode(ctrl, from_parent);
+    let mut removed = false;
+    for &blk in parent.direct.iter().filter(|&&b| b != 0) {
+        let page = read_block(ctrl, blk as u64);
+        let buf  = page.as_mut_slice();
+        for i in 0..ENTRIES_PER_BLK {
+            let ep = unsafe { buf.as_mut_ptr().add(i * DIR_ENTRY_SIZE) as *mut DirEntry };
+            if unsafe { (*ep).inode } == ino {
+                unsafe { *ep = DirEntry { inode: 0, name_len: 0, name: [0; 27] }; }
+                write_block(ctrl, blk as u64, &page);
+                removed = true;
+                break;
+            }
+        }
+        if removed { break; }
+    }
+    if !removed { return false; }
+
+    add_dir_entry(ctrl, to_parent, name, ino);
+    true
+}
+
 /// Lookup an entry by name in a directory. Returns (inode_id, is_dir).
 pub fn stat(ctrl: &mut BlockDev, ino: u32) -> (bool, u64) {
     let inode = read_inode(ctrl, ino);

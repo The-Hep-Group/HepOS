@@ -66,6 +66,23 @@ static TEXT_DRAG_WIN: Mutex<Option<usize>> = Mutex::new(None);
 /// keep scrubbing volume even if the cursor moves off the slider's y-range.
 static VOLUME_DRAG: Mutex<bool> = Mutex::new(false);
 
+/// A file/folder row's drag-and-drop between (or within) Files windows.
+/// Armed on mousedown over a row (alongside — not instead of — that click's
+/// normal select/open/rename action, same "click still fires, drag is a
+/// layered extra" tradeoff `desktop.rs`'s taskbar drag-to-reorder made) and
+/// resolved on release: dropping anywhere inside a Files window (the same
+/// one or a different one) moves the entry into whatever directory that
+/// window is currently browsing.
+struct FileDrag {
+    from_parent: u32,
+    ino:  u32,
+    name: alloc::string::String,
+    start_x: i32,
+    start_y: i32,
+    moved: bool,
+}
+static FILE_DRAG: Mutex<Option<FileDrag>> = Mutex::new(None);
+
 /// (window id, row, col, TSC timestamp) of the last fresh click in an
 /// editor/terminal content area — used to detect a double-click (same cell,
 /// within ~400ms) so it can select the whole line instead of just placing
@@ -1021,6 +1038,16 @@ fn task_blink() -> ! {
                             })
                         };
                         if let Some((ino, name, flags)) = entry {
+                            // Arm a possible drag-and-drop — resolved on release
+                            // further down in the main loop. Doesn't replace the
+                            // select/open/rename click handling below; both fire
+                            // from the same mousedown, same tradeoff the taskbar's
+                            // drag-to-reorder made.
+                            *FILE_DRAG.lock() = Some(FileDrag {
+                                from_parent: cur_ino, ino, name: name.clone(),
+                                start_x: mx, start_y: my, moved: false,
+                            });
+
                             // Select-then-click-again semantics, same thresholds
                             // the desktop's own icons use (ICON_DBLCLICK_TICKS/
                             // ICON_RENAME_TICKS) so both feel identical: a fast
@@ -1186,6 +1213,59 @@ fn task_blink() -> ! {
                     if let Some(dt) = desktop::DESKTOP.lock().as_mut() { dt.dirty = true; }
                 }
                 None => {}
+            }
+        }
+
+        // File/folder drag-and-drop between (or within) Files windows —
+        // resolves the drag armed above. `btn_held` here reuses the same
+        // "still down" signal the text-selection/volume drags above check.
+        {
+            let btn_held = btn & 1 != 0;
+            if btn_held {
+                let mut fd = FILE_DRAG.lock();
+                if let Some(fd) = fd.as_mut() {
+                    if !fd.moved && ((mx - fd.start_x).abs() > 8 || (my - fd.start_y).abs() > 8) {
+                        fd.moved = true;
+                    }
+                }
+            } else {
+                let drag = FILE_DRAG.lock().take();
+                if let Some(fd) = drag {
+                    if fd.moved {
+                        // Drop target: whatever directory the topmost Files
+                        // window under the cursor is currently browsing —
+                        // dropping on a *specific* row to go one level deeper
+                        // isn't implemented, just "drop anywhere in a Files
+                        // window" = "move into whatever it's showing".
+                        let target = {
+                            let dt = desktop::DESKTOP.lock();
+                            dt.as_ref().and_then(|d| {
+                                let win = d.windows.iter().rev().find(|w| {
+                                    w.app_kind == desktop::AppKind::Files && !w.minimized
+                                        && mx >= w.x && mx < w.x + w.w as i32
+                                        && my >= w.y && my < w.y + w.h as i32
+                                        && topmost_window_id_at(d, mx, my) == Some(w.id)
+                                })?;
+                                Some(win.id)
+                            })
+                        };
+                        if let Some(target_win) = target {
+                            let target_ino = HEPFS_NAVS.lock().iter()
+                                .find(|(id, _)| *id == target_win).map(|(_, n)| n.ino);
+                            if let Some(target_ino) = target_ino {
+                                let mut ctrl = nvme::CONTROLLER.lock();
+                                if let Some(ctrl) = ctrl.as_mut() {
+                                    let ctrl = &mut hepfs::BlockDev::Nvme(ctrl);
+                                    hepfs::move_entry(ctrl, fd.from_parent, target_ino, &fd.name);
+                                }
+                                drop(ctrl);
+                                refresh_desktop_icons();
+                                let mut dt = desktop::DESKTOP.lock();
+                                if let Some(dt) = dt.as_mut() { dt.dirty = true; }
+                            }
+                        }
+                    }
+                }
             }
         }
 
