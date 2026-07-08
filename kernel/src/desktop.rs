@@ -75,12 +75,15 @@ pub fn toggle_pinned_file(ino: u32, parent_path: String, name: String, is_dir: b
     }
 }
 
-/// Files-and-directories clipboard — (parent_ino, ino, name, is_dir). Shared
-/// by the Ctrl+C/Ctrl+V keyboard shortcut (`main.rs`) and the right-click
-/// "Copy"/"Paste" menu items below, so copying one way and pasting the other
-/// still works. Separate from the plain-text clipboard editor/terminal
-/// Ctrl+C/V uses (`clipboard.rs`).
-pub static FS_CLIPBOARD: Mutex<Option<(u32, u32, String, bool)>> = Mutex::new(None);
+/// Files-and-directories clipboard — one `(parent_ino, ino, name, is_dir)`
+/// per copied entry (empty = nothing copied). A `Vec` rather than a single
+/// `Option` so copying a multi-selection (see "Copy" on a row that's part of
+/// one) stages all of it at once, not just the row that was right-clicked.
+/// Shared by the Ctrl+C/Ctrl+V keyboard shortcut (`main.rs`) and the
+/// right-click "Copy"/"Paste" menu items below, so copying one way and
+/// pasting the other still works. Separate from the plain-text clipboard
+/// editor/terminal Ctrl+C/V uses (`clipboard.rs`).
+pub static FS_CLIPBOARD: Mutex<Vec<(u32, u32, String, bool)>> = Mutex::new(Vec::new());
 
 // ── Desktop icons ─────────────────────────────────────────────────────────────
 // Each icon: 48×48 box + 8px gap + 8px text label = 64px slot, 80px stride.
@@ -650,8 +653,12 @@ pub enum ContextMenuKind {
     /// Right-clicked a specific row in a Files window. `parent_path` is the
     /// browsed directory's real path (desktop.rs can't compute this itself —
     /// main.rs fills it in from `HepfsNav::path` when resolving the pending
-    /// right-click below).
-    FsRow { win_id: usize, parent_ino: u32, parent_path: String, ino: u32, name: String, is_dir: bool, is_pinned: bool },
+    /// right-click below). `extra` is every *other* currently multi-selected
+    /// row's (ino, name, is_dir), if the right-clicked row is part of a
+    /// multi-selection (`HepfsNav::range_selected`) — empty otherwise. "Copy"
+    /// stages the whole group, not just the one row that happened to be
+    /// right-clicked.
+    FsRow { win_id: usize, parent_ino: u32, parent_path: String, ino: u32, name: String, is_dir: bool, is_pinned: bool, extra: Vec<(u32, String, bool)> },
     /// Right-clicked empty space in a Files window's content area — just "Paste".
     FsPane { win_id: usize, parent_ino: u32, parent_path: String },
 }
@@ -1086,6 +1093,33 @@ impl Desktop {
     }
 
     /// Returns true if a new terminal window should be spawned (caller must do it after dropping the DESKTOP lock).
+    /// Bounding rect (x, y, w, h) of the currently-open text prompt, matching
+    /// whichever visual form it takes — the centered modal (New File/New
+    /// Folder/RenameFsPane) or the inline box under a desktop icon
+    /// (RenameIcon), mirroring `render()`'s/`draw_new_entry_prompt()`'s own
+    /// layout math exactly so a click just outside the visible box always
+    /// dismisses it and a click inside never does.
+    fn prompt_rect(&self) -> Option<(i32, i32, i32, i32)> {
+        let prompt = self.text_prompt.as_ref()?;
+        match prompt.kind {
+            PromptKind::RenameIcon(idx) => {
+                let icon = self.icons.get(idx)?;
+                let (ix, iy, iw, ih) = Self::icon_rect_at(icon);
+                let bw = (prompt.buf.len().max(4) * 8 + 6).min(140) as i32;
+                let bx = ix - (bw - iw as i32).max(0) / 2;
+                let label_y = iy + ih as i32 + 4;
+                Some((bx, label_y, bw, 12))
+            }
+            _ => {
+                const PW: i32 = 240;
+                const PH: i32 = 60;
+                let x = (self.fb_w as i32 - PW) / 2;
+                let y = (self.fb_h as i32 - PH) / 2;
+                Some((x, y, PW, PH))
+            }
+        }
+    }
+
     pub fn update_mouse(&mut self, mx: i32, my: i32, buttons: u8) -> bool {
         let mut spawn_terminal = false;
         if mx != self.prev_cx || my != self.prev_cy {
@@ -1098,6 +1132,21 @@ impl Desktop {
         let released = buttons & 0x01 == 0 && self.prev_btn & 0x01 != 0;
         let held     = buttons & 0x01 != 0;
         self.prev_btn = buttons;
+
+        // Any click — left or right — outside the open text prompt (rename/
+        // New File/New Folder) dismisses it instead of falling through to
+        // whatever's underneath, matching how the context menu already
+        // dismisses on an outside click.
+        if (clicked || right_clicked) && self.text_prompt.is_some() {
+            if let Some((px, py, pw, ph)) = self.prompt_rect() {
+                let inside = mx >= px && mx < px + pw && my >= py && my < py + ph;
+                if !inside {
+                    self.text_prompt = None;
+                    self.dirty = true;
+                    return false;
+                }
+            }
+        }
 
         // Drag or resize
         if held {
@@ -1402,7 +1451,7 @@ impl Desktop {
                                 if let Some(ctrl) = ctrl.as_mut() {
                                     let ctrl = &mut crate::hepfs::BlockDev::Nvme(ctrl);
                                     if let Some(parent_ino) = crate::hepfs::lookup(ctrl, "/home/desktop") {
-                                        *FS_CLIPBOARD.lock() = Some((parent_ino, ino, name, is_dir));
+                                        *FS_CLIPBOARD.lock() = alloc::vec![(parent_ino, ino, name, is_dir)];
                                     }
                                 }
                             }
@@ -1416,16 +1465,24 @@ impl Desktop {
                 (ContextMenuKind::FsRow { parent_path, ino, name, is_dir, .. }, Some(1)) => {
                     toggle_pinned_file(ino, parent_path, name, is_dir);
                 }
-                (ContextMenuKind::FsRow { parent_ino, ino, name, is_dir, .. }, Some(2)) => {
-                    *FS_CLIPBOARD.lock() = Some((parent_ino, ino, name, is_dir));
+                (ContextMenuKind::FsRow { parent_ino, ino, name, is_dir, extra, .. }, Some(2)) => {
+                    // Stage the right-clicked row plus every other row that
+                    // was part of the same multi-selection.
+                    let mut clip = alloc::vec![(parent_ino, ino, name, is_dir)];
+                    for (eino, ename, eis_dir) in extra {
+                        clip.push((parent_ino, eino, ename, eis_dir));
+                    }
+                    *FS_CLIPBOARD.lock() = clip;
                 }
                 (ContextMenuKind::FsPane { parent_ino, .. }, Some(0)) => {
                     let clip = FS_CLIPBOARD.lock().clone();
-                    if let Some((from_parent, _ino, name, _is_dir)) = clip {
+                    if !clip.is_empty() {
                         let mut ctrl = crate::nvme::CONTROLLER.lock();
                         if let Some(ctrl) = ctrl.as_mut() {
                             let ctrl = &mut crate::hepfs::BlockDev::Nvme(ctrl);
-                            crate::hepfs::copy_entry_unique(ctrl, from_parent, parent_ino, &name);
+                            for (from_parent, _ino, name, _is_dir) in &clip {
+                                crate::hepfs::copy_entry_unique(ctrl, *from_parent, parent_ino, name);
+                            }
                         }
                         drop(ctrl);
                         crate::refresh_desktop_icons();

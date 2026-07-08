@@ -84,6 +84,12 @@ struct FileDrag {
     win_id: usize,
     is_dir: bool,
     pending_action: FileRowAction,
+    /// Every *other* row that was part of the same multi-selection when the
+    /// drag started (`HepfsNav::range_selected`) — empty if the dragged row
+    /// wasn't part of one. Dropping moves the primary row *and* all of these
+    /// together, same "drag any selected item moves the whole group" model
+    /// the desktop's own icon multi-select uses.
+    extra: alloc::vec::Vec<(u32, alloc::string::String, bool)>,
 }
 #[derive(Clone, Copy, PartialEq)]
 enum FileRowAction { None, Open, Rename }
@@ -184,6 +190,17 @@ fn selected_fs_entry(win_id: usize) -> Option<(u32, u32, alloc::string::String, 
         let (pane, idx) = nav.selected?;
         (nav.ino, pane, idx)
     };
+    let (ino, name, is_dir) = resolve_fs_row(win_id, pane, idx)?;
+    Some((cur_ino, ino, name, is_dir))
+}
+
+/// Resolve a specific (pane, row_idx) in `win_id`'s currently-browsed
+/// directory into (ino, name, is_dir) — the row-lookup half of
+/// `selected_fs_entry`, factored out so multi-selection resolution
+/// (`selected_fs_entries`) can reuse it per-row. Returns `None` for the
+/// ".." row or an out-of-range index.
+fn resolve_fs_row(win_id: usize, pane: u8, idx: usize) -> Option<(u32, alloc::string::String, bool)> {
+    let cur_ino = HEPFS_NAVS.lock().iter().find(|(id, _)| *id == win_id).map(|(_, n)| n.ino)?;
     let at_root = cur_ino == hepfs::ROOT_INO;
     if !at_root && idx == 0 { return None; } // the ".." row isn't a real entry
     let real_idx = if !at_root { idx - 1 } else { idx };
@@ -192,17 +209,34 @@ fn selected_fs_entry(win_id: usize) -> Option<(u32, u32, alloc::string::String, 
     let ctrl = ctrl.as_mut()?;
     let ctrl = &mut hepfs::BlockDev::Nvme(ctrl);
     let entries = hepfs::list_dir(ctrl, cur_ino);
-    let (ino, name, is_dir) = if pane == 3 {
+    if pane == 3 {
         let (ino, name) = entries.iter()
             .filter(|(ino, _)| hepfs::read_inode(ctrl, *ino).flags == hepfs::F_DIR)
             .nth(real_idx)?;
-        (*ino, name.clone(), true)
+        Some((*ino, name.clone(), true))
     } else {
         let (ino, name) = entries.get(real_idx)?;
         let is_dir = hepfs::read_inode(ctrl, *ino).flags == hepfs::F_DIR;
-        (*ino, name.clone(), is_dir)
+        Some((*ino, name.clone(), is_dir))
+    }
+}
+
+/// Every entry the "current selection" covers — the whole multi-selection
+/// (`HepfsNav::range_selected`) if there is one (more than one row), else
+/// just the single `selected` row. Used anywhere an action (Copy, drag)
+/// should act on the whole group when one exists, not just whichever row
+/// happened to be clicked/dragged.
+fn selected_fs_entries(win_id: usize) -> alloc::vec::Vec<(u32, u32, alloc::string::String, bool)> {
+    let (cur_ino, pane, sel_idx, range) = {
+        let navs = HEPFS_NAVS.lock();
+        let Some((_, nav)) = navs.iter().find(|(id, _)| *id == win_id) else { return alloc::vec::Vec::new() };
+        let Some((pane, idx)) = nav.selected else { return alloc::vec::Vec::new() };
+        (nav.ino, pane, idx, nav.range_selected.clone())
     };
-    Some((cur_ino, ino, name, is_dir))
+    let rows: alloc::vec::Vec<usize> = if range.len() > 1 { range } else { alloc::vec![sel_idx] };
+    rows.into_iter()
+        .filter_map(|idx| resolve_fs_row(win_id, pane, idx).map(|(ino, name, is_dir)| (cur_ino, ino, name, is_dir)))
+        .collect()
 }
 
 /// Lists `/home/desktop` and pushes the result into the desktop's icon set
@@ -313,7 +347,12 @@ fn resolve_file_drop(fd: &FileDrag, mx: i32, my: i32) -> bool {
     let mut ctrl = nvme::CONTROLLER.lock();
     if let Some(ctrl) = ctrl.as_mut() {
         let ctrl = &mut hepfs::BlockDev::Nvme(ctrl);
+        // Move the dragged row, plus every other row that was part of the
+        // same multi-selection when the drag started (see FileDrag::extra).
         hepfs::move_entry(ctrl, fd.from_parent, target_ino, &fd.name);
+        for (_, name, _) in &fd.extra {
+            hepfs::move_entry(ctrl, fd.from_parent, target_ino, name);
+        }
     }
     drop(ctrl);
     refresh_desktop_icons();
@@ -329,11 +368,21 @@ fn resolve_file_drop(fd: &FileDrag, mx: i32, my: i32) -> bool {
 /// icon+label a Files window row would, floating near the cursor, whenever
 /// `FILE_DRAG` is armed and has actually moved (not just clicked).
 fn draw_file_drag_ghost(display: &mut framebuffer::Display, mx: i32, my: i32) {
-    let Some(fd) = FILE_DRAG.lock().as_ref().map(|fd| (fd.moved, fd.is_dir, fd.name.clone())) else { return };
-    let (moved, is_dir, name) = fd;
+    let Some(fd) = FILE_DRAG.lock().as_ref()
+        .map(|fd| (fd.moved, fd.is_dir, fd.name.clone(), fd.extra.len())) else { return };
+    let (moved, is_dir, name, extra_count) = fd;
     if !moved { return; }
 
-    let label = if name.len() > 20 { alloc::format!("{}…", &name[..20]) } else { name.clone() };
+    // Dragging a multi-selection shows "N items" instead of a specific name
+    // (and a generic folder-ish icon, since the group can mix files/dirs).
+    let multi = extra_count > 0;
+    let label = if multi {
+        alloc::format!("{} items", extra_count + 1)
+    } else if name.len() > 20 {
+        alloc::format!("{}…", &name[..20])
+    } else {
+        name.clone()
+    };
     let w = label.len() * 9 + 22;
     let h = 18usize;
     let gx = (mx + 12).max(0) as usize;
@@ -341,7 +390,7 @@ fn draw_file_drag_ghost(display: &mut framebuffer::Display, mx: i32, my: i32) {
     display.fill_rect(gx + 2, gy + 2, w, h, framebuffer::Color::from_hex(0x000000));
     display.fill_rect(gx, gy, w, h, framebuffer::Color::from_hex(0x1E1E40));
     display.fill_rect(gx, gy, w, 1, framebuffer::Color::from_hex(0x6C8EFF));
-    icons::draw_file_icon(display, gx + 3, gy + 3, 12, is_dir, &name);
+    icons::draw_file_icon(display, gx + 3, gy + 3, 12, is_dir || multi, &name);
     display.draw_text(gx + 20, gy + 5, &label, framebuffer::Color::from_hex(0xE8E8E8), 1);
 }
 
@@ -749,18 +798,22 @@ fn task_blink() -> ! {
                         // Ctrl+C (unlike the terminal's Ctrl+C=cancel), so
                         // treat both as Copy here.
                         if c as u8 == 0x03 || (c == 'C' && ps2::ctrl_held()) {
-                            if let Some(entry) = selected_fs_entry(win_id) { *desktop::FS_CLIPBOARD.lock() = Some(entry); }
+                            // Copies the whole multi-selection if the selected
+                            // row is part of one, else just that one row.
+                            *desktop::FS_CLIPBOARD.lock() = selected_fs_entries(win_id);
                             true
                         } else if c as u8 == 0x16 || (c == 'V' && ps2::ctrl_held()) {
                             let clip = desktop::FS_CLIPBOARD.lock().clone();
-                            if let Some((from_parent, _ino, name, _is_dir)) = clip {
+                            if !clip.is_empty() {
                                 let target_ino = HEPFS_NAVS.lock().iter()
                                     .find(|(id, _)| *id == win_id).map(|(_, n)| n.ino);
                                 if let Some(target_ino) = target_ino {
                                     let mut ctrl = nvme::CONTROLLER.lock();
                                     if let Some(ctrl) = ctrl.as_mut() {
                                         let ctrl = &mut hepfs::BlockDev::Nvme(ctrl);
-                                        hepfs::copy_entry_unique(ctrl, from_parent, target_ino, &name);
+                                        for (from_parent, _ino, name, _is_dir) in &clip {
+                                            hepfs::copy_entry_unique(ctrl, *from_parent, target_ino, name);
+                                        }
                                     }
                                     drop(ctrl);
                                     refresh_desktop_icons();
@@ -1282,13 +1335,24 @@ fn task_blink() -> ! {
                                 navs.iter_mut().find(|(id, _)| *id == win_id).map(|(_, nav)| {
                                     let was_selected = nav.selected == Some((pane, idx));
                                     let elapsed = now.saturating_sub(nav.selected_at);
-                                    nav.selected    = Some((pane, idx));
+                                    // A plain click on a row that's already part of
+                                    // the current multi-selection (range_selected)
+                                    // keeps the whole group selected, so it can be
+                                    // dragged together below — same "click an
+                                    // unselected item narrows to just it, click an
+                                    // already-selected one keeps the group" rule the
+                                    // desktop's own icon multi-select uses. Only a
+                                    // click *outside* the group resets to single-select.
+                                    let in_group = nav.range_selected.contains(&idx);
+                                    if !in_group {
+                                        nav.selected = Some((pane, idx));
+                                        nav.range_selected.clear();
+                                    }
                                     nav.selected_at = now;
-                                    nav.range_selected.clear();
-                                    (was_selected, elapsed)
+                                    (was_selected, elapsed, nav.range_selected.clone())
                                 })
                             };
-                            let Some((was_selected, elapsed)) = click_state else { continue; };
+                            let Some((was_selected, elapsed, range)) = click_state else { continue; };
                             let action = if was_selected && elapsed <= desktop::ICON_DBLCLICK_TICKS {
                                 FileRowAction::Open
                             } else if was_selected && elapsed <= desktop::ICON_RENAME_TICKS {
@@ -1300,11 +1364,18 @@ fn task_blink() -> ! {
                             if let Some(dt) = dt.as_mut() { dt.dirty = true; }
                             drop(dt);
 
+                            let extra = if range.len() > 1 {
+                                range.into_iter().filter(|&r| r != idx)
+                                    .filter_map(|r| resolve_fs_row(win_id, pane, r))
+                                    .collect()
+                            } else {
+                                alloc::vec::Vec::new()
+                            };
                             *FILE_DRAG.lock() = Some(FileDrag {
                                 from_parent: cur_ino, ino, name: name.clone(),
                                 start_x: mx, start_y: my, moved: false,
                                 win_id, is_dir: flags == hepfs::F_DIR,
-                                pending_action: action,
+                                pending_action: action, extra,
                             });
                         }
                     }
@@ -1340,12 +1411,13 @@ fn task_blink() -> ! {
                         } else {
                             let real_idx = if !at_root { entry_idx - 1 } else { entry_idx };
                             let left_w = (ww * HEPFS_TREE_W_NUM) / HEPFS_TREE_W_DEN;
+                            let pane: u8 = if rel_x <= left_w { 3 } else { 4 };
                             let entry = {
                                 let mut ctrl = nvme::CONTROLLER.lock();
                                 ctrl.as_mut().and_then(|ctrl| {
                                     let ctrl = &mut hepfs::BlockDev::Nvme(ctrl);
                                     let entries = hepfs::list_dir(ctrl, cur_ino);
-                                    if rel_x <= left_w {
+                                    if pane == 3 {
                                         entries.iter().filter(|(ino, _)| hepfs::read_inode(ctrl, *ino).flags == hepfs::F_DIR)
                                             .nth(real_idx).map(|(ino, name)| (*ino, name.clone(), true))
                                     } else {
@@ -1357,10 +1429,28 @@ fn task_blink() -> ! {
                                 })
                             };
                             match entry {
-                                Some((ino, name, is_dir)) => Some(desktop::ContextMenuKind::FsRow {
-                                    win_id, parent_ino: cur_ino, parent_path: cur_path, ino, name, is_dir,
-                                    is_pinned: desktop::is_pinned_file(ino),
-                                }),
+                                Some((ino, name, is_dir)) => {
+                                    // If this row is part of a multi-selection,
+                                    // "Copy" should stage the whole group —
+                                    // resolve every *other* selected row too.
+                                    let (is_selected_row, range) = {
+                                        let navs = HEPFS_NAVS.lock();
+                                        navs.iter().find(|(id, _)| *id == win_id)
+                                            .map(|(_, n)| (n.selected == Some((pane, entry_idx)), n.range_selected.clone()))
+                                            .unwrap_or((false, alloc::vec::Vec::new()))
+                                    };
+                                    let extra = if is_selected_row && range.len() > 1 {
+                                        range.into_iter().filter(|&r| r != entry_idx)
+                                            .filter_map(|r| resolve_fs_row(win_id, pane, r))
+                                            .collect()
+                                    } else {
+                                        alloc::vec::Vec::new()
+                                    };
+                                    Some(desktop::ContextMenuKind::FsRow {
+                                        win_id, parent_ino: cur_ino, parent_path: cur_path, ino, name, is_dir,
+                                        is_pinned: desktop::is_pinned_file(ino), extra,
+                                    })
+                                }
                                 None => Some(desktop::ContextMenuKind::FsPane { win_id, parent_ino: cur_ino, parent_path: cur_path }),
                             }
                         }
