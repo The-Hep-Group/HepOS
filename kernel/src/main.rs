@@ -100,6 +100,15 @@ struct FileDrag {
 enum FileRowAction { None, Open, Rename }
 static FILE_DRAG: Mutex<Option<FileDrag>> = Mutex::new(None);
 
+/// Armed on mousedown over a Files window's icon-grid scrollbar track —
+/// `(win_id, list_top (screen y), list_h, max_scroll (rows))` — and read
+/// every held frame after to convert the cursor's y position into a row
+/// offset, same direct-manipulation-track model the Settings volume slider
+/// already uses (`VOLUME_DRAG`), just living in `main.rs` instead of
+/// `desktop.rs` since it needs `hepfs::list_dir()` to know the content's
+/// row count (`desktop.rs` doesn't touch the block device).
+static FS_SCROLL_DRAG: Mutex<Option<(usize, i32, usize, usize)>> = Mutex::new(None);
+
 /// (window id, row, col, TSC timestamp) of the last fresh click in an
 /// editor/terminal content area — used to detect a double-click (same cell,
 /// within ~400ms) so it can select the whole line instead of just placing
@@ -153,6 +162,14 @@ struct HepfsNav {
     /// still just `selected`); file-manager multi-*move* isn't implemented,
     /// unlike the desktop's Shift+click/marquee (see PLAN.md).
     range_selected: alloc::vec::Vec<usize>,
+    /// Vertical scroll offset, in whole *grid rows* (not pixels — keeps every
+    /// visible row fully drawn, no partial-row clipping math needed) for the
+    /// right pane's icon grid. The left tree pane doesn't scroll (it's
+    /// always short: one-level directory names only). Reset to 0 on every
+    /// navigation (see the `..`/back/forward/into-directory sites) so a new
+    /// directory never opens already scrolled from wherever the previous
+    /// one was left.
+    scroll: usize,
 }
 
 // One entry per Files window, keyed by window id — same pattern as
@@ -165,7 +182,7 @@ fn hepfs_nav_new() -> HepfsNav {
         path: alloc::string::String::from("/"),
         back: alloc::vec::Vec::new(),
         fwd:  alloc::vec::Vec::new(),
-        selected: None, selected_at: 0, range_selected: alloc::vec::Vec::new(),
+        selected: None, selected_at: 0, range_selected: alloc::vec::Vec::new(), scroll: 0,
     }
 }
 
@@ -321,8 +338,17 @@ fn resolve_file_drop(fd: &FileDrag, mx: i32, my: i32) -> bool {
     let rel_x = (mx - wx) as usize;
     let rel_y = my - wy;
     let at_root = browsing_ino == hepfs::ROOT_INO;
+    let left_w = (ww * HEPFS_TREE_W_NUM) / HEPFS_TREE_W_DEN;
+    let on_tree_pane = rel_x <= left_w;
     let target_ino = if rel_y >= 22 {
-        let entry_idx = ((rel_y - 22) / 14).max(0) as usize;
+        let entry_idx = if on_tree_pane {
+            ((rel_y - 22) / 14).max(0) as usize
+        } else {
+            let right_w = ww.saturating_sub(left_w + 1);
+            let scroll = HEPFS_NAVS.lock().iter().find(|(id, _)| *id == target_win)
+                .map(|(_, n)| n.scroll).unwrap_or(0);
+            grid_idx_at(rel_x as i32 - left_w as i32 - 1, rel_y - 22, right_w, scroll)
+        };
         if !at_root && entry_idx == 0 {
             // Dropped on the ".." row — move up into the parent directory,
             // same one clicking ".." itself would navigate to.
@@ -330,13 +356,12 @@ fn resolve_file_drop(fd: &FileDrag, mx: i32, my: i32) -> bool {
                 .and_then(|(_, n)| n.back.last().map(|(ino, _)| *ino))
                 .unwrap_or(browsing_ino)
         } else {
-            let left_w = (ww * HEPFS_TREE_W_NUM) / HEPFS_TREE_W_DEN;
             let real_idx = if !at_root { entry_idx - 1 } else { entry_idx };
             let mut ctrl = nvme::CONTROLLER.lock();
             ctrl.as_mut().and_then(|ctrl| {
                 let ctrl = &mut hepfs::BlockDev::Nvme(ctrl);
                 let entries = hepfs::list_dir(ctrl, browsing_ino);
-                let row_ino = if rel_x <= left_w {
+                let row_ino = if on_tree_pane {
                     entries.iter().filter(|(ino, _)| hepfs::read_inode(ctrl, *ino).flags == hepfs::F_DIR)
                         .nth(real_idx).map(|(ino, _)| *ino)
                 } else {
@@ -1239,6 +1264,52 @@ fn task_blink() -> ! {
             }
         }
 
+        // Icon-grid scrollbar drag for a Files window's right pane — checked
+        // before the ordinary row/nav click resolution below so a click
+        // landing on the thin scrollbar strip doesn't also get misread as
+        // a click on whatever grid cell happens to sit under that same x
+        // column (the scrollbar occupies the pane's rightmost few pixels,
+        // still inside its content-hit rect).
+        let on_fs_scrollbar = if fresh_click {
+            let dt = desktop::DESKTOP.lock();
+            dt.as_ref().and_then(|d| {
+                let win = d.windows.iter().rev().find(|w| {
+                    w.app_kind == desktop::AppKind::Files && !w.minimized
+                        && mx >= w.x && mx < w.x + w.w as i32 && my >= w.y && my < w.y + w.h as i32
+                        && topmost_window_id_at(d, mx, my) == Some(w.id)
+                })?;
+                let left_w = (win.w * HEPFS_TREE_W_NUM) / HEPFS_TREE_W_DEN;
+                let right_w = win.w.saturating_sub(left_w + 1);
+                let list_top = win.y + 23;
+                let list_h = (win.h as i32 - 23).max(0) as usize;
+                let track_x = win.x + left_w as i32 + 1 + right_w.saturating_sub(HEPFS_SCROLLBAR_W) as i32;
+                if mx >= track_x && mx < track_x + HEPFS_SCROLLBAR_W as i32 && my >= list_top as i32 {
+                    Some((win.id, right_w, list_top, list_h))
+                } else { None }
+            })
+        } else { None };
+        if let Some((win_id, right_w, list_top, list_h)) = on_fs_scrollbar {
+            if let Some(max_scroll) = hepfs_scroll_max(win_id, right_w, list_h) {
+                *FS_SCROLL_DRAG.lock() = Some((win_id, list_top, list_h, max_scroll));
+            }
+        }
+        {
+            let btn_held = btn & 1 != 0;
+            if btn_held {
+                if let Some((win_id, list_top, list_h, max_scroll)) = *FS_SCROLL_DRAG.lock() {
+                    let rel = (my - list_top).max(0) as i64;
+                    let row = ((rel * max_scroll as i64) / list_h.max(1) as i64) as usize;
+                    if let Some((_, nav)) = HEPFS_NAVS.lock().iter_mut().find(|(id, _)| *id == win_id) {
+                        nav.scroll = row.min(max_scroll);
+                    }
+                    let mut dt = desktop::DESKTOP.lock();
+                    if let Some(dt) = dt.as_mut() { dt.dirty = true; }
+                }
+            } else {
+                *FS_SCROLL_DRAG.lock() = None;
+            }
+        }
+
         // HepFS window: navigate directories and open files on click.
         // Any Files window can be clicked (not just id=1) — each has its own
         // independent navigator entry in HEPFS_NAVS, shared by both panes
@@ -1251,7 +1322,7 @@ fn task_blink() -> ! {
         // visually overlapping the Files window underneath) must win the
         // click instead of leaking through to Files-window navigation. See
         // `topmost_window_id_at()`.
-        if fresh_click {
+        if fresh_click && on_fs_scrollbar.is_none() {
             let hepfs_click = {
                 let dt = desktop::DESKTOP.lock();
                 dt.as_ref().and_then(|d| {
@@ -1270,11 +1341,15 @@ fn task_blink() -> ! {
                         Some((win_id, zone, 0usize))
                     } else {
                         let left_w = (win.w * HEPFS_TREE_W_NUM) / HEPFS_TREE_W_DEN;
-                        let entry_idx = (rel_y - 23).max(0) as usize / 14;
                         if rel_x <= left_w {
+                            let entry_idx = (rel_y - 23).max(0) as usize / 14;
                             Some((win_id, 3u8, entry_idx)) // left pane: directories only
                         } else {
-                            Some((win_id, 4u8, entry_idx)) // right pane: full listing
+                            let right_w = win.w.saturating_sub(left_w + 1);
+                            let scroll = HEPFS_NAVS.lock().iter().find(|(id, _)| *id == win_id)
+                                .map(|(_, n)| n.scroll).unwrap_or(0);
+                            let idx = grid_idx_at(rel_x as i32 - left_w as i32 - 1, rel_y - 23, right_w, scroll);
+                            Some((win_id, 4u8, idx)) // right pane: full listing, icon grid
                         }
                     }
                 })
@@ -1292,6 +1367,7 @@ fn task_blink() -> ! {
                             nav.ino  = pino;
                             nav.path = ppath;
                             nav.range_selected.clear();
+                            nav.scroll = 0;
                         }
                     }
                     drop(navs);
@@ -1309,6 +1385,7 @@ fn task_blink() -> ! {
                             nav.ino  = nino;
                             nav.path = npath;
                             nav.range_selected.clear();
+                            nav.scroll = 0;
                         }
                     }
                     drop(navs);
@@ -1333,6 +1410,7 @@ fn task_blink() -> ! {
                                 nav.ino  = pino;
                                 nav.path = ppath;
                                 nav.range_selected.clear();
+                                nav.scroll = 0;
                             }
                         }
                         drop(navs);
@@ -1466,13 +1544,20 @@ fn task_blink() -> ! {
                     let kind = if rel_y < 22 {
                         None // nav bar — no context menu there
                     } else {
-                        let entry_idx = ((rel_y - 22) / 14).max(0) as usize;
+                        let left_w = (ww * HEPFS_TREE_W_NUM) / HEPFS_TREE_W_DEN;
+                        let pane: u8 = if rel_x <= left_w { 3 } else { 4 };
+                        let entry_idx = if pane == 3 {
+                            ((rel_y - 22) / 14).max(0) as usize
+                        } else {
+                            let right_w = ww.saturating_sub(left_w + 1);
+                            let scroll = HEPFS_NAVS.lock().iter().find(|(id, _)| *id == win_id)
+                                .map(|(_, n)| n.scroll).unwrap_or(0);
+                            grid_idx_at(rel_x as i32 - left_w as i32 - 1, rel_y - 22, right_w, scroll)
+                        };
                         if !at_root && entry_idx == 0 {
                             None // ".." row — nothing sensible to Open/Pin/Copy there
                         } else {
                             let real_idx = if !at_root { entry_idx - 1 } else { entry_idx };
-                            let left_w = (ww * HEPFS_TREE_W_NUM) / HEPFS_TREE_W_DEN;
-                            let pane: u8 = if rel_x <= left_w { 3 } else { 4 };
                             let entry = {
                                 let mut ctrl = nvme::CONTROLLER.lock();
                                 ctrl.as_mut().and_then(|ctrl| {
@@ -1647,6 +1732,7 @@ fn task_blink() -> ! {
                                     };
                                     nav.selected = None;
                                     nav.range_selected.clear();
+                                    nav.scroll = 0;
                                 }
                                 drop(navs);
                                 let mut dt = desktop::DESKTOP.lock();
@@ -2038,6 +2124,47 @@ fn spawn_stateless_window(kind: desktop::AppKind, title: &str, w: usize, h: usiz
 const HEPFS_TREE_W_NUM: usize = 35;
 const HEPFS_TREE_W_DEN: usize = 100;
 
+// ── Right-pane icon grid (the "large icon based file manager" ask) ─────────
+// The left tree pane stays a plain directory-name list (it's always short —
+// one level of subdirectories); only the right (full-listing) pane became a
+// wrapped icon grid. Cell = icon + centered label underneath, same glyphs
+// `icons::draw_file_icon` already draws for the old list rows, just bigger.
+const GRID_ICON:     usize = 36;
+const GRID_CELL_W:   usize = 72;
+const GRID_CELL_H:   usize = 60;
+/// Longest a filename label can be drawn at without overflowing
+/// `GRID_CELL_W` (9px/char at scale 1) and running into the next cell — one
+/// char short of the exact fit (`GRID_CELL_W / 9`) so there's still a
+/// sliver of margin between adjacent cells' labels.
+const GRID_LABEL_MAX_CHARS: usize = GRID_CELL_W / 9 - 1;
+/// Width, in pixels, of the vertical scrollbar track drawn along the right
+/// pane's right edge when its content overflows the window.
+const HEPFS_SCROLLBAR_W: usize = 8;
+
+/// Columns the right pane's icon grid fits at a given pane width — always at
+/// least 1, so a very narrow window degrades to a single column instead of
+/// dividing by a `cols` of 0.
+fn grid_cols(right_w: usize) -> usize {
+    (right_w.saturating_sub(HEPFS_SCROLLBAR_W) / GRID_CELL_W).max(1)
+}
+
+/// Maps a click/drop point *relative to the right pane's top-left content
+/// origin* (i.e. already offset past the tree pane and the nav bar) into a
+/// flat row index — the same `idx` numbering the old row-list used (0 = the
+/// ".." row when not at root, entries following in `hepfs::list_dir()`
+/// order), so every existing consumer of `(pane, idx)` — `resolve_fs_row()`,
+/// the click handler, drag/drop, the right-click context menu — needed no
+/// changes at all once this replaced their old `/14`-row-height math for
+/// pane 4. `scroll_rows` is the pane's current scroll offset in whole grid
+/// rows (`HepfsNav::scroll`), added before flattening to an index so a
+/// scrolled view still hit-tests against what's actually on screen.
+fn grid_idx_at(rel_x_in_pane: i32, rel_y_in_pane: i32, right_w: usize, scroll_rows: usize) -> usize {
+    let cols = grid_cols(right_w);
+    let col = (rel_x_in_pane.max(0) as usize / GRID_CELL_W).min(cols - 1);
+    let visual_row = rel_y_in_pane.max(0) as usize / GRID_CELL_H;
+    (visual_row + scroll_rows) * cols + col
+}
+
 /// Two-pane file manager: a single shared nav bar (back/forward/path) across
 /// the top, then a directories-only list on the left (a lightweight
 /// current-directory "tree") and the full listing (directories + files) on
@@ -2134,37 +2261,107 @@ fn render_hepfs_window(display: &mut framebuffer::Display, wx: usize, wy: usize,
             display.draw_text(wx + 4, list_top + 4, "(no folders)", dim, 1);
         }
 
-        // Right pane: full listing (directories + files), with sizes
-        let mut y = list_top + 2;
-        let mut row = 0usize;
+        // Right pane: full listing (directories + files) as a wrapped
+        // large-icon grid — item 9's "large icon based file manager" ask.
+        // Hit-testing (clicks/drops/right-clicks) lives in `grid_idx_at()`,
+        // kept in lockstep with this exact layout (same `GRID_CELL_W/H`,
+        // same idx numbering: 0 = ".." when not at root, then `entries` in
+        // `hepfs::list_dir()` order) — this function only needs to *draw*.
+        let grid_w    = right_w.saturating_sub(HEPFS_SCROLLBAR_W);
+        let cols      = grid_cols(right_w);
+        let total     = entries.len() + if at_root { 0 } else { 1 };
+        let total_rows  = total.div_ceil(cols);
+        let visible_rows = list_h.div_ceil(GRID_CELL_H).max(1);
+        let max_scroll  = total_rows.saturating_sub(visible_rows);
+        let scroll = {
+            let mut navs = HEPFS_NAVS.lock();
+            match navs.iter_mut().find(|(id, _)| *id == win_id) {
+                Some((_, n)) => { n.scroll = n.scroll.min(max_scroll); n.scroll }
+                None => 0,
+            }
+        };
+
+        let mut idx = 0usize;
+        let mut draw_grid_cell = |display: &mut framebuffer::Display, is_dir: bool, name: &str, size: Option<u64>| {
+            let row = idx / cols;
+            // Skip rows scrolled above the visible window entirely.
+            if row < scroll { idx += 1; return; }
+            let visual_row = row - scroll;
+            let col = idx % cols;
+            let cy = list_top + visual_row * GRID_CELL_H;
+            if cy + GRID_CELL_H <= list_top + list_h {
+                let cx = right_x + col * GRID_CELL_W;
+                if is_highlighted(4, idx) {
+                    display.fill_rect(cx + 2, cy + 1, GRID_CELL_W.saturating_sub(4), GRID_CELL_H - 3, hover);
+                }
+                let icon_x = cx + (GRID_CELL_W.saturating_sub(GRID_ICON)) / 2;
+                icons::draw_file_icon(display, icon_x, cy + 4, GRID_ICON, is_dir, name);
+                // Truncate to what actually fits in the cell (9px/char at
+                // scale 1) — the previous cap (9 chars, 81px) overflowed
+                // `GRID_CELL_W` (72px) and ran into the neighboring cell's
+                // label. `GRID_LABEL_MAX_CHARS - 1` leaves room for the "…".
+                let label = if name.chars().count() > GRID_LABEL_MAX_CHARS {
+                    let head: alloc::string::String = name.chars().take(GRID_LABEL_MAX_CHARS - 1).collect();
+                    alloc::format!("{}…", head)
+                } else {
+                    alloc::string::String::from(name)
+                };
+                let label_x = cx + (GRID_CELL_W.saturating_sub(label.chars().count() * 9)) / 2;
+                let col_c = if is_dir { dir_col } else { text };
+                display.draw_text(label_x, cy + GRID_ICON + 6, &label, col_c, 1);
+                if let Some(sz) = size {
+                    let s = fmt_size(sz);
+                    let chars = s.iter().position(|&b| b == 0).unwrap_or(s.len());
+                    let sx = cx + (GRID_CELL_W.saturating_sub(chars * 9)) / 2;
+                    display.draw_text(sx, cy + GRID_ICON + 16, core::str::from_utf8(&s[..chars]).unwrap_or(""), dim, 1);
+                }
+            }
+            idx += 1;
+        };
         if !at_root {
-            if is_highlighted(4, row) { display.fill_rect(right_x, y.saturating_sub(1), right_w, 13, hover); }
-            icons::draw_file_icon(display, right_x + 3, y.saturating_sub(1), 12, true, "..");
-            display.draw_text(right_x + 18, y, "..", dir_col, 1);
-            y += 14; row += 1;
+            draw_grid_cell(display, true, "..", None);
         }
         for (ino, name) in &entries {
-            if y + 12 > list_top + list_h { break; }
             let inode = hepfs::read_inode(ctrl, *ino);
             let is_dir = inode.flags == hepfs::F_DIR;
-            let col = if is_dir { dir_col } else { text };
-            if is_highlighted(4, row) { display.fill_rect(right_x, y.saturating_sub(1), right_w, 13, hover); }
-            icons::draw_file_icon(display, right_x + 3, y.saturating_sub(1), 12, is_dir, name);
-            display.draw_text(right_x + 18, y, name, col, 1);
-            if !is_dir {
-                let sz = fmt_size(inode.size);
-                let chars = sz.iter().position(|&b| b == 0).unwrap_or(sz.len());
-                let sx = right_x + right_w.saturating_sub(chars * 9 + 4);
-                display.draw_text(sx, y, core::str::from_utf8(&sz[..chars]).unwrap_or(""), dim, 1);
-            }
-            y += 14; row += 1;
+            draw_grid_cell(display, is_dir, name, if is_dir { None } else { Some(inode.size) });
         }
         if entries.is_empty() && at_root {
             display.draw_text(right_x + 4, list_top + 4, "(empty)", dim, 1);
         }
+
+        // Scrollbar: only drawn when content overflows the visible area —
+        // a thin track along the pane's right edge with a thumb sized to
+        // the visible/total ratio (`HepfsScrollDrag` below reads back this
+        // same geometry to convert a drag position into a row offset).
+        if max_scroll > 0 {
+            let track_x = right_x + grid_w;
+            display.fill_rect(track_x, list_top, HEPFS_SCROLLBAR_W, list_h, framebuffer::Color::from_hex(0x151525));
+            let thumb_h = ((list_h * visible_rows) / total_rows).max(10).min(list_h);
+            let thumb_y = list_top + ((list_h.saturating_sub(thumb_h)) * scroll) / max_scroll.max(1);
+            display.fill_rect(track_x + 1, thumb_y, HEPFS_SCROLLBAR_W.saturating_sub(2), thumb_h, acc);
+        }
     } else {
         display.draw_text(wx + 4, list_top + 4, "No NVMe", dim, 1);
     }
+}
+
+/// Everything `render_hepfs_window()`'s scrollbar needs to convert a click/
+/// drag position back into a row offset — kept alongside `grid_idx_at()` so
+/// the two stay consistent (same `total_rows`/`visible_rows` derivation).
+/// Returns `None` if the pane doesn't currently need to scroll at all.
+fn hepfs_scroll_max(win_id: usize, right_w: usize, list_h: usize) -> Option<usize> {
+    let cur_ino = HEPFS_NAVS.lock().iter().find(|(id, _)| *id == win_id).map(|(_, n)| n.ino)?;
+    let at_root = cur_ino == hepfs::ROOT_INO;
+    let mut ctrl = nvme::CONTROLLER.lock();
+    let ctrl = ctrl.as_mut()?;
+    let ctrl = &mut hepfs::BlockDev::Nvme(ctrl);
+    let total = hepfs::list_dir(ctrl, cur_ino).len() + if at_root { 0 } else { 1 };
+    let cols = grid_cols(right_w);
+    let total_rows   = total.div_ceil(cols);
+    let visible_rows = list_h.div_ceil(GRID_CELL_H).max(1);
+    let max_scroll = total_rows.saturating_sub(visible_rows);
+    if max_scroll == 0 { None } else { Some(max_scroll) }
 }
 
 /// Format a byte count into a compact string (e.g. "1.2 KB").
