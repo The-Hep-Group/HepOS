@@ -23,6 +23,7 @@ mod gdt;
 mod hda;
 mod heap;
 mod hepfs;
+mod icons;
 mod idt;
 mod image;
 mod mouse;
@@ -1550,13 +1551,15 @@ fn render_hepfs_window(display: &mut framebuffer::Display, wx: usize, wy: usize,
         let mut row = 0usize;
         if !at_root {
             if selected == Some((3, row)) { display.fill_rect(wx, y.saturating_sub(1), left_w, 13, hover); }
-            display.draw_text(wx + 4, y, "..", dir_col, 1);
+            icons::draw_file_icon(display, wx + 3, y.saturating_sub(1), 12, true, "..");
+            display.draw_text(wx + 18, y, "..", dir_col, 1);
             y += 14; row += 1;
         }
         for (_, name) in &dirs {
             if y + 12 > list_top + list_h { break; }
             if selected == Some((3, row)) { display.fill_rect(wx, y.saturating_sub(1), left_w, 13, hover); }
-            display.draw_text(wx + 4, y, name, dir_col, 1);
+            icons::draw_file_icon(display, wx + 3, y.saturating_sub(1), 12, true, name);
+            display.draw_text(wx + 18, y, name, dir_col, 1);
             y += 14; row += 1;
         }
         if dirs.is_empty() && at_root {
@@ -1568,18 +1571,18 @@ fn render_hepfs_window(display: &mut framebuffer::Display, wx: usize, wy: usize,
         let mut row = 0usize;
         if !at_root {
             if selected == Some((4, row)) { display.fill_rect(right_x, y.saturating_sub(1), right_w, 13, hover); }
-            display.draw_text(right_x + 4,  y, "d", dim, 1);
-            display.draw_text(right_x + 16, y, "..", dir_col, 1);
+            icons::draw_file_icon(display, right_x + 3, y.saturating_sub(1), 12, true, "..");
+            display.draw_text(right_x + 18, y, "..", dir_col, 1);
             y += 14; row += 1;
         }
         for (ino, name) in &entries {
             if y + 12 > list_top + list_h { break; }
             let inode = hepfs::read_inode(ctrl, *ino);
             let is_dir = inode.flags == hepfs::F_DIR;
-            let (pfx, col) = if is_dir { ("d", dir_col) } else { ("f", text) };
+            let col = if is_dir { dir_col } else { text };
             if selected == Some((4, row)) { display.fill_rect(right_x, y.saturating_sub(1), right_w, 13, hover); }
-            display.draw_text(right_x + 4,  y, pfx, dim, 1);
-            display.draw_text(right_x + 16, y, name, col, 1);
+            icons::draw_file_icon(display, right_x + 3, y.saturating_sub(1), 12, is_dir, name);
+            display.draw_text(right_x + 18, y, name, col, 1);
             if !is_dir {
                 let sz = fmt_size(inode.size);
                 let chars = sz.iter().position(|&b| b == 0).unwrap_or(sz.len());
