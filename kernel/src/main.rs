@@ -105,6 +105,13 @@ struct HepfsNav {
     path: alloc::string::String,
     back: alloc::vec::Vec<(u32, alloc::string::String)>,
     fwd:  alloc::vec::Vec<(u32, alloc::string::String)>,
+    /// Selected row, as (pane, row_index) — pane 3 = directory tree, pane 4 =
+    /// full listing. Click semantics on the selected row mirror the desktop's
+    /// icons: a fast second click opens/navigates, a slower one renames (see
+    /// `desktop::ICON_DBLCLICK_TICKS`/`ICON_RENAME_TICKS`, reused as-is so both
+    /// feel identical).
+    selected:    Option<(u8, usize)>,
+    selected_at: u64,
 }
 
 // One entry per Files window, keyed by window id — same pattern as
@@ -117,6 +124,7 @@ fn hepfs_nav_new() -> HepfsNav {
         path: alloc::string::String::from("/"),
         back: alloc::vec::Vec::new(),
         fwd:  alloc::vec::Vec::new(),
+        selected: None, selected_at: 0,
     }
 }
 
@@ -798,21 +806,38 @@ fn task_blink() -> ! {
                 dt.as_mut().and_then(|dt| dt.take_prompt_result())
             };
             if let Some(outcome) = result {
-                let mut ctrl = nvme::CONTROLLER.lock();
-                if let Some(ctrl) = ctrl.as_mut() {
-                    let ctrl = &mut hepfs::BlockDev::Nvme(ctrl);
-                    if let Some(desktop_ino) = hepfs::lookup(ctrl, "/home/desktop") {
+                {
+                    let mut ctrl = nvme::CONTROLLER.lock();
+                    if let Some(ctrl) = ctrl.as_mut() {
+                        let ctrl = &mut hepfs::BlockDev::Nvme(ctrl);
                         match outcome {
-                            desktop::PromptOutcome::CreateFile(name) => { hepfs::create_file(ctrl, desktop_ino, &name); }
-                            desktop::PromptOutcome::CreateFolder(name) => { hepfs::create_dir(ctrl, desktop_ino, &name); }
+                            desktop::PromptOutcome::CreateFile(name) => {
+                                if let Some(desktop_ino) = hepfs::lookup(ctrl, "/home/desktop") {
+                                    hepfs::create_file(ctrl, desktop_ino, &name);
+                                }
+                            }
+                            desktop::PromptOutcome::CreateFolder(name) => {
+                                if let Some(desktop_ino) = hepfs::lookup(ctrl, "/home/desktop") {
+                                    hepfs::create_dir(ctrl, desktop_ino, &name);
+                                }
+                            }
                             desktop::PromptOutcome::Rename { old_name, new_name } => {
-                                hepfs::rename(ctrl, desktop_ino, &old_name, &new_name);
+                                if let Some(desktop_ino) = hepfs::lookup(ctrl, "/home/desktop") {
+                                    hepfs::rename(ctrl, desktop_ino, &old_name, &new_name);
+                                }
+                            }
+                            desktop::PromptOutcome::RenameFsPane { parent_ino, old_name, new_name, .. } => {
+                                hepfs::rename(ctrl, parent_ino, &old_name, &new_name);
                             }
                         }
                     }
                 }
-                drop(ctrl);
+                // Any of these can touch /home/desktop's contents (directly, or
+                // indirectly if the file manager happened to be browsing it) —
+                // cheap enough to just always re-sync rather than track which.
                 refresh_desktop_icons();
+                let mut dt = desktop::DESKTOP.lock();
+                if let Some(dt) = dt.as_mut() { dt.dirty = true; }
             }
         }
 
@@ -946,55 +971,84 @@ fn task_blink() -> ! {
                             })
                         };
                         if let Some((ino, name, flags)) = entry {
-                            if flags == hepfs::F_DIR {
-                                // Navigate into directory
+                            // Select-then-click-again semantics, same thresholds
+                            // the desktop's own icons use (ICON_DBLCLICK_TICKS/
+                            // ICON_RENAME_TICKS) so both feel identical: a fast
+                            // second click on the already-selected row opens it,
+                            // a slower one renames it, anything else just selects.
+                            let now = scheduler::TICK_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+                            let click_state = {
                                 let mut navs = HEPFS_NAVS.lock();
-                                if let Some((_, nav)) = navs.iter_mut().find(|(id, _)| *id == win_id) {
-                                    let cur_ino2 = nav.ino;
-                                    let cur_path = nav.path.clone();
-                                    nav.back.push((cur_ino2, cur_path));
-                                    nav.fwd.clear();
-                                    nav.ino = ino;
-                                    nav.path = if nav.path == "/" {
+                                navs.iter_mut().find(|(id, _)| *id == win_id).map(|(_, nav)| {
+                                    let was_selected = nav.selected == Some((pane, idx));
+                                    let elapsed = now.saturating_sub(nav.selected_at);
+                                    nav.selected    = Some((pane, idx));
+                                    nav.selected_at = now;
+                                    (was_selected, elapsed)
+                                })
+                            };
+                            let Some((was_selected, elapsed)) = click_state else { continue; };
+
+                            if was_selected && elapsed <= desktop::ICON_DBLCLICK_TICKS {
+                                if flags == hepfs::F_DIR {
+                                    // Navigate into directory
+                                    let mut navs = HEPFS_NAVS.lock();
+                                    if let Some((_, nav)) = navs.iter_mut().find(|(id, _)| *id == win_id) {
+                                        let cur_ino2 = nav.ino;
+                                        let cur_path = nav.path.clone();
+                                        nav.back.push((cur_ino2, cur_path));
+                                        nav.fwd.clear();
+                                        nav.ino = ino;
+                                        nav.path = if nav.path == "/" {
+                                            alloc::format!("/{}", name)
+                                        } else {
+                                            alloc::format!("{}/{}", nav.path, name)
+                                        };
+                                        nav.selected = None;
+                                    }
+                                    drop(navs);
+                                    let mut dt = desktop::DESKTOP.lock();
+                                    if let Some(dt) = dt.as_mut() { dt.dirty = true; }
+                                } else {
+                                    // Open file in editor, or in the image viewer for .bmp
+                                    // (only reachable from the right/full-listing pane)
+                                    let cur_path = HEPFS_NAVS.lock().iter()
+                                        .find(|(id, _)| *id == win_id).map(|(_, n)| n.path.clone())
+                                        .unwrap_or_else(|| alloc::string::String::from("/"));
+                                    let file_path = if cur_path == "/" {
                                         alloc::format!("/{}", name)
                                     } else {
-                                        alloc::format!("{}/{}", nav.path, name)
+                                        alloc::format!("{}/{}", cur_path, name)
                                     };
+                                    let lower = name.to_lowercase();
+                                    if lower.ends_with(".bmp") {
+                                        image::open_smart(&file_path);
+                                    } else if lower.ends_with(".wav") {
+                                        // All Audio Player windows show the same global "now playing"
+                                        // state, so just bring the main one (id=7) forward.
+                                        audio::play(&file_path);
+                                        let mut dt = desktop::DESKTOP.lock();
+                                        if let Some(dt) = dt.as_mut() {
+                                            if let Some(w) = dt.windows.iter_mut().find(|w| w.id == 7) {
+                                                w.show();
+                                            }
+                                            dt.bring_to_front(7);
+                                            dt.dirty = true;
+                                        }
+                                        drop(dt);
+                                        *FOCUSED_WIN.lock() = Some(7);
+                                    } else {
+                                        editor::open_smart(&file_path);
+                                    }
                                 }
-                                drop(navs);
+                            } else if was_selected && elapsed <= desktop::ICON_RENAME_TICKS {
+                                let mut dt = desktop::DESKTOP.lock();
+                                if let Some(dt) = dt.as_mut() {
+                                    dt.begin_rename_fs_pane(win_id, cur_ino, name);
+                                }
+                            } else {
                                 let mut dt = desktop::DESKTOP.lock();
                                 if let Some(dt) = dt.as_mut() { dt.dirty = true; }
-                            } else {
-                                // Open file in editor, or in the image viewer for .bmp
-                                // (only reachable from the right/full-listing pane)
-                                let cur_path = HEPFS_NAVS.lock().iter()
-                                    .find(|(id, _)| *id == win_id).map(|(_, n)| n.path.clone())
-                                    .unwrap_or_else(|| alloc::string::String::from("/"));
-                                let file_path = if cur_path == "/" {
-                                    alloc::format!("/{}", name)
-                                } else {
-                                    alloc::format!("{}/{}", cur_path, name)
-                                };
-                                let lower = name.to_lowercase();
-                                if lower.ends_with(".bmp") {
-                                    image::open_smart(&file_path);
-                                } else if lower.ends_with(".wav") {
-                                    // All Audio Player windows show the same global "now playing"
-                                    // state, so just bring the main one (id=7) forward.
-                                    audio::play(&file_path);
-                                    let mut dt = desktop::DESKTOP.lock();
-                                    if let Some(dt) = dt.as_mut() {
-                                        if let Some(w) = dt.windows.iter_mut().find(|w| w.id == 7) {
-                                            w.show();
-                                        }
-                                        dt.bring_to_front(7);
-                                        dt.dirty = true;
-                                    }
-                                    drop(dt);
-                                    *FOCUSED_WIN.lock() = Some(7);
-                                } else {
-                                    editor::open_smart(&file_path);
-                                }
                             }
                         }
                     }
@@ -1443,11 +1497,11 @@ fn render_hepfs_window(display: &mut framebuffer::Display, wx: usize, wy: usize,
     let nav_h: usize = 22;
     display.fill_rect(wx, wy, ww, nav_h, nav_bg);
 
-    let (has_back, has_fwd, cur_path, cur_ino) = {
+    let (has_back, has_fwd, cur_path, cur_ino, selected) = {
         let navs = HEPFS_NAVS.lock();
         match navs.iter().find(|(id, _)| *id == win_id) {
-            Some((_, n)) => (!n.back.is_empty(), !n.fwd.is_empty(), n.path.clone(), n.ino),
-            None => (false, false, alloc::string::String::from("/"), hepfs::ROOT_INO),
+            Some((_, n)) => (!n.back.is_empty(), !n.fwd.is_empty(), n.path.clone(), n.ino, n.selected),
+            None => (false, false, alloc::string::String::from("/"), hepfs::ROOT_INO, None),
         }
     };
 
@@ -1489,16 +1543,21 @@ fn render_hepfs_window(display: &mut framebuffer::Display, wx: usize, wy: usize,
             .filter(|(ino, _)| hepfs::read_inode(ctrl, *ino).flags == hepfs::F_DIR)
             .collect();
 
+        let hover = framebuffer::Color::from_hex(0x1E1E40);
+
         // Left pane: directories only (current directory's one-level "tree")
         let mut y = list_top + 2;
+        let mut row = 0usize;
         if !at_root {
+            if selected == Some((3, row)) { display.fill_rect(wx, y.saturating_sub(1), left_w, 13, hover); }
             display.draw_text(wx + 4, y, "..", dir_col, 1);
-            y += 14;
+            y += 14; row += 1;
         }
         for (_, name) in &dirs {
             if y + 12 > list_top + list_h { break; }
+            if selected == Some((3, row)) { display.fill_rect(wx, y.saturating_sub(1), left_w, 13, hover); }
             display.draw_text(wx + 4, y, name, dir_col, 1);
-            y += 14;
+            y += 14; row += 1;
         }
         if dirs.is_empty() && at_root {
             display.draw_text(wx + 4, list_top + 4, "(no folders)", dim, 1);
@@ -1506,16 +1565,19 @@ fn render_hepfs_window(display: &mut framebuffer::Display, wx: usize, wy: usize,
 
         // Right pane: full listing (directories + files), with sizes
         let mut y = list_top + 2;
+        let mut row = 0usize;
         if !at_root {
+            if selected == Some((4, row)) { display.fill_rect(right_x, y.saturating_sub(1), right_w, 13, hover); }
             display.draw_text(right_x + 4,  y, "d", dim, 1);
             display.draw_text(right_x + 16, y, "..", dir_col, 1);
-            y += 14;
+            y += 14; row += 1;
         }
         for (ino, name) in &entries {
             if y + 12 > list_top + list_h { break; }
             let inode = hepfs::read_inode(ctrl, *ino);
             let is_dir = inode.flags == hepfs::F_DIR;
             let (pfx, col) = if is_dir { ("d", dir_col) } else { ("f", text) };
+            if selected == Some((4, row)) { display.fill_rect(right_x, y.saturating_sub(1), right_w, 13, hover); }
             display.draw_text(right_x + 4,  y, pfx, dim, 1);
             display.draw_text(right_x + 16, y, name, col, 1);
             if !is_dir {
@@ -1524,7 +1586,7 @@ fn render_hepfs_window(display: &mut framebuffer::Display, wx: usize, wy: usize,
                 let sx = right_x + right_w.saturating_sub(chars * 9 + 4);
                 display.draw_text(sx, y, core::str::from_utf8(&sz[..chars]).unwrap_or(""), dim, 1);
             }
-            y += 14;
+            y += 14; row += 1;
         }
         if entries.is_empty() && at_root {
             display.draw_text(right_x + 4, list_top + 4, "(empty)", dim, 1);

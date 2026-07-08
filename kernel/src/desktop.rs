@@ -109,16 +109,70 @@ fn icon_grid_pos(slot: usize) -> (i32, i32) {
     (ICON_X as i32, (16 + slot * ICON_STRIDE) as i32)
 }
 
+// A real 2D grid a dragged icon snaps to on release — `icon_grid_pos`
+// above only ever lays new icons out in a single column (fine for initial
+// placement), but a dropped icon should be free to land in any column/row,
+// not just back onto that column.
+const ICON_COL_W: i32 = 90;
+const ICON_ROW_H: i32 = ICON_STRIDE as i32;
+const ICON_GRID_ORIGIN_X: i32 = ICON_X as i32;
+const ICON_GRID_ORIGIN_Y: i32 = 16;
+
+/// Snap a dropped icon's top-left to the nearest grid cell. Integer-only
+/// (no_std has no `f32::round` without a math crate) — round-to-nearest via
+/// "add half the cell, then floor-divide".
+fn icon_snap(x: i32, y: i32) -> (i32, i32) {
+    let dx = (x - ICON_GRID_ORIGIN_X).max(0);
+    let dy = (y - ICON_GRID_ORIGIN_Y).max(0);
+    let col = (dx + ICON_COL_W / 2) / ICON_COL_W;
+    let row = (dy + ICON_ROW_H / 2) / ICON_ROW_H;
+    (ICON_GRID_ORIGIN_X + col * ICON_COL_W, ICON_GRID_ORIGIN_Y + row * ICON_ROW_H)
+}
+
+/// Color for a taskbar/Start-Menu row's small icon glyph — same palette
+/// `icon_color()` uses for desktop `Program` icons, just keyed by `AppKind`
+/// alone since those two places never see an `IconKind`/`FsEntry`.
+pub fn app_color(kind: AppKind) -> Color {
+    icon_color(IconKind::Program(kind, 0))
+}
+
+/// Apps pinned to the taskbar — shown as a launcher button even with no
+/// window currently open. In-memory only (no disk persistence), same
+/// lifetime as everything else in `Desktop` — both reset on reboot.
+pub static PINNED_TASKBAR: Mutex<Vec<AppKind>> = Mutex::new(Vec::new());
+
+pub fn is_pinned_taskbar(kind: AppKind) -> bool { PINNED_TASKBAR.lock().contains(&kind) }
+
+pub fn toggle_pinned_taskbar(kind: AppKind) {
+    let mut p = PINNED_TASKBAR.lock();
+    if let Some(pos) = p.iter().position(|k| *k == kind) { p.remove(pos); } else { p.push(kind); }
+}
+
+/// The desktop's fixed win_id for each of the 6 originally-built-in program
+/// icons — `None` for kinds that never had one (ImageViewer/AudioPlayer,
+/// which only ever appear via "New Window" or opening a file, not as a
+/// standalone desktop icon).
+fn program_win_id(kind: AppKind) -> Option<usize> {
+    match kind {
+        AppKind::Welcome  => Some(0), AppKind::Files    => Some(1),
+        AppKind::Terminal => Some(2), AppKind::Editor    => Some(3),
+        AppKind::Sysmon   => Some(4), AppKind::Settings => Some(5),
+        AppKind::ImageViewer | AppKind::AudioPlayer => None,
+    }
+}
+
 /// Fast-vs-slow click-on-an-already-selected-icon thresholds, in `TICK_COUNT`
 /// units (~10ms/tick — see its doc comment). Faster than this = a double
 /// click (open); slower than this (but not stale) = the deliberate second
 /// click that starts a rename, mirroring how a real desktop tells "open" and
 /// "rename" apart without a distinct keyboard shortcut for either.
-const ICON_DBLCLICK_TICKS: u64 = 40;   // ~400ms
-const ICON_RENAME_TICKS:   u64 = 300;  // ~3s — beyond this, treat as a fresh, unrelated click
+// pub — the file manager (main.rs) reuses these same thresholds so its own
+// select/open/rename click semantics feel identical to the desktop's.
+pub const ICON_DBLCLICK_TICKS: u64 = 40;   // ~400ms
+pub const ICON_RENAME_TICKS:   u64 = 300;  // ~3s — beyond this, treat as a fresh, unrelated click
 
 #[derive(Clone, Copy, PartialEq)]
-pub enum PromptKind { NewFile, NewFolder, RenameIcon(usize) }
+pub enum PromptKind { NewFile, NewFolder, RenameIcon(usize), RenameFsPane }
 
 pub struct TextPrompt {
     pub kind: PromptKind,
@@ -132,6 +186,10 @@ pub enum PromptOutcome {
     CreateFile(String),
     CreateFolder(String),
     Rename { old_name: String, new_name: String },
+    /// A rename started from a file manager window (not the desktop) —
+    /// `win_id`/`parent_ino` identify which directory/window to refresh
+    /// after the HepFS rename completes.
+    RenameFsPane { win_id: usize, parent_ino: u32, old_name: String, new_name: String },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -516,10 +574,13 @@ pub struct Desktop {
     pub text_prompt:      Option<TextPrompt>,
     /// Consumed once per frame by main.rs to perform the actual HepFS op.
     pub prompt_result:    Option<PromptOutcome>,
+    /// Extra context for `PromptKind::RenameFsPane` — (win_id, parent_ino,
+    /// old_name). Kept out of `PromptKind` itself so that enum can stay `Copy`.
+    fs_rename_ctx:         Option<(usize, u32, String)>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub enum ContextMenuKind { Background, App(AppKind), EditText(usize) }
+pub enum ContextMenuKind { Background, App(AppKind), EditText(usize), Icon(usize) }
 
 impl Desktop {
     pub fn new(fb_w: usize, fb_h: usize) -> Self {
@@ -550,7 +611,7 @@ impl Desktop {
             volume_drag: false,
             icons, icon_dragging: None, icon_drag_off: (0, 0), icon_drag_moved: false,
             icon_selected: None, icon_selected_at: 0, icon_message: None,
-            text_prompt: None, prompt_result: None,
+            text_prompt: None, prompt_result: None, fs_rename_ctx: None,
         }
     }
 
@@ -592,6 +653,33 @@ impl Desktop {
 
     fn icon_rect_at(icon: &DesktopIcon) -> (i32, i32, usize, usize) {
         (icon.x, icon.y, ICON_SIZE, ICON_SIZE)
+    }
+
+    /// Index of the icon at (mx, my), if any — shared by left-click select/drag
+    /// and right-click's "show Open/Pin instead of the generic background menu".
+    fn icon_at(&self, mx: i32, my: i32) -> Option<usize> {
+        self.icons.iter().position(|icon| {
+            let (ix, iy, iw, ih) = Self::icon_rect_at(icon);
+            mx >= ix && mx < ix + iw as i32 && my >= iy && my < iy + ih as i32 + 12
+        })
+    }
+
+    /// Whether `kind` currently has a desktop icon.
+    pub fn is_pinned_desktop(&self, kind: AppKind) -> bool {
+        self.icons.iter().any(|i| matches!(i.kind, IconKind::Program(k, _) if k == kind))
+    }
+
+    /// Add or remove `kind`'s desktop icon. No-op for kinds with no fixed
+    /// desktop win_id (see `program_win_id`).
+    pub fn toggle_pinned_desktop(&mut self, kind: AppKind) {
+        if let Some(pos) = self.icons.iter().position(|i| matches!(i.kind, IconKind::Program(k, _) if k == kind)) {
+            self.icons.remove(pos);
+        } else if let Some(win_id) = program_win_id(kind) {
+            let slot = self.icons.len();
+            let (x, y) = icon_grid_pos(slot);
+            self.icons.push(DesktopIcon { kind: IconKind::Program(kind, win_id), label: String::from(app_label(kind)), x, y });
+        }
+        self.dirty = true;
     }
 
     /// Open (double-click) an icon: for a program, show+focus its window;
@@ -640,12 +728,21 @@ impl Desktop {
         self.dirty = true;
     }
 
+    /// Start a rename prompt for a file-manager entry (as opposed to a
+    /// desktop icon) — same `TextPrompt` widget, just remembers which window
+    /// and directory the rename applies to via `fs_rename_ctx`.
+    pub fn begin_rename_fs_pane(&mut self, win_id: usize, parent_ino: u32, old_name: alloc::string::String) {
+        self.text_prompt = Some(TextPrompt { kind: PromptKind::RenameFsPane, buf: old_name.clone() });
+        self.fs_rename_ctx = Some((win_id, parent_ino, old_name));
+        self.dirty = true;
+    }
+
     /// Route a keystroke to the active text prompt (rename / new file /
     /// new folder). No-op if no prompt is open.
     pub fn prompt_on_key(&mut self, c: char) {
         let Some(prompt) = self.text_prompt.as_mut() else { return };
         match c as u32 {
-            0x1B => { self.text_prompt = None; } // Esc — cancel
+            0x1B => { self.text_prompt = None; self.fs_rename_ctx = None; } // Esc — cancel
             0x08 => { prompt.buf.pop(); }         // Backspace
             0x0A | 0x0D => {                      // Enter — confirm
                 let buf = prompt.buf.clone();
@@ -657,6 +754,14 @@ impl Desktop {
                             if matches!(self.icons.get(idx).map(|i| i.kind), Some(IconKind::FsEntry { .. })) {
                                 let old_name = self.icons[idx].label.clone();
                                 PromptOutcome::Rename { old_name, new_name: buf }
+                            } else {
+                                self.text_prompt = None;
+                                return;
+                            }
+                        }
+                        PromptKind::RenameFsPane => {
+                            if let Some((win_id, parent_ino, old_name)) = self.fs_rename_ctx.take() {
+                                PromptOutcome::RenameFsPane { win_id, parent_ino, old_name, new_name: buf }
                             } else {
                                 self.text_prompt = None;
                                 return;
@@ -720,6 +825,22 @@ impl Desktop {
     /// Returns (kind, ids-of-that-kind) — ids in the same z-order as `self.windows`.
     pub fn grouped_taskbar_entries(&self) -> Vec<(AppKind, Vec<usize>)> {
         Self::group_by_kind(self.windows.iter().filter(|w| w.ever_shown))
+    }
+
+    /// `grouped_taskbar_entries()` plus a zero-window entry for every pinned
+    /// app that isn't already open — pinned apps show as launcher buttons
+    /// even with nothing running. Empty `ids` = "pinned, not running".
+    pub fn taskbar_entries(&self) -> Vec<(AppKind, Vec<usize>)> {
+        let mut entries: Vec<(AppKind, Vec<usize>)> =
+            PINNED_TASKBAR.lock().iter().map(|k| (*k, Vec::new())).collect();
+        for (kind, ids) in self.grouped_taskbar_entries() {
+            if let Some(e) = entries.iter_mut().find(|(k, _)| *k == kind) {
+                e.1 = ids;
+            } else {
+                entries.push((kind, ids));
+            }
+        }
+        entries
     }
 
     /// Group ALL windows (regardless of minimized state) by app kind — used by
@@ -905,7 +1026,17 @@ impl Desktop {
         }
         if released {
             if let Some(idx) = self.icon_dragging.take() {
-                if !self.icon_drag_moved {
+                if self.icon_drag_moved {
+                    // Dropped after a real drag — snap to the nearest grid
+                    // cell instead of leaving it wherever the cursor let go,
+                    // same as a real desktop's icon grid.
+                    if let Some(icon) = self.icons.get_mut(idx) {
+                        let (sx, sy) = icon_snap(icon.x, icon.y);
+                        icon.x = sx;
+                        icon.y = sy;
+                    }
+                    self.dirty = true;
+                } else {
                     let now = crate::scheduler::TICK_COUNT.load(core::sync::atomic::Ordering::Relaxed);
                     if self.icon_selected == Some(idx) {
                         let elapsed = now.saturating_sub(self.icon_selected_at);
@@ -958,7 +1089,7 @@ impl Desktop {
             let in_taskbar = my >= self.fb_h as i32 - TASKBAR_H as i32;
 
             let taskbar_kind = if in_taskbar && mx as usize >= START_W {
-                let groups = self.grouped_taskbar_entries();
+                let groups = self.taskbar_entries();
                 let slot   = (mx as usize - START_W) / TASK_BTN_W;
                 groups.get(slot).map(|(k, _)| *k)
             } else { None };
@@ -1000,8 +1131,13 @@ impl Desktop {
                             || w.resize_hit(mx, my) || w.content_hit(mx, my))
                     });
                     if !on_window {
-                        self.context_menu      = Some((mx, my));
-                        self.context_menu_kind = ContextMenuKind::Background;
+                        // Right-clicking an icon shows "Open" (+ pin toggles for a
+                        // program) instead of the generic background menu.
+                        self.context_menu = Some((mx, my));
+                        self.context_menu_kind = match self.icon_at(mx, my) {
+                            Some(idx) => ContextMenuKind::Icon(idx),
+                            None      => ContextMenuKind::Background,
+                        };
                         self.close_start_menu();
                         self.taskbar_jumplist   = None;
                         self.dirty               = true;
@@ -1023,8 +1159,16 @@ impl Desktop {
                 (ContextMenuKind::Background, Some(1)) => self.begin_new_entry(false), // New File
                 (ContextMenuKind::Background, Some(2)) => self.begin_new_entry(true),  // New Folder
                 (ContextMenuKind::App(k),     Some(0)) => self.new_window_requested = Some(k),
+                (ContextMenuKind::App(k),     Some(1)) => toggle_pinned_taskbar(k),
+                (ContextMenuKind::App(k),     Some(2)) => self.toggle_pinned_desktop(k),
                 (ContextMenuKind::EditText(id), Some(0)) => self.clipboard_action_requested = Some((id, false)), // Copy
                 (ContextMenuKind::EditText(id), Some(1)) => self.clipboard_action_requested = Some((id, true)),  // Paste
+                (ContextMenuKind::Icon(idx), Some(0)) => self.open_icon(idx),
+                (ContextMenuKind::Icon(idx), Some(n @ (1 | 2))) => {
+                    if let Some(IconKind::Program(k, _)) = self.icons.get(idx).map(|i| i.kind) {
+                        if n == 1 { toggle_pinned_taskbar(k); } else { self.toggle_pinned_desktop(k); }
+                    }
+                }
                 _ => {}
             }
             return false;
@@ -1144,11 +1288,14 @@ impl Desktop {
                 // Window button — grouped by app kind; a group with >1 window opens
                 // a jump list instead of directly toggling a single window.
                 self.close_start_menu();
-                let groups = self.grouped_taskbar_entries();
+                let groups = self.taskbar_entries();
                 let btn_x  = mx as usize - START_W;
                 let slot   = btn_x / TASK_BTN_W;
                 if let Some((kind, ids)) = groups.get(slot) {
-                    if ids.len() == 1 {
+                    if ids.is_empty() {
+                        // Pinned, not running — launch a new instance.
+                        self.new_window_requested = Some(*kind);
+                    } else if ids.len() == 1 {
                         let wid = ids[0];
                         let is_minimized = self.windows.iter().find(|w| w.id == wid).map(|w| w.minimized).unwrap_or(false);
                         if is_minimized {
@@ -1195,10 +1342,7 @@ impl Desktop {
         // the second click landed — see ICON_DBLCLICK_TICKS/ICON_RENAME_TICKS);
         // every click also arms a possible drag, resolved on release below.
         if hit_id.is_none() {
-            let hit_idx = self.icons.iter().position(|icon| {
-                let (ix, iy, iw, ih) = Self::icon_rect_at(icon);
-                mx >= ix && mx < ix + iw as i32 && my >= iy && my < iy + ih as i32 + 12
-            });
+            let hit_idx = self.icon_at(mx, my);
             if let Some(idx) = hit_idx {
                 // Click semantics (select / open / rename) are resolved on
                 // release, not here — so a real drag never also fires an
@@ -1541,27 +1685,31 @@ impl Desktop {
         // count when there's more than one instance; minimized-only groups are
         // dimmed since nothing of that kind is visible right now.
         let mut bx = START_W + 4;
-        for (kind, ids) in self.grouped_taskbar_entries() {
+        for (kind, ids) in self.taskbar_entries() {
             if bx + TASK_BTN_W > self.fb_w.saturating_sub(VOL_RESERVED_W) { break; }
             let open_count = ids.iter().filter(|&&id| self.windows.iter().any(|w| w.id == id && !w.minimized)).count();
             let active = open_count > 0 && (ids.len() == 1 && self.focused == Some(ids[0])
                 || (ids.len() > 1 && ids.iter().any(|&i| self.focused == Some(i))));
             let bc = if active { pal::TASKBAR_ACT }
-                     else if open_count == 0 { pal::TASKBAR } // dimmed — minimized, not currently visible
+                     else if open_count == 0 { pal::TASKBAR } // dimmed — pinned-but-not-running or minimized
                      else { pal::TASKBAR_BTN };
             display.fill_rect(bx, ty + 4, TASK_BTN_W - 4, TASKBAR_H - 8, bc);
             if active {
                 display.fill_rect(bx, ty + TASKBAR_H - 5, TASK_BTN_W - 4, 2, pal::ACCENT);
             }
+            // Small icon glyph, then the label — same color desktop icons use.
+            display.fill_rect(bx + 4, ty + 9, 10, 10, app_color(kind));
             let full_label = if ids.len() > 1 {
                 alloc::format!("{} ({})", app_label(kind), open_count)
-            } else {
-                let win = self.windows.iter().find(|w| w.id == ids[0]);
+            } else if let Some(id) = ids.first() {
+                let win = self.windows.iter().find(|w| w.id == *id);
                 win.map(|w| w.title.clone()).unwrap_or_else(|| String::from(app_label(kind)))
+            } else {
+                String::from(app_label(kind)) // pinned, not running
             };
-            let label = if full_label.len() > 13 { &full_label[..13] } else { &full_label };
+            let label = if full_label.len() > 11 { &full_label[..11] } else { &full_label };
             let text_col = if open_count == 0 { pal::TEXT_DIM } else { pal::TEXT };
-            display.draw_text(bx + 6, ty + 10, label, text_col, 1);
+            display.draw_text(bx + 18, ty + 10, label, text_col, 1);
             bx += TASK_BTN_W;
         }
 
@@ -1656,8 +1804,23 @@ impl Desktop {
     fn context_menu_labels(&self) -> &'static [&'static str] {
         match self.context_menu_kind {
             ContextMenuKind::Background => &["Change background", "New File", "New Folder"],
-            ContextMenuKind::App(_)     => &["New Window"],
+            ContextMenuKind::App(k) => {
+                let pinned_tb = is_pinned_taskbar(k);
+                match (pinned_tb, program_win_id(k).is_some(), self.is_pinned_desktop(k)) {
+                    (false, true,  false) => &["New Window", "Pin to Taskbar", "Pin to Desktop"],
+                    (false, true,  true)  => &["New Window", "Pin to Taskbar", "Unpin from Desktop"],
+                    (true,  true,  false) => &["New Window", "Unpin from Taskbar", "Pin to Desktop"],
+                    (true,  true,  true)  => &["New Window", "Unpin from Taskbar", "Unpin from Desktop"],
+                    (false, false, _)     => &["New Window", "Pin to Taskbar"],
+                    (true,  false, _)     => &["New Window", "Unpin from Taskbar"],
+                }
+            }
             ContextMenuKind::EditText(_) => &["Copy", "Paste"],
+            ContextMenuKind::Icon(idx) => match self.icons.get(idx).map(|i| i.kind) {
+                Some(IconKind::Program(k, _)) if is_pinned_taskbar(k) => &["Open", "Unpin from Taskbar", "Unpin from Desktop"],
+                Some(IconKind::Program(_, _))                        => &["Open", "Pin to Taskbar", "Unpin from Desktop"],
+                _ => &["Open"],
+            },
         }
     }
 
@@ -1694,7 +1857,8 @@ impl Desktop {
         let title = match prompt.kind {
             PromptKind::NewFile   => "New File — name:",
             PromptKind::NewFolder => "New Folder — name:",
-            PromptKind::RenameIcon(_) => return,
+            PromptKind::RenameFsPane => "Rename — new name:",
+            PromptKind::RenameIcon(_) => return, // drawn inline under the icon instead
         };
         const PW: usize = 240;
         const PH: usize = 60;
@@ -1794,9 +1958,10 @@ impl Desktop {
             } else {
                 String::from(app_label(*kind))
             };
-            let label = if label.len() > 18 { &label[..18] } else { &label };
+            let label = if label.len() > 16 { &label[..16] } else { &label };
             let col = if any_focused { pal::ACCENT } else { pal::TEXT };
-            display.draw_text(10, ey + 6, label, col, 1);
+            display.fill_rect(10, ey + 5, 10, 10, app_color(*kind));
+            display.draw_text(24, ey + 6, label, col, 1);
             // "--" badge when no instance of this program is currently open
             if !any_open {
                 display.draw_text(MENU_W - 24, ey + 6, "--", pal::TEXT_DIM, 1);
