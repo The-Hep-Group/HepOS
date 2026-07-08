@@ -702,6 +702,22 @@ pub fn copy_entry(ctrl: &mut BlockDev, from_parent: u32, to_parent: u32, name: &
     }
 }
 
+/// `copy_entry()` with the same numbered-duplicate naming every paste path
+/// uses: same name if free, else "<name> (1)", "(2)", ... until one's free
+/// (capped so a pathological case can't loop forever instead of giving up).
+/// Shared so the Ctrl+V keyboard shortcut and the right-click "Paste" menu
+/// item can't quietly drift into different naming conventions.
+pub fn copy_entry_unique(ctrl: &mut BlockDev, from_parent: u32, to_parent: u32, name: &str) -> Option<u32> {
+    let mut candidate = String::from(name);
+    let mut n = 0u32;
+    loop {
+        if let Some(ino) = copy_entry(ctrl, from_parent, to_parent, name, &candidate) { return Some(ino); }
+        n += 1;
+        if n > 100 { return None; }
+        candidate = alloc::format!("{} ({})", name, n);
+    }
+}
+
 /// Lookup an entry by name in a directory. Returns (inode_id, is_dir).
 pub fn stat(ctrl: &mut BlockDev, ino: u32) -> (bool, u64) {
     let inode = read_inode(ctrl, ino);

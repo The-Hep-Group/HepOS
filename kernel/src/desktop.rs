@@ -43,11 +43,50 @@ pub const SETTINGS_PAGE_SOUND:      u8 = 1;
 pub static SETTINGS_PAGE: core::sync::atomic::AtomicU8 =
     core::sync::atomic::AtomicU8::new(SETTINGS_PAGE_BACKGROUND);
 
+// ── Left-edge pinned-files dock ────────────────────────────────────────────────
+// A narrow strip at the very left edge holding pinned files/directories only
+// (programs are pinned to the taskbar instead — see PINNED_TASKBAR). Sits to
+// the left of the desktop icon column, which is why ICON_X below isn't 16
+// anymore — it used to be, before this existed.
+const DOCK_W:        usize = 56;
+const DOCK_ITEM_SIZE: usize = 40;
+const DOCK_ITEM_STRIDE: usize = 56;
+const DOCK_ITEM_X:   usize = 8;
+const DOCK_ITEM_Y0:  usize = 16;
+
+/// Pinned files/directories shown in the left dock — (ino, name, is_dir).
+/// `(ino, parent_path, name, is_dir)` — `parent_path` is captured at pin time
+/// (HepFS inodes have no reverse/parent pointer to reconstruct it later from
+/// just the ino) so opening a pinned item still works no matter where it
+/// was pinned from, not just `/home/desktop`. In-memory only (no disk
+/// persistence), same lifetime as `PINNED_TASKBAR`. Snapshotted at pin time:
+/// renaming/moving/deleting the real entry elsewhere doesn't update or
+/// remove its pinned copy here.
+pub static PINNED_FILES: Mutex<Vec<(u32, String, String, bool)>> = Mutex::new(Vec::new());
+
+pub fn is_pinned_file(ino: u32) -> bool { PINNED_FILES.lock().iter().any(|(i, _, _, _)| *i == ino) }
+
+pub fn toggle_pinned_file(ino: u32, parent_path: String, name: String, is_dir: bool) {
+    let mut p = PINNED_FILES.lock();
+    if let Some(pos) = p.iter().position(|(i, _, _, _)| *i == ino) {
+        p.remove(pos);
+    } else {
+        p.push((ino, parent_path, name, is_dir));
+    }
+}
+
+/// Files-and-directories clipboard — (parent_ino, ino, name, is_dir). Shared
+/// by the Ctrl+C/Ctrl+V keyboard shortcut (`main.rs`) and the right-click
+/// "Copy"/"Paste" menu items below, so copying one way and pasting the other
+/// still works. Separate from the plain-text clipboard editor/terminal
+/// Ctrl+C/V uses (`clipboard.rs`).
+pub static FS_CLIPBOARD: Mutex<Option<(u32, u32, String, bool)>> = Mutex::new(None);
+
 // ── Desktop icons ─────────────────────────────────────────────────────────────
 // Each icon: 48×48 box + 8px gap + 8px text label = 64px slot, 80px stride.
 const ICON_SIZE:   usize = 48;
 const ICON_STRIDE: usize = 80; // vertical spacing between icon tops
-const ICON_X:      usize = 16; // left edge
+const ICON_X:      usize = DOCK_W + 16; // left edge — shifted right of the pin dock
 
 // ── App kinds — used to group taskbar/start-menu entries and to know what
 // "spawn another instance" means for a given program. ──────────────────────
@@ -574,10 +613,22 @@ pub struct Desktop {
     /// Extra context for `PromptKind::RenameFsPane` — (win_id, parent_ino,
     /// old_name). Kept out of `PromptKind` itself so that enum can stay `Copy`.
     fs_rename_ctx:         Option<(usize, u32, String)>,
-    /// Set when an `FsEntry` desktop icon is opened (double-clicked) —
-    /// (ino, is_dir, name). Consumed once per frame by main.rs, which
-    /// actually opens it (new Files window, or editor/image/audio dispatch).
-    pub open_fs_entry_requested: Option<(u32, bool, String)>,
+    /// Set when an `FsEntry` desktop icon or pin-dock item is opened —
+    /// (ino, is_dir, name, parent_path). `parent_path` is needed because a
+    /// pin-dock item isn't necessarily under `/home/desktop` like a desktop
+    /// icon always is — it's whatever directory the item was pinned *from*,
+    /// captured at pin time (HepFS inodes don't store a reverse/parent
+    /// pointer, so there's no other way to reconstruct it later). Consumed
+    /// once per frame by main.rs, which actually opens it (new Files window,
+    /// or editor/image/audio dispatch).
+    pub open_fs_entry_requested: Option<(u32, bool, String, String)>,
+    /// Right-clicked inside a Files window — (win_id, mx, my). desktop.rs
+    /// detects *that* a Files window was right-clicked but can't resolve it
+    /// into a specific row or empty-pane click (needs the block device);
+    /// main.rs does that and fills in `context_menu`/`context_menu_kind`
+    /// itself, all within the same frame (main.rs's polling runs after
+    /// `update_mouse()` in the same loop iteration, so there's no visible lag).
+    pub fs_context_menu_pending: Option<(usize, i32, i32)>,
 
     // ── Taskbar button drag-to-reorder ──────────────────────────────────────
     // Mousedown arms this instead of firing the click immediately, mirroring
@@ -593,8 +644,18 @@ pub struct Desktop {
     taskbar_click_pending:  Option<(AppKind, usize, Option<AppKind>)>,
 }
 
-#[derive(Clone, Copy, PartialEq)]
-pub enum ContextMenuKind { Background, App(AppKind), EditText(usize), Icon(usize) }
+#[derive(Clone, PartialEq)]
+pub enum ContextMenuKind {
+    Background, App(AppKind), EditText(usize), Icon(usize),
+    /// Right-clicked a specific row in a Files window. `parent_path` is the
+    /// browsed directory's real path (desktop.rs can't compute this itself —
+    /// main.rs fills it in from `HepfsNav::path` when resolving the pending
+    /// right-click below).
+    FsRow { win_id: usize, parent_ino: u32, parent_path: String, ino: u32, name: String, is_dir: bool, is_pinned: bool },
+    /// Right-clicked empty space in a Files window's content area — just "Paste".
+    FsPane { win_id: usize, parent_ino: u32, parent_path: String },
+}
+
 
 impl Desktop {
     pub fn new(fb_w: usize, fb_h: usize) -> Self {
@@ -629,6 +690,7 @@ impl Desktop {
             marquee_start: None, icon_message: None,
             text_prompt: None, prompt_result: None, fs_rename_ctx: None,
             open_fs_entry_requested: None,
+            fs_context_menu_pending: None,
             taskbar_dragging: None, taskbar_drag_start_x: 0, taskbar_drag_moved: false,
             taskbar_click_pending: None,
         }
@@ -753,7 +815,7 @@ impl Desktop {
                 // editor/image/audio state — main.rs polls this once per
                 // frame and does the actual open (new Files window navigated
                 // in, or editor/image/audio dispatch by extension).
-                self.open_fs_entry_requested = Some((ino, is_dir, icon.label.clone()));
+                self.open_fs_entry_requested = Some((ino, is_dir, icon.label.clone(), String::from("/home/desktop")));
             }
         }
         // Clear selection so a follow-up click starts a fresh selection
@@ -1263,9 +1325,24 @@ impl Desktop {
                     !w.minimized && w.content_hit(mx, my)
                         && matches!(w.app_kind, AppKind::Editor | AppKind::Terminal)
                 });
+                // Right-clicking inside a Files window is resolved by
+                // main.rs (see `fs_context_menu_pending`'s doc comment) —
+                // checked before Editor/Terminal since a Files window is
+                // neither of those, but must still win over "on_window" below
+                // (which would otherwise just silently do nothing for it, the
+                // pre-existing gap this fixes).
+                let files_win = if text_win.is_none() {
+                    self.windows.iter().rev().find(|w| {
+                        !w.minimized && w.content_hit(mx, my) && w.app_kind == AppKind::Files
+                    }).map(|w| w.id)
+                } else { None };
                 if let Some(w) = text_win {
                     self.context_menu      = Some((mx, my));
                     self.context_menu_kind = ContextMenuKind::EditText(w.id);
+                    self.taskbar_jumplist   = None;
+                    self.dirty              = true;
+                } else if let Some(win_id) = files_win {
+                    self.fs_context_menu_pending = Some((win_id, mx, my));
                     self.taskbar_jumplist   = None;
                     self.dirty              = true;
                 } else {
@@ -1295,7 +1372,7 @@ impl Desktop {
         // Left-click dismisses context menu; handle the item first if clicked on it.
         if self.context_menu.is_some() {
             let item = self.context_menu_item_at(mx, my);
-            let kind = self.context_menu_kind;
+            let kind = self.context_menu_kind.clone();
             self.context_menu = None;
             self.dirty = true;
             match (kind, item) {
@@ -1309,8 +1386,50 @@ impl Desktop {
                 (ContextMenuKind::EditText(id), Some(1)) => self.clipboard_action_requested = Some((id, true)),  // Paste
                 (ContextMenuKind::Icon(idx), Some(0)) => self.open_icon(idx),
                 (ContextMenuKind::Icon(idx), Some(n @ (1 | 2))) => {
-                    if let Some(IconKind::Program(k, _)) = self.icons.get(idx).map(|i| i.kind) {
-                        if n == 1 { toggle_pinned_taskbar(k); } else { self.toggle_pinned_desktop(k); }
+                    match self.icons.get(idx).map(|i| i.kind) {
+                        Some(IconKind::Program(k, _)) => {
+                            if n == 1 { toggle_pinned_taskbar(k); } else { self.toggle_pinned_desktop(k); }
+                        }
+                        Some(IconKind::FsEntry { ino, is_dir }) => {
+                            let name = self.icons[idx].label.clone();
+                            if n == 1 {
+                                toggle_pinned_file(ino, String::from("/home/desktop"), name, is_dir);
+                            } else {
+                                // "/home/desktop" itself needs its own ino to
+                                // set as the clipboard's parent — desktop.rs
+                                // doesn't cache that, so look it up directly.
+                                let mut ctrl = crate::nvme::CONTROLLER.lock();
+                                if let Some(ctrl) = ctrl.as_mut() {
+                                    let ctrl = &mut crate::hepfs::BlockDev::Nvme(ctrl);
+                                    if let Some(parent_ino) = crate::hepfs::lookup(ctrl, "/home/desktop") {
+                                        *FS_CLIPBOARD.lock() = Some((parent_ino, ino, name, is_dir));
+                                    }
+                                }
+                            }
+                        }
+                        None => {}
+                    }
+                }
+                (ContextMenuKind::FsRow { parent_path, ino, name, is_dir, .. }, Some(0)) => {
+                    self.open_fs_entry_requested = Some((ino, is_dir, name, parent_path));
+                }
+                (ContextMenuKind::FsRow { parent_path, ino, name, is_dir, .. }, Some(1)) => {
+                    toggle_pinned_file(ino, parent_path, name, is_dir);
+                }
+                (ContextMenuKind::FsRow { parent_ino, ino, name, is_dir, .. }, Some(2)) => {
+                    *FS_CLIPBOARD.lock() = Some((parent_ino, ino, name, is_dir));
+                }
+                (ContextMenuKind::FsPane { parent_ino, .. }, Some(0)) => {
+                    let clip = FS_CLIPBOARD.lock().clone();
+                    if let Some((from_parent, _ino, name, _is_dir)) = clip {
+                        let mut ctrl = crate::nvme::CONTROLLER.lock();
+                        if let Some(ctrl) = ctrl.as_mut() {
+                            let ctrl = &mut crate::hepfs::BlockDev::Nvme(ctrl);
+                            crate::hepfs::copy_entry_unique(ctrl, from_parent, parent_ino, &name);
+                        }
+                        drop(ctrl);
+                        crate::refresh_desktop_icons();
+                        self.dirty = true;
                     }
                 }
                 _ => {}
@@ -1459,6 +1578,21 @@ impl Desktop {
             {
                 hit_id = Some(win.id);
                 break;
+            }
+        }
+        // Pin dock click — single click opens (no select/rename dance here,
+        // it's a launcher, not a browsable icon grid).
+        if hit_id.is_none() && (mx as usize) < DOCK_W && my >= 0 {
+            let slot = ((my as usize).saturating_sub(DOCK_ITEM_Y0)) / DOCK_ITEM_STRIDE;
+            let hit = PINNED_FILES.lock().get(slot)
+                .map(|(ino, parent_path, name, is_dir)| (*ino, parent_path.clone(), name.clone(), *is_dir));
+            if let Some((ino, parent_path, name, is_dir)) = hit {
+                let (_, y, _, h) = Self::dock_item_rect(slot);
+                if my >= y as i32 && my < (y + h + 12) as i32 {
+                    self.open_fs_entry_requested = Some((ino, is_dir, name, parent_path));
+                    self.dirty = true;
+                    return false;
+                }
             }
         }
         // No window hit — check desktop icon click. Single click selects (or,
@@ -1684,8 +1818,30 @@ impl Desktop {
     }
 
     /// Clear the desktop background and draw desktop icons.
+    /// Rect (x, y, w, h) of the `slot`-th item in the left pin dock.
+    fn dock_item_rect(slot: usize) -> (usize, usize, usize, usize) {
+        (DOCK_ITEM_X, DOCK_ITEM_Y0 + slot * DOCK_ITEM_STRIDE, DOCK_ITEM_SIZE, DOCK_ITEM_SIZE)
+    }
+
+    /// Left-edge pin dock — files/directories only (programs pin to the
+    /// taskbar instead). Drawn before the desktop icons/wallpaper details so
+    /// its background panel sits under everything else in that strip.
+    fn draw_pin_dock(&self, display: &mut Display) {
+        display.fill_rect(0, 0, DOCK_W, self.fb_h.saturating_sub(TASKBAR_H), Color::from_hex(0x0C0C18));
+        display.fill_rect(DOCK_W, 0, 1, self.fb_h.saturating_sub(TASKBAR_H), pal::BORDER);
+        for (slot, (_, _, name, is_dir)) in PINNED_FILES.lock().iter().enumerate() {
+            let (x, y, w, h) = Self::dock_item_rect(slot);
+            if y + h > self.fb_h.saturating_sub(TASKBAR_H) { break; }
+            crate::icons::draw_file_icon(display, x, y, w, *is_dir, name);
+            let label = if name.len() > 7 { &name[..7] } else { name };
+            display.draw_text(x, y + h + 2, label, pal::TEXT_DIM, 1);
+            let _ = w;
+        }
+    }
+
     pub fn render(&self, display: &mut Display, _cx: i32, _cy: i32) {
         self.draw_wallpaper(display);
+        self.draw_pin_dock(display);
         for (idx, icon) in self.icons.iter().enumerate() {
             let (ix, iy, iw, ih) = Self::icon_rect_at(icon);
             if iy < 0 { continue; }
@@ -2025,8 +2181,14 @@ impl Desktop {
             ContextMenuKind::Icon(idx) => match self.icons.get(idx).map(|i| i.kind) {
                 Some(IconKind::Program(k, _)) if is_pinned_taskbar(k) => &["Open", "Unpin from Taskbar", "Unpin from Desktop"],
                 Some(IconKind::Program(_, _))                        => &["Open", "Pin to Taskbar", "Unpin from Desktop"],
-                _ => &["Open"],
+                Some(IconKind::FsEntry { ino, .. }) if is_pinned_file(ino) => &["Open", "Unpin", "Copy"],
+                Some(IconKind::FsEntry { .. })                             => &["Open", "Pin", "Copy"],
+                None => &["Open"],
             },
+            ContextMenuKind::FsRow { is_pinned, .. } => {
+                if is_pinned { &["Open", "Unpin", "Copy"] } else { &["Open", "Pin", "Copy"] }
+            }
+            ContextMenuKind::FsPane { .. } => &["Paste"],
         }
     }
 
@@ -2177,4 +2339,3 @@ impl Desktop {
 }
 
 pub static DESKTOP: Mutex<Option<Desktop>> = Mutex::new(None);
-

@@ -174,13 +174,6 @@ fn spawn_files() -> usize {
     win_id
 }
 
-/// Ctrl+C in a Files window copies (parent_ino, ino, name, is_dir) here;
-/// Ctrl+V pastes it (via `hepfs::copy_entry()` — a real duplicate, new inode
-/// and data blocks, not a move) into whichever Files window has focus. Plain
-/// text clipboard (editor/terminal Ctrl+C/V) is a separate thing —
-/// `clipboard.rs` — this is files-and-directories only.
-static FS_CLIPBOARD: Mutex<Option<(u32, u32, alloc::string::String, bool)>> = Mutex::new(None);
-
 /// Resolve `nav.selected` (pane, row) back into (parent_ino, ino, name,
 /// is_dir) — same traversal the click handler uses to turn a click into an
 /// entry, just driven by the *last selected* row instead of a live click.
@@ -218,7 +211,7 @@ fn selected_fs_entry(win_id: usize) -> Option<(u32, u32, alloc::string::String, 
 /// from the same early-boot code that creates it, so it's checked). Called
 /// once after HepFS init and again after any op that changes that directory
 /// (new file/folder, rename) — see the `prompt_result` handling below.
-fn refresh_desktop_icons() {
+pub(crate) fn refresh_desktop_icons() {
     let entries = {
         let mut ctrl = nvme::CONTROLLER.lock();
         let Some(ctrl) = ctrl.as_mut() else { return };
@@ -282,16 +275,22 @@ fn resolve_file_drop(fd: &FileDrag, mx: i32, my: i32) -> bool {
     let Some(browsing_ino) = HEPFS_NAVS.lock().iter()
         .find(|(id, _)| *id == target_win).map(|(_, n)| n.ino) else { return false };
 
-    // Did the drop land on a specific directory row? Same nav-bar/pane/row
-    // geometry the click handler itself uses.
+    // Did the drop land on a specific directory row (or the ".." row)? Same
+    // nav-bar/pane/row geometry the click handler itself uses.
     let rel_x = (mx - wx) as usize;
     let rel_y = my - wy;
+    let at_root = browsing_ino == hepfs::ROOT_INO;
     let target_ino = if rel_y >= 22 {
-        let left_w = (ww * HEPFS_TREE_W_NUM) / HEPFS_TREE_W_DEN;
         let entry_idx = ((rel_y - 22) / 14).max(0) as usize;
-        let at_root = browsing_ino == hepfs::ROOT_INO;
-        let real_idx = if !at_root { entry_idx.checked_sub(1) } else { Some(entry_idx) };
-        real_idx.and_then(|real_idx| {
+        if !at_root && entry_idx == 0 {
+            // Dropped on the ".." row — move up into the parent directory,
+            // same one clicking ".." itself would navigate to.
+            HEPFS_NAVS.lock().iter().find(|(id, _)| *id == target_win)
+                .and_then(|(_, n)| n.back.last().map(|(ino, _)| *ino))
+                .unwrap_or(browsing_ino)
+        } else {
+            let left_w = (ww * HEPFS_TREE_W_NUM) / HEPFS_TREE_W_DEN;
+            let real_idx = if !at_root { entry_idx - 1 } else { entry_idx };
             let mut ctrl = nvme::CONTROLLER.lock();
             ctrl.as_mut().and_then(|ctrl| {
                 let ctrl = &mut hepfs::BlockDev::Nvme(ctrl);
@@ -305,8 +304,8 @@ fn resolve_file_drop(fd: &FileDrag, mx: i32, my: i32) -> bool {
                 };
                 // Dropping a directory onto itself isn't a real move.
                 row_ino.filter(|&ino| ino != fd.ino)
-            })
-        }).unwrap_or(browsing_ino)
+            }).unwrap_or(browsing_ino)
+        }
     } else {
         browsing_ino
     };
@@ -734,17 +733,26 @@ fn task_blink() -> ! {
                 };
                 // Ctrl+C/Ctrl+V in a focused Files window copies/pastes
                 // whichever row is selected (files-and-directories clipboard —
-                // see FS_CLIPBOARD; separate from the plain-text clipboard
-                // editor/terminal Ctrl+C/V uses).
+                // see desktop::FS_CLIPBOARD; separate from the plain-text
+                // clipboard editor/terminal Ctrl+C/V uses).
                 let routed_files = routed_extra || {
                     let is_files_win = focused.map(|f| HEPFS_NAVS.lock().iter().any(|(id, _)| *id == f)).unwrap_or(false);
                     if is_files_win {
                         let win_id = focused.unwrap();
-                        if c == 'C' && ps2::ctrl_held() {
-                            if let Some(entry) = selected_fs_entry(win_id) { *FS_CLIPBOARD.lock() = Some(entry); }
+                        // Plain Ctrl+C on a lowercase 'c' is turned into the
+                        // control code 0x03 by ps2.rs's own ctrl-modifier
+                        // handling *before* it ever gets here — it never
+                        // arrives as the literal char 'C'. That's why this
+                        // silently did nothing before: only Ctrl+Shift+C
+                        // (shift suppresses that conversion) was handled.
+                        // Files windows have no competing meaning for plain
+                        // Ctrl+C (unlike the terminal's Ctrl+C=cancel), so
+                        // treat both as Copy here.
+                        if c as u8 == 0x03 || (c == 'C' && ps2::ctrl_held()) {
+                            if let Some(entry) = selected_fs_entry(win_id) { *desktop::FS_CLIPBOARD.lock() = Some(entry); }
                             true
-                        } else if (c == 'V' && ps2::ctrl_held()) || c as u8 == 0x16 {
-                            let clip = FS_CLIPBOARD.lock().clone();
+                        } else if c as u8 == 0x16 || (c == 'V' && ps2::ctrl_held()) {
+                            let clip = desktop::FS_CLIPBOARD.lock().clone();
                             if let Some((from_parent, _ino, name, _is_dir)) = clip {
                                 let target_ino = HEPFS_NAVS.lock().iter()
                                     .find(|(id, _)| *id == win_id).map(|(_, n)| n.ino);
@@ -752,16 +760,7 @@ fn task_blink() -> ! {
                                     let mut ctrl = nvme::CONTROLLER.lock();
                                     if let Some(ctrl) = ctrl.as_mut() {
                                         let ctrl = &mut hepfs::BlockDev::Nvme(ctrl);
-                                        // Same name if free, else "<name> (1)", "(2)", ...
-                                        // until one's free (capped so a pathological case
-                                        // can't loop forever instead of just giving up).
-                                        let mut candidate = name.clone();
-                                        let mut n = 0u32;
-                                        while hepfs::copy_entry(ctrl, from_parent, target_ino, &name, &candidate).is_none() {
-                                            n += 1;
-                                            if n > 100 { break; }
-                                            candidate = alloc::format!("{} ({})", name, n);
-                                        }
+                                        hepfs::copy_entry_unique(ctrl, from_parent, target_ino, &name);
                                     }
                                     drop(ctrl);
                                     refresh_desktop_icons();
@@ -1013,14 +1012,19 @@ fn task_blink() -> ! {
                 let mut dt = desktop::DESKTOP.lock();
                 dt.as_mut().and_then(|dt| dt.open_fs_entry_requested.take())
             };
-            if let Some((ino, is_dir, name)) = opened {
+            if let Some((ino, is_dir, name, parent_path)) = opened {
+                let entry_path = if parent_path == "/" {
+                    alloc::format!("/{}", name)
+                } else {
+                    alloc::format!("{}/{}", parent_path, name)
+                };
                 if is_dir {
                     let win_id = spawn_files();
                     if win_id != usize::MAX {
                         let mut navs = HEPFS_NAVS.lock();
                         if let Some((_, nav)) = navs.iter_mut().find(|(id, _)| *id == win_id) {
                             nav.ino  = ino;
-                            nav.path = alloc::format!("/home/desktop/{}", name);
+                            nav.path = entry_path;
                         }
                         drop(navs);
                         let mut dt = desktop::DESKTOP.lock();
@@ -1032,7 +1036,7 @@ fn task_blink() -> ! {
                         *FOCUSED_WIN.lock() = Some(win_id);
                     }
                 } else {
-                    let file_path = alloc::format!("/home/desktop/{}", name);
+                    let file_path = entry_path;
                     let lower = name.to_lowercase();
                     if lower.ends_with(".bmp") {
                         image::open_smart(&file_path);
@@ -1306,6 +1310,70 @@ fn task_blink() -> ! {
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // Resolve a pending Files-window right-click (desktop.rs detected
+        // *that* one happened but can't work out which row — needs the block
+        // device) into the actual context menu: a specific row (Open/Pin/
+        // Copy) or empty space (Paste). Same pane/row geometry the left-click
+        // handler above uses.
+        {
+            let pending = { let mut dt = desktop::DESKTOP.lock(); dt.as_mut().and_then(|d| d.fs_context_menu_pending.take()) };
+            if let Some((win_id, rx, ry)) = pending {
+                let win_rect = {
+                    let dt = desktop::DESKTOP.lock();
+                    dt.as_ref().and_then(|d| d.windows.iter().find(|w| w.id == win_id).map(|w| (w.x, w.y, w.w)))
+                };
+                if let Some((wx, wy, ww)) = win_rect {
+                    let (cur_ino, cur_path) = HEPFS_NAVS.lock().iter().find(|(id, _)| *id == win_id)
+                        .map(|(_, n)| (n.ino, n.path.clone())).unwrap_or((hepfs::ROOT_INO, alloc::string::String::from("/")));
+                    let at_root = cur_ino == hepfs::ROOT_INO;
+                    let rel_x = (rx - wx) as usize;
+                    let rel_y = ry - wy;
+                    let kind = if rel_y < 22 {
+                        None // nav bar — no context menu there
+                    } else {
+                        let entry_idx = ((rel_y - 22) / 14).max(0) as usize;
+                        if !at_root && entry_idx == 0 {
+                            None // ".." row — nothing sensible to Open/Pin/Copy there
+                        } else {
+                            let real_idx = if !at_root { entry_idx - 1 } else { entry_idx };
+                            let left_w = (ww * HEPFS_TREE_W_NUM) / HEPFS_TREE_W_DEN;
+                            let entry = {
+                                let mut ctrl = nvme::CONTROLLER.lock();
+                                ctrl.as_mut().and_then(|ctrl| {
+                                    let ctrl = &mut hepfs::BlockDev::Nvme(ctrl);
+                                    let entries = hepfs::list_dir(ctrl, cur_ino);
+                                    if rel_x <= left_w {
+                                        entries.iter().filter(|(ino, _)| hepfs::read_inode(ctrl, *ino).flags == hepfs::F_DIR)
+                                            .nth(real_idx).map(|(ino, name)| (*ino, name.clone(), true))
+                                    } else {
+                                        entries.get(real_idx).map(|(ino, name)| {
+                                            let is_dir = hepfs::read_inode(ctrl, *ino).flags == hepfs::F_DIR;
+                                            (*ino, name.clone(), is_dir)
+                                        })
+                                    }
+                                })
+                            };
+                            match entry {
+                                Some((ino, name, is_dir)) => Some(desktop::ContextMenuKind::FsRow {
+                                    win_id, parent_ino: cur_ino, parent_path: cur_path, ino, name, is_dir,
+                                    is_pinned: desktop::is_pinned_file(ino),
+                                }),
+                                None => Some(desktop::ContextMenuKind::FsPane { win_id, parent_ino: cur_ino, parent_path: cur_path }),
+                            }
+                        }
+                    };
+                    if let Some(kind) = kind {
+                        let mut dt = desktop::DESKTOP.lock();
+                        if let Some(dt) = dt.as_mut() {
+                            dt.context_menu = Some((rx, ry));
+                            dt.context_menu_kind = kind;
+                            dt.dirty = true;
+                        }
+                    }
+                }
             }
         }
 
