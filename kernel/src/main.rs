@@ -136,6 +136,28 @@ fn spawn_files() -> usize {
     win_id
 }
 
+/// Lists `/home/desktop` and pushes the result into the desktop's icon set
+/// (`Desktop::sync_fs_icons`). No-op if HepFS isn't mounted yet or
+/// `/home/desktop` doesn't exist (shouldn't happen post-boot, but this runs
+/// from the same early-boot code that creates it, so it's checked). Called
+/// once after HepFS init and again after any op that changes that directory
+/// (new file/folder, rename) — see the `prompt_result` handling below.
+fn refresh_desktop_icons() {
+    let entries = {
+        let mut ctrl = nvme::CONTROLLER.lock();
+        let Some(ctrl) = ctrl.as_mut() else { return };
+        let ctrl = &mut hepfs::BlockDev::Nvme(ctrl);
+        let Some(dir_ino) = hepfs::lookup(ctrl, "/home/desktop") else { return };
+        hepfs::list_dir(ctrl, dir_ino).into_iter()
+            .map(|(ino, name)| { let is_dir = hepfs::stat(ctrl, ino).0; (ino, name, is_dir) })
+            .collect::<alloc::vec::Vec<_>>()
+    };
+    let mut dt = desktop::DESKTOP.lock();
+    if let Some(dt) = dt.as_mut() {
+        dt.sync_fs_icons(&entries);
+    }
+}
+
 /// The id of whichever window is actually topmost at (mx, my) — chrome
 /// (close/maximize/minimize/newterm/title bar/resize edge) or content, same
 /// predicate `Desktop::update_mouse()`'s own hit-testing uses, checked
@@ -329,6 +351,12 @@ extern "C" fn kmain(bi_ptr: *const bootinfo::BootInfo) -> ! {
         hepfs::create_dir(&mut dev, hepfs::ROOT_INO, "home");
         hepfs::create_dir(&mut dev, hepfs::ROOT_INO, "etc");
         let home = hepfs::lookup(&mut dev, "/home").unwrap();
+        // Desktop icons for real files live under /home/desktop (see desktop.rs's
+        // fs_icons()) — created once, guarded by lookup() since create_dir() has
+        // no built-in dedup and this whole block reruns every boot.
+        if hepfs::lookup(&mut dev, "/home/desktop").is_none() {
+            hepfs::create_dir(&mut dev, home, "desktop");
+        }
         let fno  = hepfs::create_file(&mut dev, home, "hello.txt");
         hepfs::write_file(&mut dev, fno, b"Hello from HepOS!\n");
         let data = hepfs::read_file(&mut dev, fno);
@@ -370,6 +398,9 @@ extern "C" fn kmain(bi_ptr: *const bootinfo::BootInfo) -> ! {
                 }
             }
         }
+
+        // Populate desktop icons for whatever's already in /home/desktop.
+        refresh_desktop_icons();
 
     } else {
         serial::print("No NVMe device found\n");
@@ -469,6 +500,19 @@ fn task_blink() -> ! {
         let mut ps2_had_input = false;
         while let Some(c) = ps2::read_char() {
             ps2_had_input = true;
+
+            // Desktop "New File"/"New Folder"/rename text prompt takes priority
+            // over everything else while it's open.
+            {
+                let mut dt = desktop::DESKTOP.lock();
+                if let Some(dt) = dt.as_mut() {
+                    if dt.text_prompt.is_some() {
+                        dt.prompt_on_key(c);
+                        continue;
+                    }
+                }
+            }
+
             let focused = *FOCUSED_WIN.lock();
 
             if focused == Some(3) {
@@ -743,6 +787,32 @@ fn task_blink() -> ! {
                     }
                     *FOCUSED_WIN.lock() = Some(win_id);
                 }
+            }
+        }
+
+        // Handle a confirmed desktop New File/New Folder/rename prompt — the
+        // actual HepFS op (desktop.rs has no access to the block device).
+        {
+            let result = {
+                let mut dt = desktop::DESKTOP.lock();
+                dt.as_mut().and_then(|dt| dt.take_prompt_result())
+            };
+            if let Some(outcome) = result {
+                let mut ctrl = nvme::CONTROLLER.lock();
+                if let Some(ctrl) = ctrl.as_mut() {
+                    let ctrl = &mut hepfs::BlockDev::Nvme(ctrl);
+                    if let Some(desktop_ino) = hepfs::lookup(ctrl, "/home/desktop") {
+                        match outcome {
+                            desktop::PromptOutcome::CreateFile(name) => { hepfs::create_file(ctrl, desktop_ino, &name); }
+                            desktop::PromptOutcome::CreateFolder(name) => { hepfs::create_dir(ctrl, desktop_ino, &name); }
+                            desktop::PromptOutcome::Rename { old_name, new_name } => {
+                                hepfs::rename(ctrl, desktop_ino, &old_name, &new_name);
+                            }
+                        }
+                    }
+                }
+                drop(ctrl);
+                refresh_desktop_icons();
             }
         }
 
@@ -1027,6 +1097,9 @@ fn task_blink() -> ! {
         // state machine — see hda::play_pcm()/poll() docs).
         hda::poll();
 
+        // Expire the desktop's transient "Programs can't be renamed" toast, if any.
+        { let mut dt = desktop::DESKTOP.lock(); if let Some(dt) = dt.as_mut() { dt.tick_icon_message(); } }
+
         // Advance any in-progress async network job (ping/wget/udp) — see
         // net::poll() docs. Delivers the result to whichever terminal window
         // issued the command once it finishes (success, error, or timeout).
@@ -1277,6 +1350,8 @@ fn task_blink() -> ! {
                   if let Some(dt) = dt.as_ref() { dt.draw_volume_popup(display); } }
                 { let dt = desktop::DESKTOP.lock();
                   if let Some(dt) = dt.as_ref() { dt.draw_context_menu(display); } }
+                { let dt = desktop::DESKTOP.lock();
+                  if let Some(dt) = dt.as_ref() { dt.draw_new_entry_prompt(display); } }
 
                 // 4. Save scene (no cursor yet) so cursor-only path can erase later
                 display.save_scene();

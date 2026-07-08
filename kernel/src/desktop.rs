@@ -72,18 +72,66 @@ pub fn app_label(kind: AppKind) -> &'static str {
 /// window now gets its own navigator entry, so it works like everything else.
 pub fn app_supports_new_window(_kind: AppKind) -> bool { true }
 
-struct IconDef { win_id: usize, label: &'static str, color: Color }
-const ICONS: &[IconDef] = &[
-    IconDef { win_id: 0, label: "Welcome",  color: Color::from_hex(0xE8A020) },
-    IconDef { win_id: 1, label: "Files",    color: Color::from_hex(0x3A8FD4) },
-    IconDef { win_id: 2, label: "Terminal", color: Color::from_hex(0x2EA84A) },
-    IconDef { win_id: 3, label: "Editor",   color: Color::from_hex(0x9B5CE5) },
-    IconDef { win_id: 4, label: "Sysmon",   color: Color::from_hex(0x20B8B0) },
-    IconDef { win_id: 5, label: "Settings", color: Color::from_hex(0x888888) },
-];
+/// What a desktop icon represents. `Program` icons are the fixed built-in
+/// apps (can be dragged/reordered, but never renamed or deleted — there's no
+/// underlying HepFS entry to rename). `FsEntry` icons mirror a real file or
+/// directory under `/home/desktop`, kept in sync with `sync_fs_icons()`.
+#[derive(Clone, Copy, PartialEq)]
+pub enum IconKind { Program(AppKind, usize /* win_id */), FsEntry { ino: u32, is_dir: bool } }
 
-fn icon_rect(slot: usize) -> (i32, i32, usize, usize) {
-    (ICON_X as i32, (16 + slot * ICON_STRIDE) as i32, ICON_SIZE, ICON_SIZE)
+pub struct DesktopIcon {
+    pub kind:  IconKind,
+    pub label: String,
+    pub x:     i32,
+    pub y:     i32,
+}
+
+fn icon_color(kind: IconKind) -> Color {
+    match kind {
+        IconKind::Program(AppKind::Welcome, _)     => Color::from_hex(0xE8A020),
+        IconKind::Program(AppKind::Files, _)       => Color::from_hex(0x3A8FD4),
+        IconKind::Program(AppKind::Terminal, _)    => Color::from_hex(0x2EA84A),
+        IconKind::Program(AppKind::Editor, _)      => Color::from_hex(0x9B5CE5),
+        IconKind::Program(AppKind::Sysmon, _)      => Color::from_hex(0x20B8B0),
+        IconKind::Program(AppKind::Settings, _)    => Color::from_hex(0x888888),
+        IconKind::Program(_, _)                    => Color::from_hex(0x666699),
+        IconKind::FsEntry { is_dir: true, .. }      => Color::from_hex(0xD4B23A),
+        IconKind::FsEntry { is_dir: false, .. }     => Color::from_hex(0x999999),
+    }
+}
+
+/// Grid position for the `slot`-th icon ever placed — new icons (program or
+/// freshly-appeared file) always take the next sequential slot; existing
+/// icons keep whatever position the user last dragged them to. Doesn't try
+/// to dodge icons the user has since dragged elsewhere — same simplification
+/// real desktops make (a newly-created file just lands in the next grid cell).
+fn icon_grid_pos(slot: usize) -> (i32, i32) {
+    (ICON_X as i32, (16 + slot * ICON_STRIDE) as i32)
+}
+
+/// Fast-vs-slow click-on-an-already-selected-icon thresholds, in `TICK_COUNT`
+/// units (~10ms/tick — see its doc comment). Faster than this = a double
+/// click (open); slower than this (but not stale) = the deliberate second
+/// click that starts a rename, mirroring how a real desktop tells "open" and
+/// "rename" apart without a distinct keyboard shortcut for either.
+const ICON_DBLCLICK_TICKS: u64 = 40;   // ~400ms
+const ICON_RENAME_TICKS:   u64 = 300;  // ~3s — beyond this, treat as a fresh, unrelated click
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum PromptKind { NewFile, NewFolder, RenameIcon(usize) }
+
+pub struct TextPrompt {
+    pub kind: PromptKind,
+    pub buf:  String,
+}
+
+/// What `text_prompt`'s Enter key resolved to — main.rs polls this once per
+/// frame (`Desktop::take_prompt_result()`) and performs the actual HepFS
+/// operation, since `desktop.rs` has no access to the block device.
+pub enum PromptOutcome {
+    CreateFile(String),
+    CreateFolder(String),
+    Rename { old_name: String, new_name: String },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -454,6 +502,20 @@ pub struct Desktop {
     /// keep scrubbing volume even if the cursor moves off the slider's y-range,
     /// same held/fresh_click pattern used elsewhere (e.g. Settings' own slider).
     volume_drag: bool,
+
+    // ── Desktop icons — drag-to-reposition, click-select, click-again-to-rename ──
+    pub icons:          Vec<DesktopIcon>,
+    icon_dragging:       Option<usize>,   // index into `icons`
+    icon_drag_off:       (i32, i32),
+    icon_drag_moved:     bool,            // did this drag move far enough to not also count as a click?
+    pub icon_selected:   Option<usize>,
+    icon_selected_at:    u64,             // TICK_COUNT at last selection/click
+    /// Transient message (e.g. "Programs can't be renamed"), with the
+    /// `TICK_COUNT` value it should disappear at.
+    pub icon_message:    Option<(String, u64)>,
+    pub text_prompt:      Option<TextPrompt>,
+    /// Consumed once per frame by main.rs to perform the actual HepFS op.
+    pub prompt_result:    Option<PromptOutcome>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -461,6 +523,19 @@ pub enum ContextMenuKind { Background, App(AppKind), EditText(usize) }
 
 impl Desktop {
     pub fn new(fb_w: usize, fb_h: usize) -> Self {
+        // Fixed program icons — win_id matches the fixed window ids main.rs
+        // creates at boot (Welcome=0, Files=1, Terminal=2, Editor=3, Sysmon=4,
+        // Settings=5). These never come from HepFS, so they're seeded here
+        // rather than through `sync_fs_icons()`.
+        let program_defs: &[(AppKind, usize)] = &[
+            (AppKind::Welcome, 0), (AppKind::Files, 1), (AppKind::Terminal, 2),
+            (AppKind::Editor, 3),  (AppKind::Sysmon, 4), (AppKind::Settings, 5),
+        ];
+        let icons = program_defs.iter().enumerate().map(|(slot, &(kind, win_id))| {
+            let (x, y) = icon_grid_pos(slot);
+            DesktopIcon { kind: IconKind::Program(kind, win_id), label: String::from(app_label(kind)), x, y }
+        }).collect();
+
         Desktop {
             windows: Vec::new(), focused: None, next_id: 0,
             fb_w, fb_h, prev_btn: 0, dirty: true, mouse_dirty: false,
@@ -473,7 +548,128 @@ impl Desktop {
             clipboard_action_requested: None,
             volume_popup_open: false,
             volume_drag: false,
+            icons, icon_dragging: None, icon_drag_off: (0, 0), icon_drag_moved: false,
+            icon_selected: None, icon_selected_at: 0, icon_message: None,
+            text_prompt: None, prompt_result: None,
         }
+    }
+
+    /// Merge a fresh `/home/desktop` listing into `self.icons`: adds icons
+    /// for entries that appeared, removes ones for entries that disappeared
+    /// (deleted/renamed elsewhere, e.g. via the file manager), and leaves
+    /// everything else — including dragged positions and the label of an
+    /// entry that hasn't changed — untouched. Called by main.rs right after
+    /// HepFS is ready, and again after any op that changes `/home/desktop`'s
+    /// contents (new file/folder, rename).
+    pub fn sync_fs_icons(&mut self, entries: &[(u32, alloc::string::String, bool)]) {
+        // Drop icons for inodes no longer present.
+        self.icons.retain(|icon| match icon.kind {
+            IconKind::FsEntry { ino, .. } => entries.iter().any(|(i, _, _)| *i == ino),
+            IconKind::Program(_, _) => true,
+        });
+        // Add icons for new inodes; refresh the label for existing ones
+        // (covers a rename done from the file manager instead of the desktop).
+        for (ino, name, is_dir) in entries {
+            if let Some(icon) = self.icons.iter_mut().find(|i| matches!(i.kind, IconKind::FsEntry { ino: existing, .. } if existing == *ino)) {
+                icon.label = name.clone();
+            } else {
+                let slot = self.icons.len();
+                let (x, y) = icon_grid_pos(slot);
+                self.icons.push(DesktopIcon {
+                    kind: IconKind::FsEntry { ino: *ino, is_dir: *is_dir },
+                    label: name.clone(), x, y,
+                });
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Take the pending create/rename request, if any — main.rs calls this
+    /// once per frame and performs the actual HepFS operation.
+    pub fn take_prompt_result(&mut self) -> Option<PromptOutcome> {
+        self.prompt_result.take()
+    }
+
+    fn icon_rect_at(icon: &DesktopIcon) -> (i32, i32, usize, usize) {
+        (icon.x, icon.y, ICON_SIZE, ICON_SIZE)
+    }
+
+    /// Open (double-click) an icon: for a program, show+focus its window;
+    /// for an `FsEntry`, main.rs's per-frame poll of `new_window_requested`/
+    /// existing open logic doesn't cover files, so this only handles the
+    /// directory case (open a Files window) directly here — opening a file
+    /// by its type needs main.rs (which owns the editor/image/audio state),
+    /// so files are left for a follow-up; only the desktop-level bits
+    /// (select/drag/rename) are handled in this pass.
+    fn open_icon(&mut self, idx: usize) {
+        let Some(icon) = self.icons.get(idx) else { return };
+        match icon.kind {
+            IconKind::Program(_, win_id) => {
+                if let Some(w) = self.windows.iter_mut().find(|w| w.id == win_id) { w.show(); }
+                self.bring_to_front(win_id);
+            }
+            IconKind::FsEntry { .. } => {
+                // Real "open a file" needs main.rs (editor/image/audio dispatch) —
+                // left for a follow-up pass; directories will get the same
+                // treatment once that's wired up.
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Start renaming an icon, or show the "can't rename" message for a
+    /// program icon.
+    fn begin_rename(&mut self, idx: usize) {
+        let now = crate::scheduler::TICK_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+        let Some(icon) = self.icons.get(idx) else { return };
+        match icon.kind {
+            IconKind::Program(_, _) => {
+                self.icon_message = Some((String::from("Programs can't be renamed"), now + 150));
+            }
+            IconKind::FsEntry { .. } => {
+                self.text_prompt = Some(TextPrompt { kind: PromptKind::RenameIcon(idx), buf: icon.label.clone() });
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Open the "New File"/"New Folder" name prompt.
+    pub fn begin_new_entry(&mut self, is_dir: bool) {
+        let kind = if is_dir { PromptKind::NewFolder } else { PromptKind::NewFile };
+        self.text_prompt = Some(TextPrompt { kind, buf: String::new() });
+        self.dirty = true;
+    }
+
+    /// Route a keystroke to the active text prompt (rename / new file /
+    /// new folder). No-op if no prompt is open.
+    pub fn prompt_on_key(&mut self, c: char) {
+        let Some(prompt) = self.text_prompt.as_mut() else { return };
+        match c as u32 {
+            0x1B => { self.text_prompt = None; } // Esc — cancel
+            0x08 => { prompt.buf.pop(); }         // Backspace
+            0x0A | 0x0D => {                      // Enter — confirm
+                let buf = prompt.buf.clone();
+                if !buf.is_empty() {
+                    self.prompt_result = Some(match prompt.kind {
+                        PromptKind::NewFile   => PromptOutcome::CreateFile(buf),
+                        PromptKind::NewFolder => PromptOutcome::CreateFolder(buf),
+                        PromptKind::RenameIcon(idx) => {
+                            if matches!(self.icons.get(idx).map(|i| i.kind), Some(IconKind::FsEntry { .. })) {
+                                let old_name = self.icons[idx].label.clone();
+                                PromptOutcome::Rename { old_name, new_name: buf }
+                            } else {
+                                self.text_prompt = None;
+                                return;
+                            }
+                        }
+                    });
+                }
+                self.text_prompt = None;
+            }
+            ch if ch >= 32 && ch < 128 => { prompt.buf.push(ch as u8 as char); }
+            _ => {}
+        }
+        self.dirty = true;
     }
 
     pub fn add_window(&mut self, app_kind: AppKind, title: &str, x: i32, y: i32, w: usize, h: usize) -> usize {
@@ -684,6 +880,19 @@ impl Desktop {
                 }
             }
         }
+        if held {
+            if let Some(idx) = self.icon_dragging {
+                if let Some(icon) = self.icons.get_mut(idx) {
+                    let new_x = (mx - self.icon_drag_off.0).max(0).min(self.fb_w as i32 - ICON_SIZE as i32);
+                    let new_y = (my - self.icon_drag_off.1).max(0).min(self.fb_h as i32 - TASKBAR_H as i32 - ICON_SIZE as i32 - 12);
+                    if (new_x - icon.x).abs() > 3 || (new_y - icon.y).abs() > 3 { self.icon_drag_moved = true; }
+                    icon.x = new_x;
+                    icon.y = new_y;
+                    self.dirty = true;
+                    return false;
+                }
+            }
+        }
         if held && self.volume_drag {
             let ty = self.fb_h - TASKBAR_H;
             let (px, _, pw, _) = vol_popup_rect(self.fb_w, ty);
@@ -695,6 +904,24 @@ impl Desktop {
             return false;
         }
         if released {
+            if let Some(idx) = self.icon_dragging.take() {
+                if !self.icon_drag_moved {
+                    let now = crate::scheduler::TICK_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+                    if self.icon_selected == Some(idx) {
+                        let elapsed = now.saturating_sub(self.icon_selected_at);
+                        if elapsed <= ICON_DBLCLICK_TICKS {
+                            self.open_icon(idx);
+                        } else if elapsed <= ICON_RENAME_TICKS {
+                            self.begin_rename(idx);
+                        }
+                        self.icon_selected_at = now;
+                    } else {
+                        self.icon_selected = Some(idx);
+                        self.icon_selected_at = now;
+                    }
+                    self.dirty = true;
+                }
+            }
             self.volume_drag = false;
             // Apply snap if a window was being dragged into a snap zone
             if let Some(zone) = self.snap_zone.take() {
@@ -793,6 +1020,8 @@ impl Desktop {
             self.dirty = true;
             match (kind, item) {
                 (ContextMenuKind::Background, Some(0)) => self.open_settings_requested = true,
+                (ContextMenuKind::Background, Some(1)) => self.begin_new_entry(false), // New File
+                (ContextMenuKind::Background, Some(2)) => self.begin_new_entry(true),  // New Folder
                 (ContextMenuKind::App(k),     Some(0)) => self.new_window_requested = Some(k),
                 (ContextMenuKind::EditText(id), Some(0)) => self.clipboard_action_requested = Some((id, false)), // Copy
                 (ContextMenuKind::EditText(id), Some(1)) => self.clipboard_action_requested = Some((id, true)),  // Paste
@@ -961,21 +1190,28 @@ impl Desktop {
                 break;
             }
         }
-        // No window hit — check desktop icon click
+        // No window hit — check desktop icon click. Single click selects (or,
+        // on an already-selected icon, opens/renames depending on how fast
+        // the second click landed — see ICON_DBLCLICK_TICKS/ICON_RENAME_TICKS);
+        // every click also arms a possible drag, resolved on release below.
         if hit_id.is_none() {
-            for (slot, icon) in ICONS.iter().enumerate() {
-                let (ix, iy, iw, ih) = icon_rect(slot);
-                if mx >= ix && mx < ix + iw as i32
-                    && my >= iy && my < iy + ih as i32 + 12 // include label row
-                {
-                    if let Some(w) = self.windows.iter_mut().find(|w| w.id == icon.win_id) {
-                        w.show();
-                    }
-                    self.bring_to_front(icon.win_id);
-                    self.dirty = true;
-                    return false;
-                }
-                let _ = slot; // suppress unused warning if loop body always returns
+            let hit_idx = self.icons.iter().position(|icon| {
+                let (ix, iy, iw, ih) = Self::icon_rect_at(icon);
+                mx >= ix && mx < ix + iw as i32 && my >= iy && my < iy + ih as i32 + 12
+            });
+            if let Some(idx) = hit_idx {
+                // Click semantics (select / open / rename) are resolved on
+                // release, not here — so a real drag never also fires an
+                // open/rename just because it started on a selected icon.
+                let icon = &self.icons[idx];
+                self.icon_dragging   = Some(idx);
+                self.icon_drag_off   = (mx - icon.x, my - icon.y);
+                self.icon_drag_moved = false;
+                self.dirty = true;
+                return false;
+            } else if self.icon_selected.is_some() {
+                self.icon_selected = None;
+                self.dirty = true;
             }
         }
 
@@ -1158,23 +1394,59 @@ impl Desktop {
     /// Clear the desktop background and draw desktop icons.
     pub fn render(&self, display: &mut Display, _cx: i32, _cy: i32) {
         self.draw_wallpaper(display);
-        for (slot, icon) in ICONS.iter().enumerate() {
-            let (ix, iy, iw, ih) = icon_rect(slot);
+        for (idx, icon) in self.icons.iter().enumerate() {
+            let (ix, iy, iw, ih) = Self::icon_rect_at(icon);
             if iy < 0 { continue; }
             let ix = ix as usize; let iy = iy as usize;
+            let selected = self.icon_selected == Some(idx);
+            // Selection highlight — a lighter panel behind the whole icon+label.
+            if selected {
+                display.fill_rect(ix.saturating_sub(4), iy.saturating_sub(4), iw + 8, ih + 24, pal::MENU_HOVER);
+            }
             // Outer border (1px, slightly lighter than bg)
             display.fill_rect(ix, iy, iw, ih, Color::from_hex(0x2A2A3A));
             // Coloured icon face (inset 2px)
-            display.fill_rect(ix + 2, iy + 2, iw - 4, ih - 4, icon.color);
+            display.fill_rect(ix + 2, iy + 2, iw - 4, ih - 4, icon_color(icon.kind));
             // Dark title-bar strip on the icon face
             display.fill_rect(ix + 2, iy + 2, iw - 4, 8, Color::from_hex(0x111111));
-            // Label below (scale=1, centred under icon)
+            // Label below (scale=1, centred under icon) — replaced with an
+            // inline edit box while this icon is being renamed.
             let label_y = iy + ih + 4;
-            let label_len = icon.label.len();
-            let label_x = if label_len * 8 < iw {
-                ix + (iw - label_len * 8) / 2
-            } else { ix };
-            display.draw_text(label_x, label_y, icon.label, pal::TEXT, 1);
+            let renaming = matches!(&self.text_prompt, Some(p) if p.kind == PromptKind::RenameIcon(idx));
+            if renaming {
+                let buf = &self.text_prompt.as_ref().unwrap().buf;
+                let bw = (buf.len().max(4) * 8 + 6).min(140);
+                let bx = ix.saturating_sub(bw.saturating_sub(iw) / 2);
+                display.fill_rect(bx, label_y, bw, 12, Color::from_hex(0x000000));
+                display.fill_rect(bx, label_y, bw, 1, pal::ACCENT);
+                display.draw_text(bx + 3, label_y + 2, buf, pal::TEXT, 1);
+            } else {
+                let label_len = icon.label.len();
+                let label_x = if label_len * 8 < iw {
+                    ix + (iw - label_len * 8) / 2
+                } else { ix };
+                display.draw_text(label_x, label_y, &icon.label, pal::TEXT, 1);
+            }
+        }
+        // Transient message (e.g. "Programs can't be renamed") — small toast
+        // near the top-left of the desktop icon column.
+        if let Some((msg, _)) = &self.icon_message {
+            let mw = msg.len() * 8 + 12;
+            display.fill_rect(ICON_X, 4, mw, 16, Color::from_hex(0x000000));
+            display.fill_rect(ICON_X, 4, mw, 1, pal::CLOSE_BTN);
+            display.draw_text(ICON_X + 6, 8, msg, pal::TEXT, 1);
+        }
+    }
+
+    /// Clears `icon_message` once it's past its expiry tick. Call once per
+    /// frame from the render loop (main.rs) — kept separate from `render()`
+    /// itself since that takes `&self`, not `&mut self`.
+    pub fn tick_icon_message(&mut self) {
+        if let Some((_, expire)) = self.icon_message {
+            if crate::scheduler::TICK_COUNT.load(core::sync::atomic::Ordering::Relaxed) >= expire {
+                self.icon_message = None;
+                self.dirty = true;
+            }
         }
     }
 
@@ -1383,7 +1655,7 @@ impl Desktop {
     /// Labels for the current context menu's items, top to bottom.
     fn context_menu_labels(&self) -> &'static [&'static str] {
         match self.context_menu_kind {
-            ContextMenuKind::Background => &["Change background"],
+            ContextMenuKind::Background => &["Change background", "New File", "New Folder"],
             ContextMenuKind::App(_)     => &["New Window"],
             ContextMenuKind::EditText(_) => &["Copy", "Paste"],
         }
@@ -1413,6 +1685,32 @@ impl Desktop {
         for (i, label) in labels.iter().enumerate() {
             display.draw_text(x + 10, y + 8 + i * ITEM_H, label, pal::TEXT, 1);
         }
+    }
+
+    /// Draw the "New File"/"New Folder" name prompt as a small centered modal.
+    /// (`RenameIcon`'s prompt is drawn inline under the icon in `render()` instead.)
+    pub fn draw_new_entry_prompt(&self, display: &mut Display) {
+        let Some(prompt) = &self.text_prompt else { return };
+        let title = match prompt.kind {
+            PromptKind::NewFile   => "New File — name:",
+            PromptKind::NewFolder => "New Folder — name:",
+            PromptKind::RenameIcon(_) => return,
+        };
+        const PW: usize = 240;
+        const PH: usize = 60;
+        let x = (self.fb_w.saturating_sub(PW)) / 2;
+        let y = (self.fb_h.saturating_sub(PH)) / 2;
+        display.fill_rect(x + 3, y + 3, PW, PH, Color::from_hex(0x000000));
+        display.fill_rect(x, y, PW, PH, pal::MENU_BG);
+        display.fill_rect(x, y, PW, 1, pal::MENU_BORDER);
+        display.fill_rect(x, y + PH - 1, PW, 1, pal::MENU_BORDER);
+        display.fill_rect(x, y, 1, PH, pal::MENU_BORDER);
+        display.fill_rect(x + PW - 1, y, 1, PH, pal::MENU_BORDER);
+        display.draw_text(x + 10, y + 10, title, pal::TEXT, 1);
+        display.fill_rect(x + 10, y + 30, PW - 20, 16, Color::from_hex(0x000000));
+        display.fill_rect(x + 10, y + 30, PW - 20, 1, pal::ACCENT);
+        display.draw_text(x + 14, y + 34, &prompt.buf, pal::TEXT, 1);
+        display.draw_text(x + 10, y + 50, "Enter=confirm  Esc=cancel", pal::TEXT_DIM, 1);
     }
 
     /// Context-menu item hit-test.  Returns Some(item_index) if (mx,my) is inside

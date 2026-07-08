@@ -100,14 +100,28 @@ pub struct Inode {
     pub direct:    [u32; DIRECT_PTRS],  // absolute block numbers (0 = unused)
     pub indirect:  u32,
     pub dindirect: u32, // double-indirect: block of 1024 pointers to indirect blocks
-    _pad: [u8; 40],
+    _pad: [u8; 32],
 }
+
+// read_inode/write_inode assume every inode occupies exactly 128 bytes
+// (INODES_PER_BLK = BLOCK_SIZE / 128) — this used to silently not hold
+// (the struct was actually 136 bytes with `_pad: [u8; 40]`), so every
+// write_inode() overflowed 8 bytes into the next inode's slot in the same
+// block. Usually invisible (the overflow landed in that neighbor's own
+// _pad), but corrupted a real field (indirect/dindirect) whenever the
+// overflow's 8 bytes happened to line up with one — producing a garbage
+// block pointer and an "LBA out of range" NVMe write failure that looked
+// completely unrelated to inode layout. Caught when adding one more early
+// boot-time directory shifted inode numbering just enough to newly corrupt
+// the demo.wav file's inode. This assert makes the 128-byte assumption
+// load-bearing and checked, instead of silently-sometimes-true.
+const _: () = assert!(core::mem::size_of::<Inode>() == 128);
 
 impl Default for Inode {
     fn default() -> Self {
         Self {
             flags: 0, size: 0, nblocks: 0, ctime: 0, mtime: 0,
-            direct: [0u32; 12], indirect: 0, dindirect: 0, _pad: [0u8; 40],
+            direct: [0u32; 12], indirect: 0, dindirect: 0, _pad: [0u8; 32],
         }
     }
 }
@@ -211,10 +225,25 @@ pub fn write_inode(ctrl: &mut BlockDev, ino: u32, inode: &Inode) {
 }
 
 // ── Block allocation ──────────────────────────────────────────────────────────
+/// Claims a free data block and zeroes it on disk before returning it.
+///
+/// The zero is load-bearing, not just hygiene: `bitmap_alloc` only flips a
+/// bit — the block's actual on-disk *content* is whatever was physically
+/// there before (leftover from a previous boot's filesystem, since `format()`
+/// only clears the superblock/bitmaps/inode table, never the data region).
+/// HepFS reformats its metadata every boot, but the underlying disk image
+/// persists on the host — so an indirect/double-indirect pointer table read
+/// back from a freshly-allocated-but-never-zeroed block would see stale
+/// bytes from an unrelated previous session and misinterpret them as real
+/// block pointers. Found via a real crash: adding one more early boot-time
+/// directory shifted which block a large file's indirect table landed on,
+/// exposing exactly this — a garbage pointer that made a later write target
+/// an LBA outside the disk.
 fn alloc_block(ctrl: &mut BlockDev) -> u32 {
     // skip the first DATA_BLOCK_START blocks (they are system blocks)
     let blk = bitmap_alloc(ctrl, BLOCK_BM_BLOCK, BLOCK_BM_LEN, DATA_BLOCK_START)
         .expect("hepfs: disk full");
+    write_block(ctrl, blk, &Page::alloc());
     blk as u32
 }
 
@@ -371,9 +400,7 @@ pub fn create_dir(ctrl: &mut BlockDev, parent: u32, name: &str) -> u32 {
     let blk  = alloc_block(ctrl);
     let inode = Inode { flags: F_DIR, nblocks: 1, direct: { let mut d = [0u32; 12]; d[0] = blk; d }, ..Default::default() };
     write_inode(ctrl, ino, &inode);
-    // clear the dir data block
-    let empty = Page::alloc();
-    write_block(ctrl, blk as u64, &empty);
+    // (data block is already zeroed by alloc_block())
     add_dir_entry(ctrl, parent, name, ino);
     ino
 }
@@ -569,6 +596,33 @@ pub fn remove(ctrl: &mut BlockDev, parent_ino: u32, name: &str) -> bool {
         }
     }
     true
+}
+
+/// Rename an entry in place within its parent directory — updates the
+/// `DirEntry.name` field directly rather than remove+create, so the inode
+/// (and, for a directory, its contents) is untouched. Returns false if
+/// `old_name` doesn't exist or `new_name` is already taken.
+pub fn rename(ctrl: &mut BlockDev, parent_ino: u32, old_name: &str, new_name: &str) -> bool {
+    if find_in_dir(ctrl, parent_ino, new_name).is_some() { return false; }
+    let name_bytes = new_name.as_bytes();
+    if name_bytes.len() > 27 { return false; }
+
+    let parent = read_inode(ctrl, parent_ino);
+    for &blk in parent.direct.iter().filter(|&&b| b != 0) {
+        let page = read_block(ctrl, blk as u64);
+        let buf  = page.as_mut_slice();
+        for i in 0..ENTRIES_PER_BLK {
+            let ep = unsafe { buf.as_mut_ptr().add(i * DIR_ENTRY_SIZE) as *mut DirEntry };
+            if unsafe { (*ep).inode } != 0 && unsafe { (*ep).name_str() } == old_name {
+                let mut entry = DirEntry { inode: unsafe { (*ep).inode }, name_len: name_bytes.len() as u8, name: [0; 27] };
+                entry.name[..name_bytes.len()].copy_from_slice(name_bytes);
+                unsafe { *ep = entry; }
+                write_block(ctrl, blk as u64, &page);
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Lookup an entry by name in a directory. Returns (inode_id, is_dir).
