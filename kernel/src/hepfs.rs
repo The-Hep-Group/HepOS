@@ -668,6 +668,40 @@ pub fn move_entry(ctrl: &mut BlockDev, from_parent: u32, to_parent: u32, name: &
     true
 }
 
+/// Copy a file or directory (recursively) from one directory to another,
+/// under `dest_name` — a genuine duplicate with a *new* inode and data
+/// blocks, unlike `move_entry()`/`rename()` which just re-point a
+/// `DirEntry`. Returns the new entry's inode, or `None` if the source
+/// doesn't exist or the destination name is already taken.
+///
+/// Guards against copying a directory into itself directly (`to_parent ==
+/// source inode`), but not into a deeper descendant of itself — copying
+/// necessarily recurses through `to_parent`'s own tree, so a real cycle
+/// would recurse forever. Not reachable through the file manager today
+/// (paste always targets the *currently browsed* directory, and Ctrl+C
+/// captures a specific source before any navigation happens), but would need
+/// real ancestry-walking protection before anything else calls this with
+/// arbitrary caller-supplied source/destination pairs.
+pub fn copy_entry(ctrl: &mut BlockDev, from_parent: u32, to_parent: u32, name: &str, dest_name: &str) -> Option<u32> {
+    if find_in_dir(ctrl, to_parent, dest_name).is_some() { return None; }
+    let src_ino = find_in_dir(ctrl, from_parent, name)?;
+    if src_ino == to_parent { return None; }
+
+    let inode = read_inode(ctrl, src_ino);
+    if inode.flags == F_DIR {
+        let new_ino = create_dir(ctrl, to_parent, dest_name);
+        for (_, child_name) in list_dir(ctrl, src_ino) {
+            copy_entry(ctrl, src_ino, new_ino, &child_name, &child_name);
+        }
+        Some(new_ino)
+    } else {
+        let data = read_file(ctrl, src_ino);
+        let new_ino = create_file(ctrl, to_parent, dest_name);
+        write_file(ctrl, new_ino, &data);
+        Some(new_ino)
+    }
+}
+
 /// Lookup an entry by name in a directory. Returns (inode_id, is_dir).
 pub fn stat(ctrl: &mut BlockDev, ino: u32) -> (bool, u64) {
     let inode = read_inode(ctrl, ino);

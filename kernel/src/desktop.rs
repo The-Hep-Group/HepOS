@@ -1005,6 +1005,13 @@ impl Desktop {
         }
         if held && self.taskbar_dragging.is_some() {
             if (mx - self.taskbar_drag_start_x).abs() > 12 { self.taskbar_drag_moved = true; }
+            if self.taskbar_drag_moved {
+                // Force a full redraw every frame while the ghost button is
+                // following the cursor — plain mouse movement only sets
+                // `mouse_dirty` (the cheap cursor-only partial-flush path),
+                // which wouldn't touch the taskbar at all.
+                self.dirty = true;
+            }
         }
         if held {
             if let Some(idx) = self.icon_dragging {
@@ -1713,11 +1720,34 @@ impl Desktop {
         // count when there's more than one instance; minimized-only groups are
         // dimmed since nothing of that kind is visible right now.
         let mut bx = START_W + 4;
+        // While a button is being dragged (moved past the threshold), it's
+        // drawn as a floating "ghost" that follows the cursor instead of
+        // sitting in its normal slot — otherwise a drag looked like nothing
+        // was happening at all until you let go and the taskbar re-sorted.
+        let mut dragged_ghost: Option<(AppKind, String)> = None;
         for (kind, ids) in self.taskbar_entries() {
             if bx + TASK_BTN_W > self.fb_w.saturating_sub(VOL_RESERVED_W) { break; }
             let open_count = ids.iter().filter(|&&id| self.windows.iter().any(|w| w.id == id && !w.minimized)).count();
             let active = open_count > 0 && (ids.len() == 1 && self.focused == Some(ids[0])
                 || (ids.len() > 1 && ids.iter().any(|&i| self.focused == Some(i))));
+            let full_label = if ids.len() > 1 {
+                alloc::format!("{} ({})", app_label(kind), open_count)
+            } else if let Some(id) = ids.first() {
+                let win = self.windows.iter().find(|w| w.id == *id);
+                win.map(|w| w.title.clone()).unwrap_or_else(|| String::from(app_label(kind)))
+            } else {
+                String::from(app_label(kind)) // pinned, not running
+            };
+            let being_dragged = self.taskbar_drag_moved && self.taskbar_dragging == Some(kind);
+            if being_dragged {
+                dragged_ghost = Some((kind, full_label));
+                // Leave this slot as a faint placeholder outline so the other
+                // buttons' positions don't jump around while it's lifted out.
+                display.fill_rect(bx, ty + 4, TASK_BTN_W - 4, 1, pal::BORDER);
+                display.fill_rect(bx, ty + TASKBAR_H - 5, TASK_BTN_W - 4, 1, pal::BORDER);
+                bx += TASK_BTN_W;
+                continue;
+            }
             // Three visually distinct non-active states, not just one "dimmed":
             // pinned-and-never-opened gets an outline-only "ghost" button (no
             // fill at all), minimized gets a dimmer fill + a dim underline
@@ -1741,18 +1771,24 @@ impl Desktop {
             }
             // Small icon glyph, then the label — same color desktop icons use.
             crate::icons::draw_app_icon(display, bx + 4, ty + 9, 10, kind);
-            let full_label = if ids.len() > 1 {
-                alloc::format!("{} ({})", app_label(kind), open_count)
-            } else if let Some(id) = ids.first() {
-                let win = self.windows.iter().find(|w| w.id == *id);
-                win.map(|w| w.title.clone()).unwrap_or_else(|| String::from(app_label(kind)))
-            } else {
-                String::from(app_label(kind)) // pinned, not running
-            };
             let label = if full_label.len() > 11 { &full_label[..11] } else { &full_label };
             let text_col = if open_count == 0 { pal::TEXT_DIM } else { pal::TEXT };
             display.draw_text(bx + 18, ty + 10, label, text_col, 1);
             bx += TASK_BTN_W;
+        }
+
+        // The dragged button's floating ghost, drawn last so it renders on
+        // top of everything else, tracking the cursor's x position.
+        if let Some((kind, label)) = dragged_ghost {
+            let gx_min = START_W as i32;
+            let gx_max = self.fb_w.saturating_sub(VOL_RESERVED_W + TASK_BTN_W) as i32;
+            let gx = (self.prev_cx - (TASK_BTN_W as i32) / 2).clamp(gx_min, gx_max.max(gx_min)) as usize;
+            display.fill_rect(gx, ty + 2, TASK_BTN_W - 4, TASKBAR_H - 4, pal::TASKBAR_ACT);
+            display.fill_rect(gx, ty + 2, TASK_BTN_W - 4, 1, pal::ACCENT);
+            display.fill_rect(gx, ty + TASKBAR_H - 3, TASK_BTN_W - 4, 1, pal::ACCENT);
+            crate::icons::draw_app_icon(display, gx + 4, ty + 7, 10, kind);
+            let label = if label.len() > 11 { &label[..11] } else { &label };
+            display.draw_text(gx + 18, ty + 8, label, pal::TEXT, 1);
         }
 
         // Volume icon — 3 bars of increasing height, like a signal-strength icon.

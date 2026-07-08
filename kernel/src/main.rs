@@ -162,6 +162,44 @@ fn spawn_files() -> usize {
     win_id
 }
 
+/// Ctrl+C in a Files window copies (parent_ino, ino, name, is_dir) here;
+/// Ctrl+V pastes it (via `hepfs::copy_entry()` — a real duplicate, new inode
+/// and data blocks, not a move) into whichever Files window has focus. Plain
+/// text clipboard (editor/terminal Ctrl+C/V) is a separate thing —
+/// `clipboard.rs` — this is files-and-directories only.
+static FS_CLIPBOARD: Mutex<Option<(u32, u32, alloc::string::String, bool)>> = Mutex::new(None);
+
+/// Resolve `nav.selected` (pane, row) back into (parent_ino, ino, name,
+/// is_dir) — same traversal the click handler uses to turn a click into an
+/// entry, just driven by the *last selected* row instead of a live click.
+fn selected_fs_entry(win_id: usize) -> Option<(u32, u32, alloc::string::String, bool)> {
+    let (cur_ino, pane, idx) = {
+        let navs = HEPFS_NAVS.lock();
+        let (_, nav) = navs.iter().find(|(id, _)| *id == win_id)?;
+        let (pane, idx) = nav.selected?;
+        (nav.ino, pane, idx)
+    };
+    let at_root = cur_ino == hepfs::ROOT_INO;
+    if !at_root && idx == 0 { return None; } // the ".." row isn't a real entry
+    let real_idx = if !at_root { idx - 1 } else { idx };
+
+    let mut ctrl = nvme::CONTROLLER.lock();
+    let ctrl = ctrl.as_mut()?;
+    let ctrl = &mut hepfs::BlockDev::Nvme(ctrl);
+    let entries = hepfs::list_dir(ctrl, cur_ino);
+    let (ino, name, is_dir) = if pane == 3 {
+        let (ino, name) = entries.iter()
+            .filter(|(ino, _)| hepfs::read_inode(ctrl, *ino).flags == hepfs::F_DIR)
+            .nth(real_idx)?;
+        (*ino, name.clone(), true)
+    } else {
+        let (ino, name) = entries.get(real_idx)?;
+        let is_dir = hepfs::read_inode(ctrl, *ino).flags == hepfs::F_DIR;
+        (*ino, name.clone(), is_dir)
+    };
+    Some((cur_ino, ino, name, is_dir))
+}
+
 /// Lists `/home/desktop` and pushes the result into the desktop's icon set
 /// (`Desktop::sync_fs_icons`). No-op if HepFS isn't mounted yet or
 /// `/home/desktop` doesn't exist (shouldn't happen post-boot, but this runs
@@ -593,7 +631,53 @@ fn task_blink() -> ! {
                         true
                     } else { false }
                 };
-                if !routed_extra {
+                // Ctrl+C/Ctrl+V in a focused Files window copies/pastes
+                // whichever row is selected (files-and-directories clipboard —
+                // see FS_CLIPBOARD; separate from the plain-text clipboard
+                // editor/terminal Ctrl+C/V uses).
+                let routed_files = routed_extra || {
+                    let is_files_win = focused.map(|f| HEPFS_NAVS.lock().iter().any(|(id, _)| *id == f)).unwrap_or(false);
+                    if is_files_win {
+                        let win_id = focused.unwrap();
+                        if c == 'C' && ps2::ctrl_held() {
+                            if let Some(entry) = selected_fs_entry(win_id) { *FS_CLIPBOARD.lock() = Some(entry); }
+                            true
+                        } else if (c == 'V' && ps2::ctrl_held()) || c as u8 == 0x16 {
+                            let clip = FS_CLIPBOARD.lock().clone();
+                            if let Some((from_parent, _ino, name, _is_dir)) = clip {
+                                let target_ino = HEPFS_NAVS.lock().iter()
+                                    .find(|(id, _)| *id == win_id).map(|(_, n)| n.ino);
+                                if let Some(target_ino) = target_ino {
+                                    let mut ctrl = nvme::CONTROLLER.lock();
+                                    if let Some(ctrl) = ctrl.as_mut() {
+                                        let ctrl = &mut hepfs::BlockDev::Nvme(ctrl);
+                                        // Same name if free, else "<name> (copy)" once — if
+                                        // that's *also* taken, the paste is silently skipped
+                                        // rather than endlessly renaming.
+                                        if hepfs::copy_entry(ctrl, from_parent, target_ino, &name, &name).is_none() {
+                                            let alt = alloc::format!("{} (copy)", name);
+                                            hepfs::copy_entry(ctrl, from_parent, target_ino, &name, &alt);
+                                        }
+                                    }
+                                    drop(ctrl);
+                                    refresh_desktop_icons();
+                                    let mut dt = desktop::DESKTOP.lock();
+                                    if let Some(dt) = dt.as_mut() { dt.dirty = true; }
+                                }
+                            }
+                            true
+                        } else { false }
+                    } else { false }
+                };
+                // Only the main terminal (window id 2) — NOT whatever's
+                // actually focused, e.g. Settings/Sysmon/Welcome/an
+                // ImageViewer/AudioPlayer window — used to be a real bug:
+                // every key that didn't match the editor/extra-terminal
+                // cases above fell through here unconditionally, so e.g.
+                // Ctrl+C typed while some other window had focus still
+                // cancelled the main terminal's input line, even though it
+                // wasn't the window the user was looking at.
+                if !routed_files && focused == Some(2) {
                     let mut tg = terminal::TERMINAL.lock();
                     if let Some(t) = tg.as_mut() { t.on_key(c); }
                 }
