@@ -797,6 +797,8 @@ fn task_blink() -> ! {
         hda::spawn_pending_driver();
         // Same one-shot deferred-spawn pattern, for the AHCI/SATA driver.
         ahci::spawn_pending_driver();
+        // Same one-shot deferred-spawn pattern, for the XHCI/USB HID driver.
+        xhci::spawn_pending_driver();
 
         ps2::poll();
         mouse::poll();

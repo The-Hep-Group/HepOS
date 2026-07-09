@@ -71,4 +71,17 @@ fn main() {
     } else {
         std::fs::write(&gen_ahcid, "static AHCID_ELF: &[u8] = &[];\n").unwrap();
     }
+
+    // Bake the userspace xhcid ELF (the persistent USB HID poller process —
+    // see xhci.rs) the same way.
+    let xhcid     = root.join("userspace/target/x86_64-unknown-none/release/xhcid");
+    let gen_xhcid = std::path::Path::new(&out_dir).join("xhcid_elf.rs");
+    if xhcid.exists() {
+        let bytes = std::fs::read(&xhcid).expect("read xhcid ELF");
+        let lit: String = bytes.iter().map(|b| format!("{},", b)).collect();
+        std::fs::write(&gen_xhcid, format!("static XHCID_ELF: &[u8] = &[{}];\n", lit)).unwrap();
+        println!("cargo:rerun-if-changed={}", xhcid.display());
+    } else {
+        std::fs::write(&gen_xhcid, "static XHCID_ELF: &[u8] = &[];\n").unwrap();
+    }
 }

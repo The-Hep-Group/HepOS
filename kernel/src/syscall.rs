@@ -133,6 +133,19 @@ pub fn set_kernel_stack(top: u64) {
     unsafe { PERCPU.kernel_stack = top; }
 }
 
+/// Read/write the single shared `user_rsp` scratch slot (`gs:[8]`) —
+/// `syscall_entry`'s asm stashes the calling task's user-mode RSP here on
+/// entry and restores it from here on exit (`sysretq`). Exposed so
+/// `scheduler::block_on_irq()` can save/restore it around a context switch
+/// that happens *mid-syscall* — see that function's doc comment for the real
+/// cross-task corruption bug this closes (the same shape as the `swapgs`
+/// fix right above it: this slot is per-CPU, not per-task, so a second
+/// task's syscall entry overwrites it while the first task is still
+/// "mid-syscall" but blocked, corrupting the first task's RSP once it
+/// resumes and its own `sysretq` restores the wrong value).
+pub fn get_user_rsp() -> u64 { unsafe { PERCPU.user_rsp } }
+pub fn set_user_rsp(v: u64) { unsafe { PERCPU.user_rsp = v; } }
+
 // ── MSR helpers ───────────────────────────────────────────────────────────────
 
 unsafe fn wrmsr(msr: u32, val: u64) {

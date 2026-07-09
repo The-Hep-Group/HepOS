@@ -19,8 +19,24 @@
 //! mapping (arrows, F-keys, etc.) instead of duplicating any of it. The rest
 //! of the OS (terminal, editor, ...) needs zero changes to accept USB
 //! keyboard input alongside PS/2.
+//!
+//! **Fourth driver migrated to userspace**, reusing RTL8139's async
+//! fire-and-forget pattern (not AHCI's synchronous request/response one):
+//! the one-time bring-up above (HC reset, port power/reset, and the
+//! Enable-Slot/Address-Device/Configure-Endpoint command sequence for each
+//! HID device) stays in the kernel — it needs `pmm`/PCI access no ring-3
+//! process has, and every step there is a synchronous command/wait-for-
+//! completion exchange only ever run once per device at boot. The *ongoing*
+//! work — draining the event ring for completed HID interrupt-IN transfers
+//! and re-queuing the next one — now runs in a persistent userspace
+//! process, `userspace/xhcid`, which copies each raw 8-byte HID report into
+//! a small ring in a shared `Mailbox` page. The actual translation logic
+//! (`handle_mouse_report()`/`handle_kbd_report()` below) stays in the
+//! kernel completely unchanged, just driven by mailbox reports instead of
+//! direct hardware polling — `poll_mouse()` needed zero signature changes,
+//! so `main.rs`'s only caller needed zero changes either.
 
-use crate::{pmm, vmm, serial};
+use crate::{pmm, process, syscall, vmm, serial};
 use spin::Mutex;
 
 // ─── MMIO helpers ──────────────────────────────────────────────────────────────
@@ -287,30 +303,6 @@ impl Xhci {
         st.prev_keys = keys;
     }
 
-    pub fn poll(&mut self, fb_w: u32, fb_h: u32) {
-        unsafe {
-            while let Some(t) = self.dequeue() {
-                let ty = (t[3] >> 10) & 0x3F;
-                let cc = (t[2] >> 24) & 0xFF;
-                if ty != TRB_EV_XFER || (cc != CC_SUCCESS && cc != CC_SHORT) { continue; }
-                let slot = (t[3] >> 24) as u8;
-
-                if slot == self.mouse.slot {
-                    let buf = core::slice::from_raw_parts(self.mouse.hid_buf_v, 8);
-                    Self::handle_mouse_report(buf, fb_w, fb_h);
-                    core::ptr::write_bytes(self.mouse.hid_buf_v, 0, 8);
-                    self.queue_hid(0);
-                } else if let Some((ep, st)) = self.kbd.as_mut() {
-                    if slot == ep.slot {
-                        let buf = core::slice::from_raw_parts(ep.hid_buf_v, 8);
-                        Self::handle_kbd_report(buf, st);
-                        core::ptr::write_bytes(ep.hid_buf_v, 0, 8);
-                        self.queue_hid(1);
-                    }
-                }
-            }
-        }
-    }
 }
 
 /// USB HID modifier bit (0-7, matching the boot-report byte0 layout: LCtrl,
@@ -377,13 +369,132 @@ fn keycode_to_ps2(kc: u8) -> Option<(u8, bool)> {
     Some((sc, false))
 }
 
-pub static XHCI: Mutex<Option<Xhci>> = Mutex::new(None);
+// ── Post-bring-up: mailbox handoff to `xhcid` ─────────────────────────────────
+//
+// Everything above stays in the kernel (one-time, needs `pmm`/PCI access).
+// From here down, ongoing hardware polling moves to `userspace/xhcid`; the
+// kernel side only drains a small ring of raw HID reports and still owns
+// `handle_mouse_report()`/`handle_kbd_report()` — completely unchanged by
+// this migration, just called with mailbox-sourced bytes instead of bytes
+// read directly out of `hid_buf_v`.
 
-pub fn poll_mouse(fb_w: u32, fb_h: u32) {
-    if let Some(x) = XHCI.lock().as_mut() { x.poll(fb_w, fb_h); }
+/// One device's ring/slot info as handed to `xhcid` at launch — mirrors the
+/// subset of `HidEp` the driver process needs to keep polling and
+/// re-queuing transfers on its own, plus the ring-position state
+/// (`hid_i`/`hid_c`) the kernel already advanced by one queued transfer
+/// during bring-up (`queue_hid()` below), which `xhcid` must continue from
+/// rather than re-initializing to 0/1.
+#[repr(C)]
+struct DeviceInfo {
+    present:      u32,
+    slot:         u32,
+    hid_i:        u32,
+    hid_c:        u32,
+    hid_phys:     u64,
+    hid_buf_phys: u64,
 }
 
-/// Returns true if XHCI is initialized and ready.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Report {
+    kind: u32, // 0 = empty, 1 = mouse, 2 = keyboard
+    data: [u8; 8],
+}
+
+const REPORT_RING_N: usize = 32;
+
+/// Shared memory mailbox — one physical page, mapped into both the kernel
+/// (via `vmm::phys_to_virt`) and the `xhcid` userspace process (via
+/// `SYS_MMAP_MMIO`, using the physical address handed to it as its one
+/// launch argument). **Layout must stay byte-for-byte identical to the copy
+/// in `userspace/xhcid/src/main.rs`.**
+#[repr(C)]
+struct Mailbox {
+    bar_phys: u64,
+    evt_phys: u64,
+    cap_len:  u32,
+    db_off:   u32,
+    rt_off:   u32,
+    /// Event-ring consumer position the kernel's own bring-up (Enable
+    /// Slot/Address Device/Configure Endpoint command completions) already
+    /// advanced past — `xhcid` must continue from here, not reset to 0/1.
+    evt_i: u32,
+    evt_c: u32,
+    _pad0: u32,
+    mouse: DeviceInfo,
+    kbd:   DeviceInfo,
+    /// SPSC ring: `xhcid` writes a report then advances `head` (release);
+    /// the kernel reads at `tail` then advances `tail` once consumed. Same
+    /// convention as RTL8139's `rx_ready` handoff, just ring-shaped instead
+    /// of single-slot — a mouse/keyboard losing an in-flight report to a
+    /// races would be a real regression (dropped key edges), unlike a
+    /// dropped network packet.
+    head: u32,
+    tail: u32,
+    reports: [Report; REPORT_RING_N],
+}
+
+struct XhciHandle {
+    mailbox:     *mut Mailbox,
+    kbd_present: bool,
+    kbd_state:   KbdState,
+}
+unsafe impl Send for XhciHandle {}
+
+pub static XHCI: Mutex<Option<XhciHandle>> = Mutex::new(None);
+
+/// Mailbox physical address waiting to be handed to a freshly-spawned
+/// `xhcid` task, set by `init()` and consumed once by
+/// `spawn_pending_driver()` — same deferred-spawn pattern as every other
+/// driver migrated so far (`init()` runs too early, before the scheduler's
+/// idle/blink tasks are registered, for `scheduler::spawn()` to be safe to
+/// call directly).
+static PENDING_DRIVER_MAILBOX: Mutex<Option<u64>> = Mutex::new(None);
+
+/// Launches the queued `xhcid` driver process, if `init()` found a mouse (and
+/// optional keyboard) and queued one. Must be called only after the
+/// scheduler's idle/blink tasks are registered and the timer is running
+/// (i.e. from within `task_blink`'s own loop). A no-op on every call after
+/// the first (or if nothing was ever queued).
+pub fn spawn_pending_driver() {
+    let Some(mailbox_phys) = PENDING_DRIVER_MAILBOX.lock().take() else { return };
+    match process::exec_async_with_arg(usize::MAX, "<xhcid>", XHCID_ELF, mailbox_phys) {
+        Ok(()) => serial::print("xhci: xhcid launched\n"),
+        Err(_) => serial::print("xhci: xhcid launch failed\n"),
+    }
+}
+
+// Baked-in xhcid ELF (generated by build.rs from userspace/target/.../xhcid).
+// Empty slice if userspace hasn't been rebuilt since this driver was added.
+include!(concat!(env!("OUT_DIR"), "/xhcid_elf.rs"));
+
+/// Drain every raw HID report `xhcid` has queued since the last call and
+/// translate it via the same `handle_mouse_report()`/`handle_kbd_report()`
+/// logic the kernel always used, just fed from the mailbox instead of
+/// hardware. Same call site/signature as before this migration — `main.rs`
+/// needed zero changes.
+pub fn poll_mouse(fb_w: u32, fb_h: u32) {
+    let mut guard = XHCI.lock();
+    let Some(h) = guard.as_mut() else { return };
+    let mb = h.mailbox;
+    unsafe {
+        loop {
+            let head = core::ptr::read_volatile(&(*mb).head);
+            let tail = core::ptr::read_volatile(&(*mb).tail);
+            if head == tail { break; }
+            let idx = (tail as usize) % REPORT_RING_N;
+            let report = (*mb).reports[idx];
+            match report.kind {
+                1 => Xhci::handle_mouse_report(&report.data, fb_w, fb_h),
+                2 => Xhci::handle_kbd_report(&report.data, &mut h.kbd_state),
+                _ => {}
+            }
+            core::ptr::write_volatile(&mut (*mb).tail, tail.wrapping_add(1));
+        }
+    }
+}
+
+/// Returns true if XHCI is initialized and `xhcid` has been queued/launched.
 pub fn is_ready() -> bool { XHCI.lock().is_some() }
 
 /// Brings up one USB HID device already reset on `port` (1-based), returning
@@ -649,6 +760,58 @@ pub fn init(devices: &[crate::pci::PciDevice]) {
             }
         }
 
-        *XHCI.lock() = Some(x);
+        // Shared mailbox — the only thing the kernel and the `xhcid`
+        // userspace process both touch going forward. Its size (well under
+        // one page) fits a single `pmm::alloc_page()`, unlike AHCI's.
+        let Some(mailbox_phys) = pmm::alloc_page() else {
+            serial::print("xhci: mailbox OOM — mouse/keyboard will not work\n");
+            return;
+        };
+        let mailbox_virt = vmm::phys_to_virt(mailbox_phys) as *mut Mailbox;
+        core::ptr::write_bytes(mailbox_virt as *mut u8, 0, 4096);
+        (*mailbox_virt).bar_phys = bar_phys;
+        (*mailbox_virt).evt_phys = x.evt_p;
+        (*mailbox_virt).cap_len  = cap_len as u32;
+        (*mailbox_virt).db_off   = db_off as u32;
+        (*mailbox_virt).rt_off   = rt_off as u32;
+        (*mailbox_virt).evt_i    = x.evt_i as u32;
+        (*mailbox_virt).evt_c    = x.evt_c as u32;
+        (*mailbox_virt).mouse = DeviceInfo {
+            present: 1, slot: x.mouse.slot as u32,
+            hid_i: x.mouse.hid_i as u32, hid_c: x.mouse.hid_c as u32,
+            hid_phys: x.mouse.hid_p, hid_buf_phys: x.mouse.hid_buf_p,
+        };
+
+        syscall::grant_mmio_range(bar_phys, 65536);
+        syscall::grant_mmio_range(x.evt_p, 4096);
+        syscall::grant_mmio_range(x.mouse.hid_p, 4096);
+        syscall::grant_mmio_range(x.mouse.hid_buf_p, 4096);
+
+        let kbd_present = x.kbd.is_some();
+        let kbd_state = if let Some((ep, st)) = &x.kbd {
+            (*mailbox_virt).kbd = DeviceInfo {
+                present: 1, slot: ep.slot as u32,
+                hid_i: ep.hid_i as u32, hid_c: ep.hid_c as u32,
+                hid_phys: ep.hid_p, hid_buf_phys: ep.hid_buf_p,
+            };
+            syscall::grant_mmio_range(ep.hid_p, 4096);
+            syscall::grant_mmio_range(ep.hid_buf_p, 4096);
+            KbdState { prev_mods: st.prev_mods, prev_keys: st.prev_keys }
+        } else {
+            KbdState { prev_mods: 0, prev_keys: [0; 6] }
+        };
+        syscall::grant_mmio_range(mailbox_phys, 4096);
+
+        *XHCI.lock() = Some(XhciHandle { mailbox: mailbox_virt, kbd_present, kbd_state });
+
+        if XHCID_ELF.is_empty() {
+            serial::print("xhci: xhcid ELF not built (run `cargo build --release` in userspace/) — mouse/keyboard will not work\n");
+        } else {
+            // Don't spawn the driver task here — `init()` runs during early
+            // hardware bring-up, before `kmain` registers the scheduler's
+            // idle/blink tasks (see `spawn_pending_driver()`'s doc comment).
+            *PENDING_DRIVER_MAILBOX.lock() = Some(mailbox_phys);
+            serial::print("xhci: xhcid queued to launch once the scheduler is up\n");
+        }
     }
 }

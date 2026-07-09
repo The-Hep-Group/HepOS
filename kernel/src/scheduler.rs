@@ -299,6 +299,26 @@ pub fn sleep_ms(ms: u64) {
 /// where `context_switch()` returns, however much later that is) — from
 /// every *other* task's perspective, GS.base is always exactly what it
 /// should be for whatever they're doing.
+///
+/// **A second, closely-related bug the `swapgs` fix alone didn't cover:**
+/// `gs:[8]` (`PERCPU.user_rsp`) is a *single* per-CPU scratch slot, not
+/// per-task — `syscall_entry`'s asm stashes the calling task's user-mode
+/// RSP there on entry and restores it from there on `sysretq`. If this task
+/// blocks here mid-syscall and some *other* task's syscall entry runs
+/// before this one resumes (routine, once several drivers are all calling
+/// `SYS_WAIT_IRQ` every loop iteration), that other task's entry overwrites
+/// `gs:[8]` with *its own* user RSP. When this task is eventually resumed
+/// and its own `sysretq` fires, it restores whatever's *currently* sitting
+/// in `gs:[8]` — not the RSP this task actually had — silently corrupting
+/// its own ring-3 stack pointer (surfaced as a page fault at a seemingly
+/// arbitrary address near the top of the user stack region, once enough
+/// concurrent `SYS_WAIT_IRQ`-blocking drivers existed to make the race
+/// likely). Fixed the same way as the `swapgs` toggle above: save this
+/// task's own `gs:[8]` value to a local *before* yielding (nothing else can
+/// have touched it yet — it's still this task's own, freshly written by its
+/// own entry), then write it back immediately after resuming, before
+/// anything else gets a chance to read it via this task's own eventual
+/// `sysretq`.
 pub fn block_on_irq(vector: u8) {
     let switch = {
         let mut sched = SCHEDULER.lock();
@@ -310,6 +330,7 @@ pub fn block_on_irq(vector: u8) {
     };
     if let Some((old_rsp, new_rsp, new_cr3, new_kstack_top)) = switch {
         unsafe {
+            let saved_user_rsp = crate::syscall::get_user_rsp();
             core::arch::asm!("swapgs", options(nostack, nomem)); // → resting state before yielding the CPU
             use_kstack(new_kstack_top);
             write_cr3(new_cr3);
@@ -317,8 +338,11 @@ pub fn block_on_irq(vector: u8) {
             // Resumed here (possibly much later, on a different physical
             // moment entirely) — flip back to mid-syscall state so the
             // exit-side swapgs+sysretq waiting for us in syscall_entry
-            // still sees what it expects.
+            // still sees what it expects, and restore our own user_rsp in
+            // case some other task's syscall clobbered the shared slot
+            // while we were away.
             core::arch::asm!("swapgs", options(nostack, nomem));
+            crate::syscall::set_user_rsp(saved_user_rsp);
         }
     } else {
         let mut sched = SCHEDULER.lock();
