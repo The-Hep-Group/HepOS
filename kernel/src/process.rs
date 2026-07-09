@@ -5,18 +5,30 @@
 //! via SYSCALL; when it calls exit(N) the longjmp in `do_exit` returns
 //! control here and `run_elf` returns N.
 //!
-//! The APIC timer is left *unmasked* for the duration (this comment used to
-//! say the opposite — stale, left over from before the scheduler supported
-//! real preemption): the timer ISR can fire while ring 3 is running, and its
-//! usual `context_switch` can carry a ring-3 CPU state across the switch
-//! just like any other task's — `iretq` back into ring 3 on resume works
-//! the same way `iretq` back into ring 0 does. That's what `exec_async()`
-//! below relies on: it runs `run_elf()` as its own scheduler task instead of
-//! calling it inline from whichever task issued the command, so the rest of
-//! the desktop (`task_blink`) keeps running concurrently instead of freezing
-//! for the process's entire lifetime.
+//! The APIC timer is left *unmasked* for the duration: the timer ISR can
+//! fire while ring 3 is running, and its usual `context_switch` can carry a
+//! ring-3 CPU state across the switch just like any other task's — `iretq`
+//! back into ring 3 on resume works the same way `iretq` back into ring 0
+//! does. `exec_async()` below relies on this: it runs `run_elf()` as its own
+//! scheduler task instead of calling it inline from whichever task issued
+//! the command, so the rest of the desktop (`task_blink`) keeps running
+//! concurrently instead of freezing for the process's entire lifetime.
+//!
+//! ## Multi-process state
+//!
+//! Every piece of ring-3 bookkeeping that used to be a single global
+//! (`USER_RUNNING`, `KERNEL_RETURN_RSP`, `EXIT_CODE`, `MMIO_NEXT_VA`,
+//! `CURRENT_PID`, the captured-stdout buffer) — safe only because at most
+//! one process ever ran at a time — is now a per-task `ProcSlot`, indexed by
+//! `scheduler::current_task_index()`. Each `exec_async()` call gets its own
+//! scheduler task (see that fn's doc comment) with its own private page
+//! tables (`create_user_pml4()`), so several processes can genuinely be
+//! in-flight at once: one blocked in `SYS_WAIT_IRQ`, another mid-syscall,
+//! another just starting, without stepping on each other's state. The one
+//! piece of *machine* state this still requires care around is CR3 — see
+//! `scheduler::Task::cr3`'s doc comment for the other half of this fix.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use alloc::{string::String, vec::Vec};
 use spin::Mutex;
 use crate::{elf, paging, pmm, scheduler, vmm};
@@ -31,34 +43,74 @@ const USER_STACK_PAGES: u64 = 8;
 const USER_STACK_TOP:   u64 = 0x7FFF_F000;   // RSP starts here (top of the region)
 const USER_STACK_BASE:  u64 = USER_STACK_TOP - USER_STACK_PAGES * 4096;
 
-// ── MMIO-passthrough syscall support ──────────────────────────────────────────
-//
-// Foundational piece of PLAN.md's "move drivers to userspace" item: lets a
-// ring-3 process ask the kernel (via SYS_MMAP_MMIO) to map a physical MMIO
-// region into its own page tables, then poll it directly with no further
-// syscalls — the same shape a real userspace driver would use. Only one
-// process ever runs at a time (`run_elf` blocks until exit), so a single
-// global bump cursor is enough; it resets on every `exec()` since each run
-// gets a fresh PML4 anyway.
-//
-// Not yet scoped by permission (any process can map any physical address) —
-// fine for this proof-of-concept, but real driver isolation needs a
-// capability/allowlist check here before this is trusted with more than one
-// cooperating process.
 const USER_MMIO_BASE: u64 = 0x6000_0000;
-static MMIO_NEXT_VA: AtomicU64 = AtomicU64::new(USER_MMIO_BASE);
+
+// ── Per-task ring-3 process state ─────────────────────────────────────────────
+//
+// A fixed-size table indexed by `scheduler::current_task_index()` (the
+// bounded *array position* of the currently-running task, not its
+// ever-incrementing `id`) — one slot per concurrently-alive task capable of
+// hosting a ring-3 process. `MAX_TASKS` is a soft cap on how many tasks can
+// be alive *at once*, not how many ever run over a session (dead slots are
+// reused by `scheduler::spawn()`, so this doesn't grow with uptime) —
+// generous for this project's scale; `slot_index()` clamps rather than
+// panics if it's ever exceeded, trading a wrong-but-harmless slot collision
+// for never crashing the kernel over it.
+const MAX_TASKS: usize = 32;
+
+#[derive(Clone, Copy)]
+struct ProcSlot {
+    /// Saved kernel RSP from `enter_ring3`; `do_exit` restores it to return.
+    kernel_return_rsp: u64,
+    /// Written by `do_exit`, read by `run_elf` after it returns.
+    exit_code: u64,
+    /// Set while *this task's* user process is executing; `sys_exit` checks
+    /// the current task's copy of this before calling `do_exit`.
+    user_running: bool,
+    /// Bump allocator cursor for `SYS_MMAP_MMIO`, private per process since
+    /// each has its own low-half page tables — no cross-process collision
+    /// risk, so every process can safely start from the same base.
+    mmio_next_va: u64,
+    pid: u32,
+}
+
+impl ProcSlot {
+    const fn empty() -> Self {
+        Self { kernel_return_rsp: 0, exit_code: 0, user_running: false, mmio_next_va: 0, pid: 0 }
+    }
+}
+
+static mut PROC_SLOTS: [ProcSlot; MAX_TASKS] = [ProcSlot::empty(); MAX_TASKS];
+
+fn slot_index() -> usize {
+    scheduler::current_task_index().min(MAX_TASKS - 1)
+}
+
+fn slot() -> &'static mut ProcSlot {
+    unsafe { &mut PROC_SLOTS[slot_index()] }
+}
+
+/// PID of whichever process is running on the *calling* task right now (0 if
+/// none) — backs `SYS_GETPID`.
+pub fn current_pid() -> u32 { slot().pid }
+
+/// Whether the calling task currently has a ring-3 process running — backs
+/// `sys_exit`'s "is there actually anything to longjmp out of" check.
+pub fn is_user_running() -> bool { slot().user_running }
 
 /// Maps `len` bytes of physical MMIO space (rounded to page granularity) into
 /// the calling process's currently-loaded page tables. Returns the mapped
 /// user virtual address (with `phys`'s in-page offset preserved), or 0 if no
-/// process is running or the request is out of bounds.
+/// process is running on the calling task or the request is out of bounds.
 pub fn map_mmio_for_user(phys: u64, len: u64) -> u64 {
-    if unsafe { !USER_RUNNING } { return 0; }
+    let s = slot();
+    if !s.user_running { return 0; }
     if len == 0 || len > 16 * 1024 * 1024 { return 0; }
     let page_off  = phys & 0xFFF;
     let phys_base = phys & !0xFFF;
     let pages     = (page_off + len + 0xFFF) / 4096;
-    let virt_base = MMIO_NEXT_VA.fetch_add(pages * 4096, Ordering::Relaxed);
+    let virt_base = s.mmio_next_va;
+    s.mmio_next_va += pages * 4096;
     for i in 0..pages {
         paging::map_page_current_user(virt_base + i * 4096, phys_base + i * 4096,
             paging::WRITE | paging::NOCACHE);
@@ -137,19 +189,32 @@ static TEST_ELF: [u8; 183] = [
 
 // ── Process stdout capture buffer ─────────────────────────────────────────────
 //
-// sys_write appends bytes here (in addition to serial) while USER_RUNNING.
-// After exec() returns the caller drains and displays the buffer in the terminal.
-static PROC_OUT: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+// sys_write appends bytes here (in addition to serial) while the calling
+// task's process is running. Keyed by task index (same "sparse list of
+// (key, value)" pattern `HEPFS_NAVS`/`EXTRA_TERMINALS` already use elsewhere
+// in this codebase) rather than one shared buffer, so two processes running
+// concurrently on different tasks don't interleave each other's output.
+static PROC_OUT: Mutex<Vec<(usize, Vec<u8>)>> = Mutex::new(Vec::new());
 
-/// Append bytes to the process output capture buffer.
+/// Append bytes to the calling task's process output capture buffer.
 /// Called from syscall::sys_write while a process is running.
 pub fn proc_write(bytes: &[u8]) {
-    PROC_OUT.lock().extend_from_slice(bytes);
+    let idx = slot_index();
+    let mut out = PROC_OUT.lock();
+    match out.iter_mut().find(|(i, _)| *i == idx) {
+        Some((_, buf)) => buf.extend_from_slice(bytes),
+        None => out.push((idx, bytes.to_vec())),
+    }
 }
 
-/// Take and return all buffered process output, clearing the buffer.
+/// Take and return the calling task's buffered process output, clearing it.
 fn take_proc_output() -> Vec<u8> {
-    core::mem::take(&mut *PROC_OUT.lock())
+    let idx = slot_index();
+    let mut out = PROC_OUT.lock();
+    match out.iter().position(|(i, _)| *i == idx) {
+        Some(pos) => out.remove(pos).1,
+        None => Vec::new(),
+    }
 }
 
 // ── Process table ─────────────────────────────────────────────────────────────
@@ -169,21 +234,7 @@ const MAX_PROCS: usize = 32;
 static PROCTAB:  Mutex<Vec<ProcEntry>> = Mutex::new(Vec::new());
 static NEXT_PID: AtomicU32            = AtomicU32::new(1);
 
-/// PID of the currently-executing user process (0 = none).
-pub static CURRENT_PID: AtomicU32 = AtomicU32::new(0);
-
-// ── Process state ─────────────────────────────────────────────────────────────
-
-/// Set while a user process is executing; sys_exit checks this.
-pub static mut USER_RUNNING: bool = false;
-
-/// Saved kernel RSP from enter_ring3; do_exit restores it to return.
-static mut KERNEL_RETURN_RSP: u64 = 0;
-
-/// Exit code written by do_exit; read by run_elf after return.
-static mut EXIT_CODE: u64 = 0;
-
-// ── CR3 helpers ───────────────────────────────────────────────────────────────
+// ── Page table setup ──────────────────────────────────────────────────────────
 
 fn read_cr3() -> u64 {
     let v: u64;
@@ -194,8 +245,6 @@ fn read_cr3() -> u64 {
 unsafe fn write_cr3(phys: u64) {
     core::arch::asm!("mov cr3, {}", in(reg) phys, options(nostack, nomem));
 }
-
-// ── Page table setup ──────────────────────────────────────────────────────────
 
 /// Allocate a fresh PML4 with the kernel high-half entries copied in.
 fn create_user_pml4() -> u64 {
@@ -216,12 +265,16 @@ fn create_user_pml4() -> u64 {
 
 /// IRETQ into ring 3 at `entry` / `stack_top`.
 ///
-/// Saves callee-saved registers + RSP to KERNEL_RETURN_RSP so that
-/// `do_exit()` can restore them and "return" from this function.
+/// Saves callee-saved registers + RSP to `*krsp_ptr` — the calling task's own
+/// `ProcSlot::kernel_return_rsp` (computed by `run_elf`, a plain Rust
+/// function, and passed in as a third argument) rather than a single shared
+/// global, so `do_exit()` can restore them and "return" from this function
+/// even with multiple processes each mid-ring-3-excursion on different tasks.
 #[unsafe(naked)]
-unsafe extern "C" fn enter_ring3(entry: u64, stack_top: u64) {
-    // entry    → RDI (SysV arg 1)
+unsafe extern "C" fn enter_ring3(entry: u64, stack_top: u64, krsp_ptr: u64) {
+    // entry     → RDI (SysV arg 1)
     // stack_top → RSI (SysV arg 2)
+    // krsp_ptr  → RDX (SysV arg 3)
     core::arch::naked_asm!(
         // Save callee-saved registers.
         "push rbp",
@@ -230,9 +283,8 @@ unsafe extern "C" fn enter_ring3(entry: u64, stack_top: u64) {
         "push r13",
         "push r14",
         "push r15",
-        // Record kernel stack so do_exit can longjmp back.
-        "lea rax, [rip + {krsp}]",
-        "mov [rax], rsp",
+        // Record kernel stack (this task's own slot) so do_exit can longjmp back.
+        "mov [rdx], rsp",
         // Build IRETQ frame.  CPU pops: RIP, CS, RFLAGS, RSP, SS.
         "push 0x1b",    // SS  = USER_DS | RPL3
         "push rsi",     // RSP = stack_top (arg 2)
@@ -242,22 +294,25 @@ unsafe extern "C" fn enter_ring3(entry: u64, stack_top: u64) {
         "iretq",
         // do_exit longjmps here by restoring RSP to the saved value above,
         // then executing the pop sequence + ret.
-        krsp = sym KERNEL_RETURN_RSP,
     );
 }
 
 /// Called by sys_exit from inside a syscall handler.
-/// Restores the kernel frame left by enter_ring3 and returns from it.
+/// Restores the kernel frame left by enter_ring3 (for the *calling task's*
+/// process — see `ProcSlot`) and returns from it.
 ///
-/// SAFETY: must only be called while USER_RUNNING == true.
+/// SAFETY: must only be called while the calling task's `ProcSlot::user_running`
+/// is true.
 pub unsafe fn do_exit(code: u64) -> ! {
-    EXIT_CODE = code;
-    USER_RUNNING = false;
+    let s = slot();
+    s.exit_code = code;
+    s.user_running = false;
+    let krsp = s.kernel_return_rsp;
     core::arch::asm!(
         // syscall_entry did swapgs (GS=kernel, IA32_KERNEL_GS_BASE=user).
         // Undo it so next ring-3 entry starts with GS=user, KERNEL_GS_BASE=kernel.
         "swapgs",
-        "mov rsp, [{rsp}]",
+        "mov rsp, {krsp}",
         "pop r15",
         "pop r14",
         "pop r13",
@@ -265,7 +320,7 @@ pub unsafe fn do_exit(code: u64) -> ! {
         "pop rbx",
         "pop rbp",
         "ret",
-        rsp = sym KERNEL_RETURN_RSP,
+        krsp = in(reg) krsp,
         options(noreturn),
     );
 }
@@ -275,15 +330,15 @@ pub unsafe fn do_exit(code: u64) -> ! {
 /// Load and run an ELF64 binary, recording it in the process table, and
 /// block the calling task until it exits. Only ever called from
 /// `async_task_entry()` below now — a *task's own* execution blocking on
-/// this is fine and expected (that's exactly what frees up every other task,
-/// `task_blink` included, to keep running); nothing outside this module
-/// calls it directly anymore, see `exec_async()`.
+/// this is fine and expected (that's exactly what frees up every other task
+/// to keep running); nothing outside this module calls it directly, see
+/// `exec_async()`.
 fn exec_blocking(name: &str, data: &[u8]) -> Result<u64, &'static str> {
-    // Clear any stale output from a previous run.
-    PROC_OUT.lock().clear();
+    // Clear any stale output left over if this task's slot is being reused
+    // (see `PROC_OUT`'s doc comment).
+    let _ = take_proc_output();
 
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
-    CURRENT_PID.store(pid, Ordering::Relaxed);
 
     {
         let mut tab = PROCTAB.lock();
@@ -301,7 +356,7 @@ fn exec_blocking(name: &str, data: &[u8]) -> Result<u64, &'static str> {
         });
     }
 
-    let result = run_elf(data);
+    let result = run_elf(pid, data);
 
     {
         let mut tab = PROCTAB.lock();
@@ -311,7 +366,6 @@ fn exec_blocking(name: &str, data: &[u8]) -> Result<u64, &'static str> {
         }
     }
 
-    CURRENT_PID.store(0, Ordering::Relaxed);
     result
 }
 
@@ -323,10 +377,14 @@ pub fn for_each_proc(mut f: impl FnMut(u32, &str, bool, u64)) {
     }
 }
 
-/// Load an ELF64 binary from `data`, run it in a fresh user address space,
-/// and return its exit code.
-fn run_elf(data: &[u8]) -> Result<u64, &'static str> {
-    MMIO_NEXT_VA.store(USER_MMIO_BASE, Ordering::Relaxed);
+/// Load an ELF64 binary from `data`, run it in a fresh user address space
+/// (recording `pid` in this task's `ProcSlot` so `SYS_GETPID` sees it), and
+/// return its exit code.
+fn run_elf(pid: u32, data: &[u8]) -> Result<u64, &'static str> {
+    let idx = slot_index();
+    unsafe {
+        PROC_SLOTS[idx] = ProcSlot { pid, mmio_next_va: USER_MMIO_BASE, ..ProcSlot::empty() };
+    }
     let pml4 = create_user_pml4();
 
     let loaded = elf::load(data, pml4)?;
@@ -340,17 +398,21 @@ fn run_elf(data: &[u8]) -> Result<u64, &'static str> {
         stack_pages.push(p);
     }
 
-    // Switch to user PML4 and enter ring 3.
-    // Timer remains unmasked — the timer ISR saves the full interrupt frame and
-    // can preempt ring-3 via context_switch; iretq in the ISR resumes ring-3.
+    // Switch to user PML4 and enter ring 3. `set_current_cr3()` keeps this
+    // task's own scheduler entry in sync so a preemption mid-ring-3 (or
+    // mid-syscall, e.g. SYS_WAIT_IRQ blocking) restores the right address
+    // space on resume — see `scheduler::Task::cr3`'s doc comment.
     let orig_cr3 = read_cr3();
+    let krsp_ptr = unsafe { &mut PROC_SLOTS[idx].kernel_return_rsp as *mut u64 as u64 };
     unsafe {
         write_cr3(pml4);
-        USER_RUNNING = true;
-        enter_ring3(loaded.entry, USER_STACK_TOP);
+        scheduler::set_current_cr3(pml4);
+        PROC_SLOTS[idx].user_running = true;
+        enter_ring3(loaded.entry, USER_STACK_TOP, krsp_ptr);
         // Returns here after do_exit longjmp
     }
     unsafe { write_cr3(orig_cr3); }
+    scheduler::set_current_cr3(orig_cr3);
 
     // Free user memory
     for p in stack_pages { pmm::free_page(p); }
@@ -359,7 +421,7 @@ fn run_elf(data: &[u8]) -> Result<u64, &'static str> {
     // A full cleanup would walk the low-half of pml4.  Acceptable for now.
     pmm::free_page(pml4);
 
-    Ok(unsafe { EXIT_CODE })
+    Ok(unsafe { PROC_SLOTS[idx].exit_code })
 }
 
 // Baked-in hello ELF (generated by build.rs from userspace/target/.../hello).
@@ -376,62 +438,57 @@ include!(concat!(env!("OUT_DIR"), "/hwtest_elf.rs"));
 // which task_blink (the desktop loop) and kmain's own boot sequence aren't,
 // as ordinary function calls. Calling it inline from `task_blink` (as the
 // terminal commands used to) would freeze the entire desktop — mouse,
-// rendering, every other window — for as long as the ring-3 process runs,
-// since `task_blink`'s own call stack would be the one sitting inside
-// `enter_ring3` the whole time.
+// rendering, every other window — for as long as the ring-3 process runs.
 //
 // The fix: give the process its own scheduler task (`scheduler::spawn()`)
 // instead. `task_blink` keeps running concurrently, round-robining with it
-// via ordinary timer preemption — same mechanism that already lets it share
-// the CPU with `task_idle`, now just with a third participant whose "task
-// body" happens to include a ring 3 excursion. Same single-job-at-a-time
-// restriction `net.rs`'s async network commands (`start_ping`/`start_wget`)
-// already use, for the same reason: `exec_blocking()`'s process-global state
-// (`USER_RUNNING`, `MMIO_NEXT_VA`, `CURRENT_PID`) was never built to have two
-// processes in flight at once, and giving it that isn't in scope here.
+// via ordinary timer preemption. Multiple background processes can now run
+// truly concurrently (see this module's top doc comment on `ProcSlot`) —
+// there's no single-job-at-a-time guard anymore; `PENDING_QUEUE`/`DONE_QUEUE`
+// hold as many in-flight jobs as there are tasks to run them.
 struct AsyncJob { issuer: usize, name: String, data: Vec<u8> }
 
-/// Set by `exec_async()`, consumed once by `async_task_entry()` when its task
-/// first actually runs (which may be a tick or more later — `spawn()` only
-/// queues it `Ready`, it doesn't run synchronously).
-static PENDING: Mutex<Option<AsyncJob>> = Mutex::new(None);
+/// Jobs queued by `exec_async()`, each consumed by exactly one
+/// `async_task_entry()` invocation (its own freshly-spawned task) — which
+/// specific job a given task pops doesn't matter, since jobs are
+/// independent and each spawn corresponds to exactly one push.
+static PENDING_QUEUE: Mutex<Vec<AsyncJob>> = Mutex::new(Vec::new());
 
-/// True from `exec_async()` succeeding until the spawned task's exit-code
-/// message lands in `ASYNC_DONE` — the single-job-at-a-time guard.
-static ASYNC_BUSY: AtomicBool = AtomicBool::new(false);
+/// Finished jobs' `(issuer, result message)`, popped by `poll_async()` — one
+/// entry per completed job, same mailbox shape `net::poll()` uses, just a
+/// queue instead of a single slot now that more than one can finish between
+/// polls.
+static DONE_QUEUE: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
 
-/// `(issuer, result message)` — set once by `async_task_entry()` when the
-/// process exits, polled (and cleared) by `poll_async()`. Same
-/// `Option`-as-a-single-shot-mailbox shape `net::poll()` already uses, for
-/// the same reason: the caller (`main.rs`'s per-frame loop) needs to catch
-/// this exactly once, whichever frame it happens to land on.
-static ASYNC_DONE: Mutex<Option<(usize, String)>> = Mutex::new(None);
+/// Count of background jobs currently queued or running.
+static ACTIVE_JOBS: AtomicUsize = AtomicUsize::new(0);
 
-/// True while a background process is running (or queued to run) — the
-/// guard `exec_async()` checks so a second launch can't stomp on
-/// `exec_blocking()`'s single-process-at-a-time global state.
-pub fn job_in_progress() -> bool { ASYNC_BUSY.load(Ordering::Relaxed) }
+/// True while at least one background process is running (or queued to
+/// run). No longer a single-job guard — `exec_async()` doesn't refuse a
+/// second launch — just an informational count for callers (e.g. the
+/// boot-time self-test) that want to know "is anything going on".
+pub fn job_in_progress() -> bool { ACTIVE_JOBS.load(Ordering::Relaxed) > 0 }
 
 /// Launches `data` as a background process without blocking the caller —
 /// `issuer` is the terminal window id `poll_async()` should deliver the
 /// eventual "exited: N" (or error) message to, same convention
 /// `net::start_ping()`/`start_wget()` use. Returns immediately, before the
-/// process has necessarily even started running.
+/// process has necessarily even started running. Multiple calls can be
+/// in flight at once — each gets its own scheduler task and `ProcSlot`.
 pub fn exec_async(issuer: usize, name: &str, data: &[u8]) -> Result<(), &'static str> {
-    if job_in_progress() { return Err("a process is already running"); }
     if data.is_empty() { return Err("nothing to run"); }
-    ASYNC_BUSY.store(true, Ordering::Relaxed);
-    *PENDING.lock() = Some(AsyncJob { issuer, name: String::from(name), data: data.to_vec() });
+    ACTIVE_JOBS.fetch_add(1, Ordering::Relaxed);
+    PENDING_QUEUE.lock().push(AsyncJob { issuer, name: String::from(name), data: data.to_vec() });
     scheduler::spawn("user_proc", async_task_entry);
     Ok(())
 }
 
-/// The spawned task's entire body: run the queued job to completion, stash
+/// The spawned task's entire body: run one queued job to completion, stash
 /// the result for `poll_async()`, then exit. Never returns — `entry: fn()
 /// -> !` is all `scheduler::spawn()` accepts, so this can't capture
-/// anything; the job itself is threaded through the `PENDING` mailbox.
+/// anything; the job itself is threaded through the `PENDING_QUEUE` mailbox.
 fn async_task_entry() -> ! {
-    if let Some(AsyncJob { issuer, name, data }) = PENDING.lock().take() {
+    if let Some(AsyncJob { issuer, name, data }) = PENDING_QUEUE.lock().pop() {
         let result = exec_blocking(&name, &data);
         let output = take_proc_output();
         let msg = match result {
@@ -446,18 +503,20 @@ fn async_task_entry() -> ! {
             }
             Err(e) => alloc::format!("{}: {}", name, e),
         };
-        *ASYNC_DONE.lock() = Some((issuer, msg));
+        DONE_QUEUE.lock().push((issuer, msg));
     }
-    ASYNC_BUSY.store(false, Ordering::Relaxed);
+    ACTIVE_JOBS.fetch_sub(1, Ordering::Relaxed);
     scheduler::exit_current();
 }
 
-/// Advance the in-progress background process, if any finished since the
+/// Advance the in-progress background processes, if any finished since the
 /// last call. Call this once per main-loop frame, same as `net::poll()` —
-/// returns `Some((issuer, message))` exactly once, when the process exits;
-/// the caller prints `message` into the issuing terminal window.
+/// returns `Some((issuer, message))` for one finished job per call (call in
+/// a loop, or accept up to one delivered per frame, same as the existing
+/// call site does); the caller prints `message` into the issuing terminal
+/// window.
 pub fn poll_async() -> Option<(usize, String)> {
-    ASYNC_DONE.lock().take()
+    DONE_QUEUE.lock().pop()
 }
 
 /// Launch the embedded ELF test binary (prints "Hello from ring 3!") in the

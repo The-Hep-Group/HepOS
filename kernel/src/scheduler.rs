@@ -20,8 +20,27 @@ pub struct Task {
     /// promotes it back to `Ready`, so `wake_at` is set to `u64::MAX` here
     /// to keep it out of the ordinary sleep-expiry check entirely.
     pub waiting_irq: Option<u8>,
+    /// This task's own top-level page table (CR3 value). Every task used to
+    /// implicitly share one CR3 — safe only because at most one process
+    /// (with its own private low-half page tables) was ever "in flight" at
+    /// a time. Now that multiple ring-3 processes can run concurrently (see
+    /// `process.rs`), each task with its own address space needs its CR3
+    /// restored on every resume, same as its RSP already is. Ordinary tasks
+    /// (idle/blink/etc.) all default to the kernel's own root PML4, read
+    /// once at creation time, and never change it.
+    pub cr3:     u64,
     _stack:      Vec<u8>,       // keeps the stack allocation alive
     pub rsp:     u64,
+}
+
+fn read_cr3() -> u64 {
+    let v: u64;
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) v, options(nostack, nomem)); }
+    v
+}
+
+unsafe fn write_cr3(phys: u64) {
+    core::arch::asm!("mov cr3, {}", in(reg) phys, options(nostack, nomem));
 }
 
 impl Task {
@@ -55,7 +74,10 @@ impl Task {
             f.add(6).write(task_trampoline as *const () as u64); // ret addr
         }
 
-        Task { id, name, state: TaskState::Ready, wake_at: 0, waiting_irq: None, _stack: stack, rsp: rsp as u64 }
+        Task {
+            id, name, state: TaskState::Ready, wake_at: 0, waiting_irq: None,
+            cr3: read_cr3(), _stack: stack, rsp: rsp as u64,
+        }
     }
 }
 
@@ -73,7 +95,10 @@ impl Scheduler {
         self.tasks.push(task);
     }
 
-    /// Returns (old_rsp_ptr, new_rsp) without holding the lock during switch.
+    /// Returns (old_rsp_ptr, new_rsp, new_cr3) without holding the lock
+    /// during the switch — the caller must `write_cr3(new_cr3)` *before*
+    /// calling `context_switch()` (that part doesn't touch CR3 itself; see
+    /// each call site).
     ///
     /// The outgoing task (`self.current`) is only reset to `Ready` if it's
     /// still `Running` — i.e. this is an ordinary timer-driven preemption.
@@ -81,7 +106,7 @@ impl Scheduler {
     /// `Blocked`) on themselves *before* calling this, and that must survive
     /// the switch untouched — overwriting it back to `Ready` here would undo
     /// the exit/sleep the instant it took effect.
-    pub fn next(&mut self) -> Option<(*mut u64, u64)> {
+    pub fn next(&mut self) -> Option<(*mut u64, u64, u64)> {
         let n = self.tasks.len();
         if n < 2 { return None; }
 
@@ -112,9 +137,29 @@ impl Scheduler {
 
         let old_rsp = &mut self.tasks[self.current].rsp as *mut u64;
         let new_rsp = self.tasks[next].rsp;
+        let new_cr3 = self.tasks[next].cr3;
         self.current = next;
-        Some((old_rsp, new_rsp))
+        Some((old_rsp, new_rsp, new_cr3))
     }
+}
+
+/// Array index (into `Scheduler::tasks`, *not* the ever-incrementing `id`
+/// field) of whichever task is currently executing — the stable, bounded key
+/// `process.rs` uses to look up per-process state (see its `ProcSlot` table),
+/// since `id` grows without bound over a long session (every `spawn()` bumps
+/// it) while this is bounded by however many tasks are alive *right now*.
+pub fn current_task_index() -> usize {
+    SCHEDULER.lock().current
+}
+
+/// Update the *currently running* task's own CR3 — called by `process.rs`
+/// right after it changes CR3 itself (entering or leaving a process's
+/// address space), so a future preemption saves/restores the right value
+/// for this task instead of stale data left over from `Task::new()`.
+pub fn set_current_cr3(cr3: u64) {
+    let mut sched = SCHEDULER.lock();
+    let cur = sched.current;
+    sched.tasks[cur].cr3 = cr3;
 }
 
 pub static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::empty());
@@ -149,8 +194,8 @@ pub fn exit_current() -> ! {
         sched.tasks[cur].state = TaskState::Dead;
         sched.next()
     };
-    if let Some((old_rsp, new_rsp)) = switch {
-        unsafe { context_switch(old_rsp, new_rsp); }
+    if let Some((old_rsp, new_rsp, new_cr3)) = switch {
+        unsafe { write_cr3(new_cr3); context_switch(old_rsp, new_rsp); }
     }
     loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
 }
@@ -170,8 +215,8 @@ pub fn sleep_ms(ms: u64) {
         sched.tasks[cur].state = TaskState::Blocked;
         sched.next()
     };
-    if let Some((old_rsp, new_rsp)) = switch {
-        unsafe { context_switch(old_rsp, new_rsp); }
+    if let Some((old_rsp, new_rsp, new_cr3)) = switch {
+        unsafe { write_cr3(new_cr3); context_switch(old_rsp, new_rsp); }
     } else {
         // No other task to run — undo the Blocked state we tentatively set,
         // since nothing will ever call next() to promote us back to Ready.
@@ -199,8 +244,8 @@ pub fn block_on_irq(vector: u8) {
         sched.tasks[cur].state = TaskState::Blocked;
         sched.next()
     };
-    if let Some((old_rsp, new_rsp)) = switch {
-        unsafe { context_switch(old_rsp, new_rsp); }
+    if let Some((old_rsp, new_rsp, new_cr3)) = switch {
+        unsafe { write_cr3(new_cr3); context_switch(old_rsp, new_rsp); }
     } else {
         let mut sched = SCHEDULER.lock();
         let cur = sched.current;
@@ -235,9 +280,9 @@ pub fn tick() {
     wake_irq_waiters(crate::apic::timer_vector());
     // Acquire lock, compute switch, then DROP lock before context_switch.
     let switch = SCHEDULER.lock().next();
-    if let Some((old_rsp, new_rsp)) = switch {
+    if let Some((old_rsp, new_rsp, new_cr3)) = switch {
         // Lock is released here — safe to switch stacks.
-        unsafe { context_switch(old_rsp, new_rsp); }
+        unsafe { write_cr3(new_cr3); context_switch(old_rsp, new_rsp); }
     }
 }
 

@@ -10,7 +10,6 @@
 //!   60 = exit(code)           — spins/halts (no processes yet)
 
 use core::arch::asm;
-use core::sync::atomic::Ordering;
 use crate::{gdt, pmm, serial, vmm};
 
 // MSR addresses
@@ -234,7 +233,7 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a
     match num {
         SYS_WRITE      => sys_write(a1, a2, a3),
         SYS_EXIT       => sys_exit(a1),
-        SYS_GETPID     => crate::process::CURRENT_PID.load(Ordering::Relaxed) as u64,
+        SYS_GETPID     => crate::process::current_pid() as u64,
         SYS_MMAP_MMIO  => sys_mmap_mmio(a1, a2),
         SYS_PORT_IN    => sys_port_in(a1, a2),
         SYS_PORT_OUT   => sys_port_out(a1, a2, a3),
@@ -267,7 +266,7 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
 /// exit(code) — terminates the running user process (if any) via longjmp,
 /// otherwise returns -ENOSYS.
 fn sys_exit(code: u64) -> u64 {
-    if unsafe { crate::process::USER_RUNNING } {
+    if crate::process::is_user_running() {
         unsafe { crate::process::do_exit(code) }
         // do_exit is -> !, so this branch never reaches here; Rust knows it.
     } else {
