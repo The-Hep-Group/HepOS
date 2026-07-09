@@ -795,6 +795,8 @@ fn task_blink() -> ! {
         rtl8139::spawn_pending_driver();
         // Same one-shot deferred-spawn pattern, for the HDA audio driver.
         hda::spawn_pending_driver();
+        // Same one-shot deferred-spawn pattern, for the AHCI/SATA driver.
+        ahci::spawn_pending_driver();
 
         ps2::poll();
         mouse::poll();

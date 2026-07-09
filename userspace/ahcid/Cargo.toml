@@ -1,0 +1,12 @@
+[package]
+name = "ahcid"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ahcid"
+path = "src/main.rs"
+
+[dependencies]
+hepos-rt  = { path = "../hepos-rt" }
+hepos-std = { path = "../hepos-std" }

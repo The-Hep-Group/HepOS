@@ -58,4 +58,17 @@ fn main() {
     } else {
         std::fs::write(&gen_hdad, "static HDAD_ELF: &[u8] = &[];\n").unwrap();
     }
+
+    // Bake the userspace ahcid ELF (the persistent AHCI/SATA driver process —
+    // see ahci.rs) the same way.
+    let ahcid     = root.join("userspace/target/x86_64-unknown-none/release/ahcid");
+    let gen_ahcid = std::path::Path::new(&out_dir).join("ahcid_elf.rs");
+    if ahcid.exists() {
+        let bytes = std::fs::read(&ahcid).expect("read ahcid ELF");
+        let lit: String = bytes.iter().map(|b| format!("{},", b)).collect();
+        std::fs::write(&gen_ahcid, format!("static AHCID_ELF: &[u8] = &[{}];\n", lit)).unwrap();
+        println!("cargo:rerun-if-changed={}", ahcid.display());
+    } else {
+        std::fs::write(&gen_ahcid, "static AHCID_ELF: &[u8] = &[];\n").unwrap();
+    }
 }
