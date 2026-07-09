@@ -73,6 +73,10 @@ struct Mailbox {
     head: u32,
     tail: u32,
     reports: [Report; REPORT_RING_N],
+    /// 0 = keep running, 1 = kernel wants this process to exit (`service
+    /// stop`/`kill`). Checked once per loop iteration; see xhci.rs's kernel
+    /// side (`stop_service()`) for why this is cooperative, not a forced kill.
+    stop: u32,
 }
 
 unsafe fn w64(b: *mut u8, o: usize, v: u64) { (b.add(o) as *mut u64).write_volatile(v) }
@@ -194,6 +198,11 @@ pub unsafe extern "C" fn _start(mailbox_phys: u64) -> ! {
     println!("xhcid: ready (mouse slot {}, kbd {})", mouse.slot, kbd.is_some());
 
     loop {
+        if core::ptr::read_volatile(&(*mb).stop) != 0 {
+            println!("xhcid: stop requested, exiting");
+            hepos_rt::sys_exit(0);
+        }
+
         while let Some(t) = dequeue(evt_v, evt_p, rt, &mut evt_i, &mut evt_c) {
             let ty = (t[3] >> 10) & 0x3F;
             let cc = (t[2] >> 24) & 0xFF;

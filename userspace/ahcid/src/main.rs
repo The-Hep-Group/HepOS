@@ -92,6 +92,10 @@ struct Mailbox {
     count:       u32,
     _pad0:       u32,
     data:        [u8; 4096],
+    /// 0 = keep running, 1 = kernel wants this process to exit (`service
+    /// stop`/`kill`). Checked once per loop iteration; see ahci.rs's kernel
+    /// side (`stop_service()`) for why this is cooperative, not a forced kill.
+    stop:        u32,
 }
 
 fn r32(base: *mut u8, off: usize) -> u32 {
@@ -191,6 +195,11 @@ pub unsafe extern "C" fn _start(mailbox_phys: u64) -> ! {
     println!("ahcid: ready (port_base {:#x})", port_base);
 
     loop {
+        if core::ptr::read_volatile(&mb.stop) != 0 {
+            println!("ahcid: stop requested, exiting");
+            hepos_rt::sys_exit(0);
+        }
+
         let op = core::ptr::read_volatile(&mb.op);
         if op != 0 {
             let lba   = core::ptr::read_volatile(&mb.lba);

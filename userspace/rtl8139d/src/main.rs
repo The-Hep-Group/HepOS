@@ -46,6 +46,11 @@ struct Mailbox {
     rx_ready: u32,
     rx_len:   u32,
     rx_buf:   [u8; 1600],
+    /// 0 = keep running, 1 = kernel wants this process to exit (`service
+    /// stop`/`kill`). Checked once per loop iteration; see rtl8139.rs's
+    /// kernel side (`stop_service()`) for why this is cooperative, not a
+    /// forced kill.
+    stop: u32,
 }
 
 const RX_BUF_LEN: usize = 65536 + 16;
@@ -78,6 +83,11 @@ pub unsafe extern "C" fn _start(mailbox_phys: u64) -> ! {
     let mut rx_off  = 0usize;
 
     loop {
+        if core::ptr::read_volatile(&mb.stop) != 0 {
+            println!("rtl8139d: stop requested, exiting");
+            hepos_rt::sys_exit(0);
+        }
+
         // ── TX: kernel queued a packet — send it for real ──────────────────
         let tx_len = core::ptr::read_volatile(&mb.tx_len) as usize;
         if tx_len != 0 {

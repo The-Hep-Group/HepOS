@@ -30,7 +30,116 @@ const COMMAND_NAMES: &[&str] = &[
     "history", "lspci", "netdiag", "netstart", "netpoll", "ifconfig",
     "ping", "wget", "udp", "view", "play", "shutdown", "reboot", "echo",
     "sysinfo", "syscallinfo", "runtest", "runhello", "runhwtest", "exec", "ps", "newterm", "beep", "volume", "sata",
+    "service", "kill",
 ];
+
+// ── Service management (`service`/`kill` commands) ───────────────────────────
+//
+// A lightweight, systemd-flavored front end over the 4 userspace driver
+// modules' own `is_enabled()`/`set_enabled()`/`is_running()`/
+// `start_service()`/`stop_service()` functions (see e.g. `rtl8139.rs`'s
+// comments for why `stop` is a cooperative mailbox flag, not a true forced
+// kill — this scheduler has no safe way to preempt an arbitrary task from
+// outside its own context). `enable`/`disable` are in-memory only for this
+// session (don't persist across a reboot) and only govern whether a
+// *future* `start` is allowed to succeed — matching real `systemctl`
+// semantics for the flag's meaning, just not its durability.
+const SERVICE_TABLE: &[(&str, &str)] = &[
+    ("rtl8139d", "RTL8139 NIC driver"),
+    ("hdad",     "Intel HDA audio driver"),
+    ("ahcid",    "AHCI/SATA disk driver"),
+    ("xhcid",    "XHCI USB HID (mouse/keyboard) driver"),
+];
+
+#[derive(Clone, Copy)]
+enum ServiceAction { Start, Stop, Enable, Disable, Status }
+
+impl ServiceAction {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "start"   => Some(Self::Start),
+            "stop"    => Some(Self::Stop),
+            "enable"  => Some(Self::Enable),
+            "disable" => Some(Self::Disable),
+            "status"  => Some(Self::Status),
+            _ => None,
+        }
+    }
+}
+
+fn service_is_enabled(name: &str) -> bool {
+    match name {
+        "rtl8139d" => crate::rtl8139::is_enabled(),
+        "hdad"     => crate::hda::is_enabled(),
+        "ahcid"    => crate::ahci::is_enabled(),
+        "xhcid"    => crate::xhci::is_enabled(),
+        _ => false,
+    }
+}
+
+fn service_is_running(name: &str) -> bool {
+    match name {
+        "rtl8139d" => crate::rtl8139::is_running(),
+        "hdad"     => crate::hda::is_running(),
+        "ahcid"    => crate::ahci::is_running(),
+        "xhcid"    => crate::xhci::is_running(),
+        _ => false,
+    }
+}
+
+/// Dispatch one `service` action (or `kill`'s implicit `Stop`) to the named
+/// driver module. Returns a human-readable success message, or an error
+/// string on failure (unknown name, already in that state, disabled, or a
+/// stop that timed out waiting for the driver to notice).
+fn service_dispatch(name: &str, action: ServiceAction) -> Result<String, String> {
+    if !SERVICE_TABLE.iter().any(|(n, _)| *n == name) {
+        return Err(alloc::format!(
+            "unknown service '{}' (known: {})", name,
+            SERVICE_TABLE.iter().map(|(n, _)| *n).collect::<alloc::vec::Vec<_>>().join(", ")));
+    }
+    match action {
+        ServiceAction::Status => {
+            return Ok(alloc::format!(
+                "{}: enabled={} running={}", name, service_is_enabled(name), service_is_running(name)));
+        }
+        ServiceAction::Enable => {
+            match name {
+                "rtl8139d" => crate::rtl8139::set_enabled(true),
+                "hdad"     => crate::hda::set_enabled(true),
+                "ahcid"    => crate::ahci::set_enabled(true),
+                "xhcid"    => crate::xhci::set_enabled(true),
+                _ => unreachable!(),
+            }
+            return Ok(alloc::format!("{} enabled", name));
+        }
+        ServiceAction::Disable => {
+            match name {
+                "rtl8139d" => crate::rtl8139::set_enabled(false),
+                "hdad"     => crate::hda::set_enabled(false),
+                "ahcid"    => crate::ahci::set_enabled(false),
+                "xhcid"    => crate::xhci::set_enabled(false),
+                _ => unreachable!(),
+            }
+            return Ok(alloc::format!("{} disabled (won't affect an already-running instance)", name));
+        }
+        ServiceAction::Start | ServiceAction::Stop => {}
+    }
+    let result = match (name, action) {
+        ("rtl8139d", ServiceAction::Start) => crate::rtl8139::start_service(),
+        ("rtl8139d", ServiceAction::Stop)  => crate::rtl8139::stop_service(),
+        ("hdad",     ServiceAction::Start) => crate::hda::start_service(),
+        ("hdad",     ServiceAction::Stop)  => crate::hda::stop_service(),
+        ("ahcid",    ServiceAction::Start) => crate::ahci::start_service(),
+        ("ahcid",    ServiceAction::Stop)  => crate::ahci::stop_service(),
+        ("xhcid",    ServiceAction::Start) => crate::xhci::start_service(),
+        ("xhcid",    ServiceAction::Stop)  => crate::xhci::stop_service(),
+        _ => unreachable!(),
+    };
+    match result {
+        Ok(()) => Ok(alloc::format!("{} {}", name, if matches!(action, ServiceAction::Start) { "started" } else { "stopped" })),
+        Err(e) => Err(alloc::string::String::from(e)),
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Cell {
@@ -567,6 +676,9 @@ impl Terminal {
                     ("udp <host>:<port> <msg>","send a UDP datagram, print any reply (3s timeout)"),
                     ("view <file.bmp>", "open an uncompressed BMP in the image viewer"),
                     ("play <file.wav>", "play a 16-bit PCM WAV (48kHz, mono/stereo) via HDA"),
+                    ("ps",             "list processes"),
+                    ("service <list|status|start|stop|enable|disable> [name]", "manage driver services (rtl8139d/hdad/ahcid/xhcid)"),
+                    ("kill <pid>",     "stop a running driver service by pid"),
                 ];
                 for (name, desc) in &cmds {
                     self.print_colored("  ", DIM);
@@ -996,6 +1108,51 @@ impl Terminal {
                     self.print(&alloc::format!("  {:>3}  {}  {}\n", pid, state, name));
                 });
                 if !any { self.print("  (no processes)\n"); }
+            }
+
+            "service" => {
+                let sub = arg1;
+                let name = arg2;
+                if sub.is_empty() {
+                    self.print_colored("usage: service <list|status|start|stop|enable|disable> [name]\n", ERR);
+                } else if sub == "list" {
+                    self.print("  NAME       ENABLED  RUNNING\n");
+                    self.print("  ---------  -------  -------\n");
+                    for (svc, _) in SERVICE_TABLE {
+                        self.print(&alloc::format!(
+                            "  {:<9}  {:<7}  {}\n", svc,
+                            if service_is_enabled(svc) { "yes" } else { "no" },
+                            if service_is_running(svc) { "yes" } else { "no" }));
+                    }
+                } else if let Some(action) = ServiceAction::parse(sub) {
+                    match service_dispatch(name, action) {
+                        Ok(msg) => self.print_colored(&alloc::format!("{}\n", msg), OK),
+                        Err(msg) => self.print_colored(&alloc::format!("service: {}\n", msg), ERR),
+                    }
+                } else {
+                    self.print_colored(&alloc::format!("service: unknown subcommand '{}'\n", sub), ERR);
+                }
+            }
+
+            "kill" => {
+                if arg1.is_empty() {
+                    self.print_colored("usage: kill <pid>\n", ERR);
+                } else {
+                    match arg1.parse::<u32>() {
+                        Err(_) => self.print_colored("kill: invalid pid\n", ERR),
+                        Ok(pid) => match crate::process::name_for_running_pid(pid) {
+                            None => self.print_colored(&alloc::format!("kill: no running process with pid {}\n", pid), ERR),
+                            Some(name) => {
+                                let bare = name.trim_start_matches('<').trim_end_matches('>');
+                                match service_dispatch(bare, ServiceAction::Stop) {
+                                    Ok(_) => self.print_colored(&alloc::format!("killed {} (pid {})\n", name, pid), OK),
+                                    Err(_) => self.print_colored(
+                                        &alloc::format!("kill: {} isn't a background service and can't be force-killed (no safe forced-termination primitive in this scheduler — see PLAN.md)\n", name), ERR),
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             "newterm" => {

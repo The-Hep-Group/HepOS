@@ -389,6 +389,34 @@ pub fn for_each_proc(mut f: impl FnMut(u32, &str, bool, u64)) {
     }
 }
 
+/// True if any process named `name` currently has `ProcState::Running`.
+/// Backs the `service`/`kill` terminal commands' status checks — a driver
+/// process's name (`<rtl8139d>` etc.) is always the same literal across
+/// stop/start cycles, so this is enough to answer "is it running right now"
+/// without the service layer needing to separately track a PID.
+pub fn is_process_running(name: &str) -> bool {
+    let mut found = false;
+    for_each_proc(|_, n, running, _| { if running && n == name { found = true; } });
+    found
+}
+
+/// The PID of the (at most one, by convention) currently-running process
+/// named `name`, if any. Used by `kill <pid>` to map a PID back to a
+/// service name.
+pub fn pid_for_name(name: &str) -> Option<u32> {
+    let mut found = None;
+    for_each_proc(|pid, n, running, _| { if running && n == name { found = Some(pid); } });
+    found
+}
+
+/// The name of the process currently holding `pid`, if it's still running.
+/// Used by `kill <pid>` to map a PID back to a service name.
+pub fn name_for_running_pid(pid: u32) -> Option<String> {
+    let mut found = None;
+    for_each_proc(|p, n, running, _| { if running && p == pid { found = Some(String::from(n)); } });
+    found
+}
+
 /// Load an ELF64 binary from `data`, run it in a fresh user address space
 /// (recording `pid` in this task's `ProcSlot` so `SYS_GETPID` sees it),
 /// handing it `arg` as its one launch argument (see `enter_ring3`'s doc

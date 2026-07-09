@@ -54,6 +54,10 @@ struct Mailbox {
     is_playing:  u32,
     elapsed_ms:  u32,
     total_ms:    u32,
+    /// 0 = keep running, 1 = kernel wants this process to exit (`service
+    /// stop`/`kill`). Checked once per loop iteration; see hda.rs's kernel
+    /// side (`stop_service()`) for why this is cooperative, not a forced kill.
+    stop: u32,
 }
 
 const PCM_MAX_BYTES: u64 = 1 << 20;
@@ -164,6 +168,20 @@ pub unsafe extern "C" fn _start(mailbox_phys: u64) -> ! {
     let mut drain_at: Option<u64> = None;
 
     loop {
+        if core::ptr::read_volatile(&mb.stop) != 0 {
+            // Properly halt the stream before exiting if a clip is still
+            // playing — otherwise the hardware would keep looping the DMA
+            // buffer with nobody left to ever stop it.
+            if core::ptr::read_volatile(&mb.is_playing) != 0 {
+                w32(mmio_va, sd_off + SD_CTL, ctl_base);               spin(50_000);
+                w32(mmio_va, sd_off + SD_CTL, ctl_base | SD_CTL_SRST); spin(50_000);
+                w32(mmio_va, sd_off + SD_CTL, ctl_base);               spin(50_000);
+                core::ptr::write_volatile(&mut mb.is_playing, 0);
+            }
+            println!("hdad: stop requested, exiting");
+            hepos_rt::sys_exit(0);
+        }
+
         // ── Volume: re-apply whenever the kernel changes it ────────────────
         let vol = core::ptr::read_volatile(&mb.volume);
         if vol != last_volume {

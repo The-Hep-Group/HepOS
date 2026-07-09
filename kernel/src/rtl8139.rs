@@ -83,11 +83,20 @@ struct Mailbox {
     rx_ready: u32,
     rx_len:   u32,
     rx_buf:   [u8; 1600],
+    /// 0 = keep running. Kernel writes 1 to request a cooperative shutdown
+    /// (`service stop rtl8139d` / `kill <pid>`); the driver checks this once
+    /// per loop iteration and calls `sys_exit(0)` if set. Cooperative rather
+    /// than a true forced kill because there's no safe way to preempt a
+    /// process that might currently be holding a kernel lock (e.g. mid
+    /// register I/O) from outside its own context in this scheduler — see
+    /// `stop_service()`'s doc comment.
+    stop: u32,
 }
 
 pub struct Rtl8139 {
     pub mac: [u8; 6],
     mailbox_virt: *mut Mailbox,
+    mailbox_phys: u64,
 }
 unsafe impl Send for Rtl8139 {}
 
@@ -143,6 +152,89 @@ pub fn spawn_pending_driver() {
         Ok(()) => crate::serial::print("rtl8139: rtl8139d launched\n"),
         Err(_) => crate::serial::print("rtl8139: rtl8139d launch failed\n"),
     }
+}
+
+// ── Service management (`service`/`kill` terminal commands) ──────────────────
+//
+// Whether a future `start_service()` call is allowed to actually launch the
+// driver — `service enable`/`disable` toggle this. In-memory only, doesn't
+// persist across a reboot (this session's scope): matches real `systemctl`
+// semantics for the flag's *meaning* (governs future starts, doesn't touch
+// an already-running instance), just not its durability.
+static ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+pub const SERVICE_NAME: &str = "<rtl8139d>";
+
+pub fn is_enabled() -> bool { ENABLED.load(core::sync::atomic::Ordering::Relaxed) }
+pub fn set_enabled(v: bool) { ENABLED.store(v, core::sync::atomic::Ordering::Relaxed); }
+pub fn is_running() -> bool { process::is_process_running(SERVICE_NAME) }
+
+/// Number of spin iterations to wait for `rtl8139d` to notice `stop` and
+/// exit. Generous for the same reason `ahci.rs`'s `MAILBOX_WAIT_SPINS` is —
+/// the driver only checks once per ~10ms timer tick.
+const STOP_WAIT_SPINS: u32 = 500_000_000;
+
+/// Request a cooperative shutdown of the running `rtl8139d` and wait for it
+/// to actually exit. Not a true forced kill: this scheduler has no safe way
+/// to preempt an arbitrary task from outside its own context (it might be
+/// holding `NIC`'s own lock, mid register I/O, etc. — see
+/// `scheduler::block_on_irq()`'s doc comments for the kinds of subtle bugs
+/// that already came from *less* invasive cross-task interactions). Instead
+/// this sets a flag the driver's own loop checks once per iteration and
+/// exits itself via `sys_exit(0)` — safe, since it only ever happens at a
+/// point the driver chose, never mid-operation.
+pub fn stop_service() -> Result<(), &'static str> {
+    if !is_running() { return Err("not running"); }
+    let mb = { let g = NIC.lock(); g.as_ref().map(|n| n.mailbox_virt) };
+    let Some(mb) = mb else { return Err("driver not initialized") };
+    unsafe { core::ptr::write_volatile(&mut (*mb).stop, 1); }
+    for _ in 0..STOP_WAIT_SPINS {
+        if !is_running() { return Ok(()); }
+        core::hint::spin_loop();
+    }
+    Err("timeout waiting for driver to stop")
+}
+
+/// Guards against two concurrent `start_service()` calls both slipping past
+/// the `is_running()` check below — necessary because `process::
+/// exec_async_with_arg()` only *queues* the launch; the spawned task needs
+/// its own scheduling turn before it actually registers in the process
+/// table, so `is_running()` can still read false for a little while after a
+/// successful `start_service()` call returns. A real bug this exact race
+/// caused during testing: two rapid `start_service()` calls (one checking
+/// "already running" *before* the first call's spawn had registered) both
+/// launched their own `rtl8139d` instance, leaving two running concurrently.
+static STARTING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Launch a fresh `rtl8139d` instance on the same already-initialized
+/// hardware/mailbox — the one-time PCI/DMA bring-up in `init()` never needs
+/// to be redone, only the ring-3 process itself. Blocks (bounded spin) until
+/// the new instance is actually confirmed running before returning `Ok`, so
+/// callers never see a false "success" for a launch that hasn't landed yet
+/// — see `STARTING`'s doc comment for the double-launch bug this closes.
+pub fn start_service() -> Result<(), &'static str> {
+    use core::sync::atomic::Ordering;
+    if !is_enabled() { return Err("disabled"); }
+    if is_running() { return Err("already running"); }
+    if STARTING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return Err("start already in progress");
+    }
+    let result = (|| {
+        let (mb, mailbox_phys) = {
+            let g = NIC.lock();
+            match g.as_ref() { Some(n) => (n.mailbox_virt, n.mailbox_phys), None => return Err("driver not initialized") }
+        };
+        if RTL8139D_ELF.is_empty() { return Err("rtl8139d ELF not built"); }
+        unsafe { core::ptr::write_volatile(&mut (*mb).stop, 0); }
+        process::exec_async_with_arg(usize::MAX, SERVICE_NAME, RTL8139D_ELF, mailbox_phys)?;
+        for _ in 0..STOP_WAIT_SPINS {
+            if is_running() { return Ok(()); }
+            core::hint::spin_loop();
+        }
+        Err("timeout waiting for driver to start")
+    })();
+    STARTING.store(false, Ordering::Release);
+    result
 }
 
 // Baked-in rtl8139d ELF (generated by build.rs from
@@ -273,7 +365,7 @@ pub fn init(devices: &[crate::pci::PciDevice]) {
 
         serial::print("rtl8139: ready\n");
 
-        *NIC.lock() = Some(Rtl8139 { mac, mailbox_virt });
+        *NIC.lock() = Some(Rtl8139 { mac, mailbox_virt, mailbox_phys });
         return;
     }
     serial::print("rtl8139: not found\n");
