@@ -1,9 +1,20 @@
 //! Intel High Definition Audio (HDA) driver.
 //!
 //! Detects the HDA controller (PCI class 0x04/0x03), maps its MMIO BAR,
-//! resets the controller, configures QEMU's hda-duplex codec via the
-//! Immediate Command interface, sets up a single output stream, and plays
-//! PCM audio.
+//! resets the controller, and hands off to a persistent userspace process
+//! (`userspace/hdad`) that configures QEMU's hda-duplex codec via the
+//! Immediate Command interface, sets up the single output stream, and plays
+//! PCM audio — HepOS's second real "driver moved to userspace" migration
+//! (PLAN.md's "move drivers to userspace libOS" item), following the exact
+//! pattern RTL8139's did: one-time hardware bring-up stays in the kernel
+//! (needs `pmm`/PCI access no ring-3 process has), the ongoing hot-path
+//! (here: codec verbs + DMA position tracking, there: TX/RX polling) moves
+//! to a persistent userspace process talking to the kernel through a shared
+//! `Mailbox` page. Every caller of this module's public API
+//! (`beep`/`play_pcm`/`poll`/`is_playing`/`progress_ms`/`set_volume`/
+//! `get_volume`/`is_available`) needed zero changes — same signatures,
+//! reimplemented underneath to write/read the mailbox instead of touching
+//! HDA MMIO directly.
 //!
 //! Public API:
 //!   `init(devs)`  — call once during boot; returns true if HDA found.
@@ -11,60 +22,13 @@
 //!                    a task; HDA DMA drives playback independently).
 
 use spin::Mutex;
-use crate::{paging, pci, pmm, serial, vmm};
+use crate::{paging, pci, pmm, process, serial, syscall, vmm};
 
 // ── HDA global controller registers (byte offsets from BAR0) ─────────────────
-const GCAP:     usize = 0x00; // u16 – Global Capabilities
+// Only needed here for the one-time kernel-side reset/codec-detection dance;
+// `userspace/hdad` has its own copy for the ongoing verb/stream-descriptor work.
 const GCTL:     usize = 0x08; // u32 – Global Control
-const STATESTS:  usize = 0x0E; // u16 – State Change Status (codec bitmask)
-const IC:       usize = 0x60; // u32 – Immediate Command
-const IR:       usize = 0x64; // u32 – Immediate Response
-const IRS:      usize = 0x68; // u16 – Immediate Response Status
-
-// ── Stream descriptor register offsets (relative to stream base) ─────────────
-const SD_CTL:  usize = 0x00;
-const SD_CBL:  usize = 0x08;
-const SD_LVI:  usize = 0x0C;
-const SD_FMT:  usize = 0x10;
-const SD_BDPL: usize = 0x18;
-const SD_BDPU: usize = 0x1C;
-
-const SD_CTL_SRST: u32 = 1 << 0;
-const SD_CTL_RUN:  u32 = 1 << 1;
-const SD_CTL_IOCE: u32 = 1 << 2;
-
-#[repr(C)]
-struct BdlEntry { addr: u64, len: u32, ioc: u32 }
-
-// ── Driver state ──────────────────────────────────────────────────────────────
-struct Hda {
-    mmio:   *mut u8,
-    sd_off: usize,
-}
-unsafe impl Send for Hda {}
-
-static HDA: Mutex<Option<Hda>> = Mutex::new(None);
-
-pub fn is_available() -> bool { HDA.lock().is_some() }
-
-// ── MMIO helpers ──────────────────────────────────────────────────────────────
-
-#[inline(always)]
-fn r16(base: *mut u8, off: usize) -> u16 {
-    unsafe { (base.add(off) as *const u16).read_volatile() }
-}
-#[inline(always)]
-fn r32(base: *mut u8, off: usize) -> u32 {
-    unsafe { (base.add(off) as *const u32).read_volatile() }
-}
-#[inline(always)]
-fn w16(base: *mut u8, off: usize, v: u16) {
-    unsafe { (base.add(off) as *mut u16).write_volatile(v); }
-}
-#[inline(always)]
-fn w32(base: *mut u8, off: usize, v: u32) {
-    unsafe { (base.add(off) as *mut u32).write_volatile(v); }
-}
+const STATESTS: usize = 0x0E; // u16 – State Change Status (codec bitmask)
 
 fn spin(n: u32) {
     for _ in 0..n {
@@ -72,33 +36,26 @@ fn spin(n: u32) {
     }
 }
 
+#[inline(always)]
+fn r16(base: *mut u8, off: usize) -> u16 {
+    unsafe { (base.add(off) as *const u16).read_volatile() }
+}
+#[inline(always)]
+fn w32(base: *mut u8, off: usize, v: u32) {
+    unsafe { (base.add(off) as *mut u32).write_volatile(v); }
+}
+
 // ── TSC + PIT-calibrated timing ──────────────────────────────────────────────
 //
-// beep() must wait `duration_ms` without reading HDA MMIO (QEMU's HDA MMIO
-// emulation is extremely slow while DMA is active).  TICK_COUNT from the
-// scheduler is not usable because tasks run with IF=0 after the first
-// context-switch, so the APIC timer ISR never fires again.
-//
-// Solution: calibrate TSC against PIT timer 2 once at init time, then use
-// `rdtsc()` for all delays.  TSC advances regardless of IF flag.
-
+// `hdad` needs wall-time delays (its zero-buffer→drain→stop sequence, and
+// playback-position tracking) without relying on `scheduler::TICK_COUNT` or
+// any kernel state — TSC works the same in ring 3 as ring 0 (unrestricted,
+// CR4.TSD is never set anywhere in this kernel), so it reads it directly via
+// its own `rdtsc` (no syscall needed), the same way the kernel used to.
+// Calibrated once here (still needs PIT port I/O, ring-0 only) and handed to
+// the driver via the mailbox.
 pub static TSC_PER_MS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(1_000_000); // sane default (1 GHz TSC)
-
-#[inline(always)]
-pub fn rdtsc() -> u64 {
-    let lo: u32;
-    let hi: u32;
-    unsafe {
-        core::arch::asm!(
-            "rdtsc",
-            out("eax") lo,
-            out("edx") hi,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-    ((hi as u64) << 32) | lo as u64
-}
 
 #[inline(always)]
 fn pit_in(port: u16) -> u8 {
@@ -127,7 +84,6 @@ fn calibrate_tsc() {
 
     let t0 = rdtsc();
     // Poll OUT pin (bit 5 of port 0x61); bound the wait so we can't hang here.
-    // At the 1GHz TSC default, 100M iterations easily covers 50ms.
     for _ in 0..100_000_000u32 {
         if pit_in(0x61) & 0x20 != 0 { break; }
         core::hint::spin_loop();
@@ -136,7 +92,6 @@ fn calibrate_tsc() {
 
     pit_out(0x61, old61); // restore
 
-    // 10ms reference → divide by 10 for cycles/ms
     let elapsed = t1.wrapping_sub(t0);
     if elapsed > 0 {
         TSC_PER_MS.store(elapsed / 10, core::sync::atomic::Ordering::Relaxed);
@@ -144,104 +99,114 @@ fn calibrate_tsc() {
     }
 }
 
-// ── Immediate Command interface ───────────────────────────────────────────────
+#[inline(always)]
+pub fn rdtsc() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        core::arch::asm!(
+            "rdtsc",
+            out("eax") lo,
+            out("edx") hi,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    ((hi as u64) << 32) | lo as u64
+}
+
+// ── Shared memory mailbox ─────────────────────────────────────────────────────
 //
-// Sends one codec verb and returns the response word.
-// codec address (cad), node ID (nid), 20-bit verb payload (verb).
-fn send_verb(mmio: *mut u8, cad: u8, nid: u8, verb: u32) -> u32 {
-    let cmd = ((cad as u32) << 28) | ((nid as u32) << 20) | (verb & 0x000F_FFFF);
-
-    // Wait for ICB (bit 0) to clear — 1 000 iterations max (~10 µs).
-    // QEMU processes IC commands synchronously so this normally exits on iter 1.
-    for _ in 0..1_000u32 {
-        if r16(mmio, IRS) & 1 == 0 { break; }
-        spin(10);
-    }
-
-    w32(mmio, IC, cmd);
-    w16(mmio, IRS, 0x01); // set ICB to trigger command
-
-    // Wait for IRV (bit 1) — bounded to 1 000 iterations for the same reason.
-    for _ in 0..1_000u32 {
-        let irs = r16(mmio, IRS);
-        if irs & 2 != 0 {
-            w16(mmio, IRS, 0x02); // W1C: clear IRV
-            return r32(mmio, IR);
-        }
-        spin(10);
-    }
-    0 // timeout — codec not responding
+// One physical page, mapped into both the kernel (`vmm::phys_to_virt`) and
+// the `hdad` userspace process (`SYS_MMAP_MMIO`, using the physical address
+// handed to it as its one launch argument). **Layout must stay byte-for-byte
+// identical to the copy in `userspace/hdad/src/main.rs`** — no shared crate
+// between them to enforce that (userspace can't depend on kernel code).
+#[repr(C)]
+struct Mailbox {
+    mmio_phys:  u64,
+    buf_phys:   u64,
+    bdl_phys:   u64,
+    sd_off:     u32,
+    tsc_per_ms: u32,
+    /// Nonzero = "please play this many i16 words (stereo-interleaved) —
+    /// they're already sitting in the shared PCM buffer." Kernel sets it
+    /// after writing samples; the driver clears it back to 0 once it's
+    /// started the DMA stream.
+    play_request: u32,
+    /// Current volume (0-100) — kernel updates any time via `set_volume()`;
+    /// the driver re-sends the amp/gain verb whenever it notices a change
+    /// from its own last-applied value.
+    volume:      u32,
+    is_playing:  u32,
+    elapsed_ms:  u32,
+    total_ms:    u32,
 }
 
-// Helpers for the two verb encodings used by HDA:
-//   4-bit verb: opcode in bits[19:16], 16-bit data in bits[15:0]
-//   12-bit verb: opcode in bits[19:8],  8-bit data in bits[7:0]
-fn verb4(mmio: *mut u8, nid: u8, opcode: u32, data: u32) -> u32 {
-    send_verb(mmio, 0, nid, (opcode << 16) | (data & 0xFFFF))
+/// Max PCM buffer size (1 MB, matching the original in-kernel driver's cap —
+/// ~5.4s of 48kHz stereo audio) — pre-allocated once at `init()` and reused
+/// for every `beep()`/`play_pcm()` call, same "fixed reusable DMA buffer"
+/// approach RTL8139's TX slots use, rather than allocating fresh per call
+/// (which would need a fresh allowlist grant every time).
+const PCM_MAX_BYTES: usize = 1 << 20;
+const PCM_MAX_PAGES: usize = PCM_MAX_BYTES / 4096;
+
+struct Hda {
+    mailbox_virt: *mut Mailbox,
+    /// Kernel's own mapping of the shared PCM buffer — `beep()`/`play_pcm()`
+    /// write samples here directly (same physical page `hdad` separately
+    /// maps via `SYS_MMAP_MMIO` to feed the hardware).
+    buf_virt: *mut i16,
 }
-fn verb12(mmio: *mut u8, nid: u8, opcode: u32, data: u32) -> u32 {
-    send_verb(mmio, 0, nid, (opcode << 8) | (data & 0xFF))
-}
+unsafe impl Send for Hda {}
+
+static HDA: Mutex<Option<Hda>> = Mutex::new(None);
+
+pub fn is_available() -> bool { HDA.lock().is_some() }
 
 // ── Volume ────────────────────────────────────────────────────────────────────
-// 0-100, applied to the DAC output amplifier's 7-bit gain field (0-127).
-// Persists across clips since `configure_codec()` re-sends the gain/mute verb
-// on every beep()/play_pcm() call; `set_volume()` also re-sends it immediately
-// so a volume change takes effect on whatever's already playing.
 static VOLUME: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(100);
 
 pub fn get_volume() -> u8 {
     VOLUME.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// Set output volume (0-100, clamped) and apply it immediately if the codec
-/// is initialized — takes effect on whatever's currently playing, not just
-/// the next clip.
+/// Set output volume (0-100, clamped). Takes effect the moment `hdad` next
+/// notices the mailbox's `volume` field changed — within one of its
+/// ~10ms-rate-limited loop iterations, same as the old in-kernel driver's
+/// "immediately" was really "next time anything touches the codec".
 pub fn set_volume(vol: u8) {
     let vol = vol.min(100);
     VOLUME.store(vol, core::sync::atomic::Ordering::Relaxed);
     if let Some(hda) = HDA.lock().as_ref() {
-        send_amp_gain_mute_verb(hda.mmio, vol);
+        unsafe { core::ptr::write_volatile(&mut (*hda.mailbox_virt).volume, vol as u32); }
     }
 }
 
-fn send_amp_gain_mute_verb(mmio: *mut u8, vol: u8) {
-    let gain = (vol as u32 * 127) / 100;
-    // Unmute + gain on DAC output amplifier (both channels, output).
-    // payload: bit 7=right, bit 6=left, bit 4=output, bits[5:0]=gain
-    verb4(mmio, 2, 0x3, 0xD000 | gain);
-}
-
-// ── Codec configuration ───────────────────────────────────────────────────────
-//
-// QEMU hda-duplex codec topology (hard-coded):
-//   node 1 = AFG (Audio Function Group)
-//   node 2 = Output DAC (converter)
-//   node 3 = Input ADC
-//   node 4 = Output Pin
-//   node 5 = Input Pin
-//
-// stream_id: 1-indexed stream assigned to DAC (must match the SD stream number)
-// fmt: 16-bit HDA format word
-fn configure_codec(mmio: *mut u8, stream_id: u8, fmt: u16) {
-    // Power on function group and DAC
-    verb12(mmio, 1, 0x705, 0x00); // AFG: Set Power State D0
-    verb12(mmio, 2, 0x705, 0x00); // DAC: Set Power State D0
-    spin(5_000);                   // wait for D0 settle
-
-    // Set converter PCM format (48 kHz, 16-bit, stereo = 0x0011)
-    verb4(mmio, 2, 0x2, fmt as u32);
-
-    // Assign stream and channel (stream_id, channel 0)
-    verb12(mmio, 2, 0x706, (stream_id as u32) << 4);
-
-    send_amp_gain_mute_verb(mmio, get_volume());
-
-    // Enable output pin
-    verb12(mmio, 4, 0x707, 0x40); // Pin Widget Control: HP-Out enable
-}
-
 // ── Public init ───────────────────────────────────────────────────────────────
+
+/// Mailbox physical address waiting to be handed to a freshly-spawned
+/// `hdad` task, set by `init()` and consumed once by `spawn_pending_driver()`.
+/// Can't spawn directly from `init()` — that runs during early hardware
+/// bring-up, before `kmain` registers the scheduler's idle/blink tasks;
+/// `scheduler::spawn()` that early corrupts the "task 0 becomes kmain's own
+/// execution context" bootstrap trick (see `rtl8139.rs`'s identical fix,
+/// found the hard way there first).
+static PENDING_DRIVER_MAILBOX: Mutex<Option<u64>> = Mutex::new(None);
+
+/// Launches the queued `hdad` driver process, if `init()` found the
+/// hardware and queued one. Must be called only after the scheduler's
+/// idle/blink tasks are registered and the timer is running (i.e. from
+/// within `task_blink`'s own loop). A no-op on every call after the first.
+pub fn spawn_pending_driver() {
+    let Some(mailbox_phys) = PENDING_DRIVER_MAILBOX.lock().take() else { return };
+    match process::exec_async_with_arg(usize::MAX, "<hdad>", HDAD_ELF, mailbox_phys) {
+        Ok(()) => serial::print("HDA: hdad launched\n"),
+        Err(_) => serial::print("HDA: hdad launch failed\n"),
+    }
+}
+
+// Baked-in hdad ELF (generated by build.rs from userspace/target/.../hdad).
+include!(concat!(env!("OUT_DIR"), "/hdad_elf.rs"));
 
 pub fn init(devs: &[pci::PciDevice]) -> bool {
     // Calibrate TSC now, while interrupts are still off and before HDA DMA starts.
@@ -269,26 +234,25 @@ pub fn init(devs: &[pci::PciDevice]) -> bool {
         bar0 & !0xF
     };
 
-    // Map 16 KB of MMIO (covers all registers and up to 8 stream descriptors)
+    // Map 16 KB of MMIO — one-time kernel-side use, just for reset + codec
+    // detection below; `hdad` maps the same physical region separately for
+    // its own ongoing use.
     let mmio = paging::map_mmio(bar_phys, 16384);
     serial::print("HDA: MMIO mapped\n");
 
     // ── Controller reset ──────────────────────────────────────────────────────
-    // Clear CRST bit, wait until hardware confirms (GCTL.CRST=0)
     w32(mmio, GCTL, 0x00);
     for _ in 0..100_000u32 {
-        if r32(mmio, GCTL) & 1 == 0 { break; }
+        if r32_pub(mmio, GCTL) & 1 == 0 { break; }
         spin(10);
     }
-    // Set CRST to bring controller out of reset
     w32(mmio, GCTL, 0x01);
     for _ in 0..100_000u32 {
-        if r32(mmio, GCTL) & 1 != 0 { break; }
+        if r32_pub(mmio, GCTL) & 1 != 0 { break; }
         spin(10);
     }
     spin(50_000); // let codecs enumerate
 
-    // Check codec presence
     let statests = r16(mmio, STATESTS);
     if statests == 0 {
         serial::print("HDA: no codec detected\n");
@@ -296,29 +260,67 @@ pub fn init(devs: &[pci::PciDevice]) -> bool {
     }
     serial::print("HDA: codec detected\n");
 
-    let gcap   = r16(mmio, GCAP);
+    let gcap   = r16(mmio, 0x00);
     let iss    = ((gcap >> 8) & 0x0F) as usize;
     let sd_off = 0x80 + iss * 0x20; // first output stream descriptor
 
-    *HDA.lock() = Some(Hda { mmio, sd_off });
-    serial::print("HDA: init OK\n");
+    // Pre-allocate the reusable PCM buffer + BDL page + mailbox page.
+    let buf_phys = match pmm::alloc_contiguous(PCM_MAX_PAGES) {
+        Some(p) => p,
+        None => { serial::print("HDA: OOM for PCM buffer\n"); return false; }
+    };
+    unsafe { core::ptr::write_bytes(vmm::phys_to_virt(buf_phys), 0, PCM_MAX_BYTES); }
+    let buf_virt = vmm::phys_to_virt(buf_phys) as *mut i16;
+
+    let bdl_phys = match pmm::alloc_page() {
+        Some(p) => p,
+        None => { serial::print("HDA: OOM for BDL\n"); return false; }
+    };
+
+    let mailbox_phys = match pmm::alloc_page() {
+        Some(p) => p,
+        None => { serial::print("HDA: OOM for mailbox\n"); return false; }
+    };
+    let mailbox_virt = vmm::phys_to_virt(mailbox_phys) as *mut Mailbox;
+    unsafe {
+        core::ptr::write_bytes(mailbox_virt as *mut u8, 0, 4096);
+        (*mailbox_virt).mmio_phys  = bar_phys;
+        (*mailbox_virt).buf_phys   = buf_phys;
+        (*mailbox_virt).bdl_phys   = bdl_phys;
+        (*mailbox_virt).sd_off     = sd_off as u32;
+        (*mailbox_virt).tsc_per_ms = TSC_PER_MS.load(core::sync::atomic::Ordering::Relaxed) as u32;
+        (*mailbox_virt).volume     = VOLUME.load(core::sync::atomic::Ordering::Relaxed) as u32;
+    }
+
+    // Grant the runtime-discovered ranges hdad needs — no fixed compile-time
+    // allowlist entry could cover a PCI BAR or a pmm-allocated buffer's
+    // address. HDA is MMIO-only (no port I/O), so no port grant needed.
+    syscall::grant_mmio_range(bar_phys, 16384);
+    syscall::grant_mmio_range(buf_phys, PCM_MAX_PAGES as u64 * 4096);
+    syscall::grant_mmio_range(bdl_phys, 4096);
+    syscall::grant_mmio_range(mailbox_phys, 4096);
+
+    *PENDING_DRIVER_MAILBOX.lock() = Some(mailbox_phys);
+    *HDA.lock() = Some(Hda { mailbox_virt, buf_virt });
+    serial::print("HDA: init OK (hdad queued to launch once the scheduler is up)\n");
     true
+}
+
+/// Public-in-crate 32-bit MMIO read, reused by `init()`'s reset-wait loops
+/// above (the private `r32`/`w32`/`r16` pair below stays crate-private).
+fn r32_pub(base: *mut u8, off: usize) -> u32 {
+    unsafe { (base.add(off) as *const u32).read_volatile() }
 }
 
 // ── Beep ──────────────────────────────────────────────────────────────────────
 
 /// Play a square-wave beep at `freq_hz` for `duration_ms` milliseconds.
-///
-/// Non-blocking — generates the tone into a buffer and hands it to
-/// `play_pcm()`, which starts the DMA stream and returns immediately;
-/// `poll()` (called once per frame from the main loop) advances the
-/// zero-buffer → drain → stop sequence in the background. `beep` used to
-/// spin-wait for the whole tone + a 200ms drain, freezing the entire desktop
-/// for the command's duration — see PLAN.md Known Issues.
+/// Non-blocking — generates the tone into the shared PCM buffer and hands it
+/// to `play_pcm()`.
 pub fn beep(freq_hz: u32, duration_ms: u32) {
     let sample_rate: u32 = 48_000;
     let total_samples = ((sample_rate * duration_ms) / 1_000) as usize;
-    let n = total_samples.min((1usize << 20) / 4); // cap to play_pcm's 1MB buffer
+    let n = total_samples.min(PCM_MAX_BYTES / 4); // cap to the shared buffer
 
     let mut samples = alloc::vec![0i16; n * 2];
     let period_samp = if freq_hz > 0 { sample_rate / freq_hz } else { 0 };
@@ -334,154 +336,60 @@ pub fn beep(freq_hz: u32, duration_ms: u32) {
     play_pcm(&samples);
 }
 
-// ── Async PCM playback ────────────────────────────────────────────────────────
-//
-// Unlike beep() (which blocks the calling command for its whole duration —
-// fine for a short UI-feedback tone), play_pcm() starts the DMA stream and
-// returns immediately. poll() (called once per frame from the main render
-// loop) advances a small state machine that zeroes the buffer once the clip
-// finishes, waits for SDL to drain, then stops the stream — the same
-// validated stop sequence beep() uses, just spread across frames instead of
-// spin-waited in one call. This lets the Audio Player window show a live
-// "Playing... Xs / Ys" indicator instead of only the result after the fact.
-
-struct ActivePlayback {
-    mmio:      *mut u8,
-    sd_off:    usize,
-    buf_virt:  *mut i16,
-    buf_bytes: usize,
-    buf_phys:  u64,
-    buf_pages: usize,
-    bdl_phys:  u64,
-    ctl_base:  u32,
-    start_at:  u64,          // TSC at playback start
-    stop_at:   u64,          // TSC when the clip finishes (start zeroing then)
-    drain_at:  Option<u64>,  // TSC when SDL should have drained (set once zeroed)
-}
-unsafe impl Send for ActivePlayback {}
-
-static ACTIVE: Mutex<Option<ActivePlayback>> = Mutex::new(None);
-
-pub fn is_playing() -> bool { ACTIVE.lock().is_some() }
-
-/// (elapsed_ms, total_ms) of the currently active clip, if any.
-pub fn progress_ms() -> Option<(u64, u64)> {
-    let guard = ACTIVE.lock();
-    let ap = guard.as_ref()?;
-    let tsc_per_ms = TSC_PER_MS.load(core::sync::atomic::Ordering::Relaxed).max(1);
-    let total_ms   = ap.stop_at.wrapping_sub(ap.start_at) / tsc_per_ms;
-    let elapsed_ms = rdtsc().wrapping_sub(ap.start_at) / tsc_per_ms;
-    Some((elapsed_ms.min(total_ms), total_ms))
-}
-
-/// Force any in-progress async playback to a clean, immediate stop. Briefly
-/// blocking (~200ms SDL drain) but only runs when something is actually
-/// playing — a no-op otherwise. Called before beep()/play_pcm() start a new
-/// clip, since the controller only has one output stream to share.
-fn stop_now() {
-    let ap = match ACTIVE.lock().take() { Some(a) => a, None => return };
-    unsafe { core::ptr::write_bytes(ap.buf_virt as *mut u8, 0, ap.buf_bytes); }
-    let tsc_per_ms = TSC_PER_MS.load(core::sync::atomic::Ordering::Relaxed);
-    let until = rdtsc().wrapping_add(tsc_per_ms.saturating_mul(200));
-    while rdtsc().wrapping_sub(until) > u64::MAX / 2 { core::hint::spin_loop(); }
-    w32(ap.mmio, ap.sd_off + SD_CTL, ap.ctl_base);               spin(50_000);
-    w32(ap.mmio, ap.sd_off + SD_CTL, ap.ctl_base | SD_CTL_SRST); spin(50_000);
-    w32(ap.mmio, ap.sd_off + SD_CTL, ap.ctl_base);               spin(50_000);
-    pmm::free_page(ap.bdl_phys);
-    for i in 0..ap.buf_pages as u64 { pmm::free_page(ap.buf_phys + i*4096); }
-}
-
-/// Advance the async-playback state machine. Call once per frame from the
-/// main render loop; a no-op when nothing is playing.
-pub fn poll() {
-    let now = rdtsc();
-    let tsc_per_ms = TSC_PER_MS.load(core::sync::atomic::Ordering::Relaxed);
-    let mut guard = ACTIVE.lock();
-    let Some(ap) = guard.as_mut() else { return };
-
-    match ap.drain_at {
-        None => {
-            if now.wrapping_sub(ap.stop_at) > u64::MAX / 2 { return; } // clip still playing
-            // Clip finished — zero the buffer in-place while the stream keeps
-            // running (same trick as beep(): QEMU's next ~21ms read delivers
-            // silence to SDL), then start the drain timer.
-            unsafe { core::ptr::write_bytes(ap.buf_virt as *mut u8, 0, ap.buf_bytes); }
-            ap.drain_at = Some(now.wrapping_add(tsc_per_ms.saturating_mul(200)));
-        }
-        Some(drain_at) => {
-            if now.wrapping_sub(drain_at) > u64::MAX / 2 { return; } // still draining
-            w32(ap.mmio, ap.sd_off + SD_CTL, ap.ctl_base);               spin(50_000);
-            w32(ap.mmio, ap.sd_off + SD_CTL, ap.ctl_base | SD_CTL_SRST); spin(50_000);
-            w32(ap.mmio, ap.sd_off + SD_CTL, ap.ctl_base);               spin(50_000);
-            pmm::free_page(ap.bdl_phys);
-            for i in 0..ap.buf_pages as u64 { pmm::free_page(ap.buf_phys + i*4096); }
-            *guard = None;
-        }
-    }
-}
-
 /// Start playing raw interleaved 16-bit stereo PCM at 48 kHz — returns
-/// immediately; playback continues in the background, advanced by poll().
-/// Truncates to whatever fits in a 1 MB DMA buffer (~5.4s) since the whole
-/// clip is copied into one contiguous buffer up front — no streaming/refill.
+/// immediately; playback continues in the background, entirely driven by
+/// `hdad` (see that process — `poll()` below is now a no-op). Truncates to
+/// whatever fits in the shared 1 MB DMA buffer (~5.4s).
 ///
 /// Returns `(samples_played, truncated)` — `samples_played` counts i16 words
 /// (so stereo pairs = samples_played / 2).
 pub fn play_pcm(samples_stereo: &[i16]) -> (usize, bool) {
-    stop_now(); // only one stream — clear out any previous clip first
+    let guard = HDA.lock();
+    let hda = match guard.as_ref() { Some(h) => h, None => return (0, false) };
 
-    let guard  = HDA.lock();
-    let hda    = match guard.as_ref() { Some(h) => h, None => return (0, false) };
-    let mmio   = hda.mmio;
-    let sd_off = hda.sd_off;
-    drop(guard);
-
-    let max_words = (1usize << 20) / 2; // i16 words that fit in a 1MB buffer
+    let max_words = PCM_MAX_BYTES / 2;
     let n = samples_stereo.len().min(max_words) & !1; // keep an even stereo-pair count
     let truncated = n < samples_stereo.len();
-    let buf_bytes = n * 2;
-    if buf_bytes == 0 { return (0, truncated); }
-    let buf_pages = (buf_bytes + 4095) / 4096;
+    if n == 0 { return (0, truncated); }
 
-    let buf_phys = match pmm::alloc_contiguous(buf_pages) {
-        Some(p) => p,
-        None    => { serial::print("HDA: OOM\n"); return (0, truncated); }
-    };
-    let buf_virt = vmm::phys_to_virt(buf_phys) as *mut i16;
-    unsafe { core::ptr::copy_nonoverlapping(samples_stereo.as_ptr(), buf_virt, n); }
+    // Wait (bounded) for `hdad` to have picked up any previous request —
+    // same reasoning as RTL8139's TX mailbox wait: writing new samples into
+    // the shared buffer before the driver's finished reading the old ones
+    // would corrupt whatever it's mid-copying.
+    for _ in 0..1_000_000u32 {
+        if unsafe { core::ptr::read_volatile(&(*hda.mailbox_virt).play_request) } == 0 { break; }
+        core::hint::spin_loop();
+    }
 
-    let bdl_phys = match pmm::alloc_page() {
-        Some(p) => p,
-        None    => { for i in 0..buf_pages as u64 { pmm::free_page(buf_phys + i*4096); } return (0, truncated); }
-    };
-    unsafe { (vmm::phys_to_virt(bdl_phys) as *mut BdlEntry).write(BdlEntry { addr: buf_phys, len: buf_bytes as u32, ioc: 1 }); }
-
-    let stream_id: u8 = 1;
-    let fmt: u16      = 0x0011; // 48 kHz, 16-bit, stereo
-    configure_codec(mmio, stream_id, fmt);
-
-    w32(mmio, sd_off + SD_CTL, SD_CTL_SRST); spin(5_000);
-    w32(mmio, sd_off + SD_CTL, 0);           spin(5_000);
-
-    w32(mmio, sd_off + SD_BDPL, bdl_phys as u32);
-    w32(mmio, sd_off + SD_BDPU, (bdl_phys >> 32) as u32);
-    w32(mmio, sd_off + SD_CBL,  buf_bytes as u32);
-    w16(mmio, sd_off + SD_LVI,  0);
-    w16(mmio, sd_off + SD_FMT,  fmt);
-
-    let ctl_base = ((stream_id as u32) << 20) | SD_CTL_IOCE;
-    w32(mmio, sd_off + SD_CTL, ctl_base | SD_CTL_RUN);
-
-    let tsc_per_ms   = TSC_PER_MS.load(core::sync::atomic::Ordering::Relaxed);
-    let stereo_pairs = (n / 2) as u64;
-    let duration_ms  = (stereo_pairs * 1000 / 48_000).max(1);
-    let start_at     = rdtsc();
-    let stop_at      = start_at.wrapping_add(tsc_per_ms.saturating_mul(duration_ms));
-
-    *ACTIVE.lock() = Some(ActivePlayback {
-        mmio, sd_off, buf_virt, buf_bytes, buf_phys, buf_pages, bdl_phys, ctl_base,
-        start_at, stop_at, drain_at: None,
-    });
+    unsafe { core::ptr::copy_nonoverlapping(samples_stereo.as_ptr(), hda.buf_virt, n); }
+    unsafe { core::ptr::write_volatile(&mut (*hda.mailbox_virt).play_request, n as u32); }
 
     (n, truncated)
 }
+
+/// Whether `hdad` currently has an active clip playing.
+pub fn is_playing() -> bool {
+    let guard = HDA.lock();
+    match guard.as_ref() {
+        Some(h) => unsafe { core::ptr::read_volatile(&(*h.mailbox_virt).is_playing) != 0 },
+        None => false,
+    }
+}
+
+/// (elapsed_ms, total_ms) of the currently active clip, if any — read
+/// straight from the mailbox, which `hdad` updates every loop iteration.
+pub fn progress_ms() -> Option<(u64, u64)> {
+    let guard = HDA.lock();
+    let hda = guard.as_ref()?;
+    if unsafe { core::ptr::read_volatile(&(*hda.mailbox_virt).is_playing) } == 0 { return None; }
+    let elapsed = unsafe { core::ptr::read_volatile(&(*hda.mailbox_virt).elapsed_ms) } as u64;
+    let total   = unsafe { core::ptr::read_volatile(&(*hda.mailbox_virt).total_ms) } as u64;
+    Some((elapsed, total))
+}
+
+/// Used to advance the playback state machine (zero-buffer → drain → stop)
+/// when that lived in the kernel — `hdad` does all of that now, entirely on
+/// its own, so this is a no-op. Kept (rather than removing and updating
+/// every call site) since `main.rs` still calls it once per frame alongside
+/// `net::poll()`.
+pub fn poll() {}

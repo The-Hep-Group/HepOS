@@ -45,4 +45,17 @@ fn main() {
     } else {
         std::fs::write(&gen_rtl8139d, "static RTL8139D_ELF: &[u8] = &[];\n").unwrap();
     }
+
+    // Bake the userspace hdad ELF (the persistent HDA audio driver process —
+    // see hda.rs) the same way.
+    let hdad     = root.join("userspace/target/x86_64-unknown-none/release/hdad");
+    let gen_hdad = std::path::Path::new(&out_dir).join("hdad_elf.rs");
+    if hdad.exists() {
+        let bytes = std::fs::read(&hdad).expect("read hdad ELF");
+        let lit: String = bytes.iter().map(|b| format!("{},", b)).collect();
+        std::fs::write(&gen_hdad, format!("static HDAD_ELF: &[u8] = &[{}];\n", lit)).unwrap();
+        println!("cargo:rerun-if-changed={}", hdad.display());
+    } else {
+        std::fs::write(&gen_hdad, "static HDAD_ELF: &[u8] = &[];\n").unwrap();
+    }
 }

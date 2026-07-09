@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "hdad"
+version = "0.1.0"
+dependencies = [
+ "hepos-rt",
+ "hepos-std",
+]
+
+[[package]]
 name = "hello"
 version = "0.1.0"
 dependencies = [

@@ -793,6 +793,8 @@ fn task_blink() -> ! {
         // scheduler's idle/blink tasks are registered corrupts the
         // bootstrap.
         rtl8139::spawn_pending_driver();
+        // Same one-shot deferred-spawn pattern, for the HDA audio driver.
+        hda::spawn_pending_driver();
 
         ps2::poll();
         mouse::poll();
