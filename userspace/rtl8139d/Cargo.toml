@@ -1,0 +1,12 @@
+[package]
+name = "rtl8139d"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rtl8139d"
+path = "src/main.rs"
+
+[dependencies]
+hepos-rt  = { path = "../hepos-rt" }
+hepos-std = { path = "../hepos-std" }

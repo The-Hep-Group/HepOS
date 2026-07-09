@@ -263,7 +263,13 @@ fn create_user_pml4() -> u64 {
 
 // ── Entry / exit ──────────────────────────────────────────────────────────────
 
-/// IRETQ into ring 3 at `entry` / `stack_top`.
+/// IRETQ into ring 3 at `entry` / `stack_top`, handing the process one
+/// launch argument (in RDI, so a `_start(arg: u64)` sees it as an ordinary
+/// SysV first parameter — existing programs that declare `_start()` with no
+/// parameters simply ignore it). Used for persistent driver processes (see
+/// `rtl8139.rs`) to tell them where to find their shared mailbox page,
+/// discovered at runtime and so impossible to bake into the ELF itself;
+/// ordinary one-shot programs (`hello`/`hwtest`/`exec <file>`) just pass 0.
 ///
 /// Saves callee-saved registers + RSP to `*krsp_ptr` — the calling task's own
 /// `ProcSlot::kernel_return_rsp` (computed by `run_elf`, a plain Rust
@@ -271,10 +277,11 @@ fn create_user_pml4() -> u64 {
 /// global, so `do_exit()` can restore them and "return" from this function
 /// even with multiple processes each mid-ring-3-excursion on different tasks.
 #[unsafe(naked)]
-unsafe extern "C" fn enter_ring3(entry: u64, stack_top: u64, krsp_ptr: u64) {
+unsafe extern "C" fn enter_ring3(entry: u64, stack_top: u64, krsp_ptr: u64, arg: u64) {
     // entry     → RDI (SysV arg 1)
     // stack_top → RSI (SysV arg 2)
     // krsp_ptr  → RDX (SysV arg 3)
+    // arg       → RCX (SysV arg 4)
     core::arch::naked_asm!(
         // Save callee-saved registers.
         "push rbp",
@@ -291,6 +298,10 @@ unsafe extern "C" fn enter_ring3(entry: u64, stack_top: u64, krsp_ptr: u64) {
         "push 0x202",   // RFLAGS: IF=1, bit-1 always set
         "push 0x23",    // CS  = USER_CS | RPL3
         "push rdi",     // RIP = entry    (arg 1)
+        // rdi/rsi/rdx already captured on the stack above — free to reuse.
+        // Ring 3 sees `arg` in RDI, matching a `_start(arg: u64)`'s own
+        // first SysV parameter.
+        "mov rdi, rcx",
         "iretq",
         // do_exit longjmps here by restoring RSP to the saved value above,
         // then executing the pop sequence + ret.
@@ -333,7 +344,7 @@ pub unsafe fn do_exit(code: u64) -> ! {
 /// this is fine and expected (that's exactly what frees up every other task
 /// to keep running); nothing outside this module calls it directly, see
 /// `exec_async()`.
-fn exec_blocking(name: &str, data: &[u8]) -> Result<u64, &'static str> {
+fn exec_blocking(name: &str, data: &[u8], arg: u64) -> Result<u64, &'static str> {
     // Clear any stale output left over if this task's slot is being reused
     // (see `PROC_OUT`'s doc comment).
     let _ = take_proc_output();
@@ -356,7 +367,7 @@ fn exec_blocking(name: &str, data: &[u8]) -> Result<u64, &'static str> {
         });
     }
 
-    let result = run_elf(pid, data);
+    let result = run_elf(pid, data, arg);
 
     {
         let mut tab = PROCTAB.lock();
@@ -378,9 +389,12 @@ pub fn for_each_proc(mut f: impl FnMut(u32, &str, bool, u64)) {
 }
 
 /// Load an ELF64 binary from `data`, run it in a fresh user address space
-/// (recording `pid` in this task's `ProcSlot` so `SYS_GETPID` sees it), and
+/// (recording `pid` in this task's `ProcSlot` so `SYS_GETPID` sees it),
+/// handing it `arg` as its one launch argument (see `enter_ring3`'s doc
+/// comment — 0 for an ordinary program, a runtime-discovered value like a
+/// shared mailbox's physical address for a persistent driver process), and
 /// return its exit code.
-fn run_elf(pid: u32, data: &[u8]) -> Result<u64, &'static str> {
+fn run_elf(pid: u32, data: &[u8], arg: u64) -> Result<u64, &'static str> {
     let idx = slot_index();
     unsafe {
         PROC_SLOTS[idx] = ProcSlot { pid, mmio_next_va: USER_MMIO_BASE, ..ProcSlot::empty() };
@@ -408,7 +422,7 @@ fn run_elf(pid: u32, data: &[u8]) -> Result<u64, &'static str> {
         write_cr3(pml4);
         scheduler::set_current_cr3(pml4);
         PROC_SLOTS[idx].user_running = true;
-        enter_ring3(loaded.entry, USER_STACK_TOP, krsp_ptr);
+        enter_ring3(loaded.entry, USER_STACK_TOP, krsp_ptr, arg);
         // Returns here after do_exit longjmp
     }
     unsafe { write_cr3(orig_cr3); }
@@ -446,7 +460,7 @@ include!(concat!(env!("OUT_DIR"), "/hwtest_elf.rs"));
 // truly concurrently (see this module's top doc comment on `ProcSlot`) —
 // there's no single-job-at-a-time guard anymore; `PENDING_QUEUE`/`DONE_QUEUE`
 // hold as many in-flight jobs as there are tasks to run them.
-struct AsyncJob { issuer: usize, name: String, data: Vec<u8> }
+struct AsyncJob { issuer: usize, name: String, data: Vec<u8>, arg: u64 }
 
 /// Jobs queued by `exec_async()`, each consumed by exactly one
 /// `async_task_entry()` invocation (its own freshly-spawned task) — which
@@ -476,9 +490,17 @@ pub fn job_in_progress() -> bool { ACTIVE_JOBS.load(Ordering::Relaxed) > 0 }
 /// process has necessarily even started running. Multiple calls can be
 /// in flight at once — each gets its own scheduler task and `ProcSlot`.
 pub fn exec_async(issuer: usize, name: &str, data: &[u8]) -> Result<(), &'static str> {
+    exec_async_with_arg(issuer, name, data, 0)
+}
+
+/// Same as `exec_async()`, but hands the new process `arg` as its one launch
+/// argument (see `enter_ring3`'s doc comment) — for a persistent driver
+/// process that needs to know a runtime-discovered address (e.g. its shared
+/// mailbox's physical address) it has no other way to learn.
+pub fn exec_async_with_arg(issuer: usize, name: &str, data: &[u8], arg: u64) -> Result<(), &'static str> {
     if data.is_empty() { return Err("nothing to run"); }
     ACTIVE_JOBS.fetch_add(1, Ordering::Relaxed);
-    PENDING_QUEUE.lock().push(AsyncJob { issuer, name: String::from(name), data: data.to_vec() });
+    PENDING_QUEUE.lock().push(AsyncJob { issuer, name: String::from(name), data: data.to_vec(), arg });
     scheduler::spawn("user_proc", async_task_entry);
     Ok(())
 }
@@ -488,8 +510,8 @@ pub fn exec_async(issuer: usize, name: &str, data: &[u8]) -> Result<(), &'static
 /// -> !` is all `scheduler::spawn()` accepts, so this can't capture
 /// anything; the job itself is threaded through the `PENDING_QUEUE` mailbox.
 fn async_task_entry() -> ! {
-    if let Some(AsyncJob { issuer, name, data }) = PENDING_QUEUE.lock().pop() {
-        let result = exec_blocking(&name, &data);
+    if let Some(AsyncJob { issuer, name, data, arg }) = PENDING_QUEUE.lock().pop() {
+        let result = exec_blocking(&name, &data, arg);
         let output = take_proc_output();
         let msg = match result {
             Ok(code) => {

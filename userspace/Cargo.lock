@@ -28,3 +28,11 @@ dependencies = [
  "hepos-rt",
  "hepos-std",
 ]
+
+[[package]]
+name = "rtl8139d"
+version = "0.1.0"
+dependencies = [
+ "hepos-rt",
+ "hepos-std",
+]

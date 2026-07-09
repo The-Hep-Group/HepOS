@@ -65,8 +65,40 @@ const ALLOWED_MMIO: &[(u64, u64)] = &[
     (0xFEE0_0000, 0xFEE0_1000), // Local APIC, 4 KB
 ];
 
+// ── Dynamic (runtime-granted) allowlist entries ───────────────────────────────
+//
+// The fixed tables above cover hardware whose address is a compile-time
+// constant (RTC ports, the Local APIC's architectural physical address).
+// RTL8139's I/O base (a PCI BAR) and its DMA buffer physical addresses are
+// only known once `rtl8139::init()` actually discovers/allocates them at
+// boot — there's no way to hardcode those into a `const` table. Rather than
+// widen the static allowlist into something unbounded (which would defeat
+// its whole point), the kernel *grants* exactly the ranges a specific driver
+// needs, once, right after discovering them, before spawning that driver's
+// userspace process. Still not per-process scoped (any process can use any
+// granted range, same caveat as the static table above) — just extended to
+// cover runtime-discovered hardware too.
+static DYNAMIC_PORTS: spin::Mutex<alloc::vec::Vec<(u16, u16)>> = spin::Mutex::new(alloc::vec::Vec::new());
+static DYNAMIC_MMIO:  spin::Mutex<alloc::vec::Vec<(u64, u64)>> = spin::Mutex::new(alloc::vec::Vec::new());
+
+/// Grant every process access to I/O ports `lo..=hi` — call once, right
+/// after discovering a runtime-only port range (e.g. a PCI BAR), before
+/// spawning whatever userspace driver process needs it.
+pub fn grant_port_range(lo: u16, hi: u16) {
+    DYNAMIC_PORTS.lock().push((lo, hi));
+}
+
+/// Grant every process access to the physical range `[phys, phys+len)` via
+/// `SYS_MMAP_MMIO` — same idea as `grant_port_range()`, for a
+/// runtime-discovered physical address (e.g. a DMA buffer `pmm::alloc_page()`
+/// just returned).
+pub fn grant_mmio_range(phys: u64, len: u64) {
+    DYNAMIC_MMIO.lock().push((phys, phys + len));
+}
+
 fn port_allowed(port: u16) -> bool {
     ALLOWED_PORTS.iter().any(|&(lo, hi)| port >= lo && port <= hi)
+        || DYNAMIC_PORTS.lock().iter().any(|&(lo, hi)| port >= lo && port <= hi)
 }
 
 /// `[phys, phys+len)` must fall entirely within one allowed range — no
@@ -74,6 +106,7 @@ fn port_allowed(port: u16) -> bool {
 fn mmio_allowed(phys: u64, len: u64) -> bool {
     let Some(end) = phys.checked_add(len) else { return false };
     ALLOWED_MMIO.iter().any(|&(lo, hi)| phys >= lo && end <= hi)
+        || DYNAMIC_MMIO.lock().iter().any(|&(lo, hi)| phys >= lo && end <= hi)
 }
 
 // Kernel stack for syscall handling (16 KB, 4 pages)

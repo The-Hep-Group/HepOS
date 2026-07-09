@@ -786,6 +786,14 @@ fn task_blink() -> ! {
     let mut prev_cursor_y: usize = 300;
 
     loop {
+        // One-shot (no-op every call after the first): launches the queued
+        // `rtl8139d` driver process, if `rtl8139::init()` found the hardware
+        // and staged one. Has to happen here, not inside `init()` itself —
+        // see that fn's doc comment on why spawning a task before the
+        // scheduler's idle/blink tasks are registered corrupts the
+        // bootstrap.
+        rtl8139::spawn_pending_driver();
+
         ps2::poll();
         mouse::poll();
 

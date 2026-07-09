@@ -32,4 +32,17 @@ fn main() {
     } else {
         std::fs::write(&gen_hwtest, "static HWTEST_ELF: &[u8] = &[];\n").unwrap();
     }
+
+    // Bake the userspace rtl8139d ELF (the persistent NIC driver process —
+    // see rtl8139.rs) the same way.
+    let rtl8139d     = root.join("userspace/target/x86_64-unknown-none/release/rtl8139d");
+    let gen_rtl8139d = std::path::Path::new(&out_dir).join("rtl8139d_elf.rs");
+    if rtl8139d.exists() {
+        let bytes = std::fs::read(&rtl8139d).expect("read rtl8139d ELF");
+        let lit: String = bytes.iter().map(|b| format!("{},", b)).collect();
+        std::fs::write(&gen_rtl8139d, format!("static RTL8139D_ELF: &[u8] = &[{}];\n", lit)).unwrap();
+        println!("cargo:rerun-if-changed={}", rtl8139d.display());
+    } else {
+        std::fs::write(&gen_rtl8139d, "static RTL8139D_ELF: &[u8] = &[];\n").unwrap();
+    }
 }
