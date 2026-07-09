@@ -250,9 +250,10 @@ unsafe fn write_cr3(phys: u64) {
 fn create_user_pml4() -> u64 {
     let phys = pmm::alloc_page().expect("process: OOM for PML4");
     let virt = vmm::phys_to_virt(phys);
+    let cur_cr3 = read_cr3();
     unsafe {
         core::ptr::write_bytes(virt, 0, 4096);
-        let cur = vmm::phys_to_virt(read_cr3()) as *const u64;
+        let cur = vmm::phys_to_virt(cur_cr3) as *const u64;
         let new = virt as *mut u64;
         for i in 256..512usize {
             new.add(i).write_volatile(cur.add(i).read_volatile());
@@ -510,7 +511,17 @@ pub fn exec_async_with_arg(issuer: usize, name: &str, data: &[u8], arg: u64) -> 
 /// -> !` is all `scheduler::spawn()` accepts, so this can't capture
 /// anything; the job itself is threaded through the `PENDING_QUEUE` mailbox.
 fn async_task_entry() -> ! {
-    if let Some(AsyncJob { issuer, name, data, arg }) = PENDING_QUEUE.lock().pop() {
+    // Deliberately NOT `if let Some(...) = PENDING_QUEUE.lock().pop() { ... }`
+    // — that's a real Rust footgun: the temporary `MutexGuard` from `.lock()`
+    // lives for the *entire if-let body* (its "scrutinee" expression, per
+    // Rust's temporary-lifetime rules), not just the match itself. Since a
+    // persistent driver process (RTL8139/HDA) never returns from
+    // `exec_blocking()` below — it loops forever once in ring 3 — that would
+    // hold `PENDING_QUEUE`'s lock *forever*, deadlocking every other task
+    // that ever tries to pop its own job from the same queue. Popping into a
+    // `let` first drops the guard immediately, before the body ever runs.
+    let popped = PENDING_QUEUE.lock().pop();
+    if let Some(AsyncJob { issuer, name, data, arg }) = popped {
         let result = exec_blocking(&name, &data, arg);
         let output = take_proc_output();
         let msg = match result {

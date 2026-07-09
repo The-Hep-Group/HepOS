@@ -124,6 +124,15 @@ struct PercpuData {
 
 static mut PERCPU: PercpuData = PercpuData { kernel_stack: 0, user_rsp: 0 };
 
+/// Repoint the SYSCALL-entry kernel stack at `top` — called by
+/// `scheduler.rs` on every task switch so whichever task is "current"
+/// handles its own syscalls on its own dedicated stack, not a single shared
+/// buffer every process used to fight over (see `scheduler::Task::_kstack`'s
+/// doc comment for the real bug this fixes).
+pub fn set_kernel_stack(top: u64) {
+    unsafe { PERCPU.kernel_stack = top; }
+}
+
 // ── MSR helpers ───────────────────────────────────────────────────────────────
 
 unsafe fn wrmsr(msr: u32, val: u64) {
