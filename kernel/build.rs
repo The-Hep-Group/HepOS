@@ -84,4 +84,17 @@ fn main() {
     } else {
         std::fs::write(&gen_xhcid, "static XHCID_ELF: &[u8] = &[];\n").unwrap();
     }
+
+    // Bake the userspace nvmed ELF (the persistent NVMe I/O-queue process —
+    // see nvme.rs) the same way.
+    let nvmed     = root.join("userspace/target/x86_64-unknown-none/release/nvmed");
+    let gen_nvmed = std::path::Path::new(&out_dir).join("nvmed_elf.rs");
+    if nvmed.exists() {
+        let bytes = std::fs::read(&nvmed).expect("read nvmed ELF");
+        let lit: String = bytes.iter().map(|b| format!("{},", b)).collect();
+        std::fs::write(&gen_nvmed, format!("static NVMED_ELF: &[u8] = &[{}];\n", lit)).unwrap();
+        println!("cargo:rerun-if-changed={}", nvmed.display());
+    } else {
+        std::fs::write(&gen_nvmed, "static NVMED_ELF: &[u8] = &[];\n").unwrap();
+    }
 }

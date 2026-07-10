@@ -1,5 +1,40 @@
-﻿use crate::{paging, pci, pmm, vmm};
-use core::sync::atomic::{fence, Ordering};
+﻿//! NVMe driver.
+//!
+//! **Fifth driver migrated to userspace, and the highest-stakes one** — this
+//! is the actual HepFS boot disk, unlike AHCI (migrated earlier, but never
+//! actually mounted by HepFS in this build). The one-time bring-up (PCI
+//! enable, MMIO mapping, controller disable/enable, admin queue setup,
+//! Identify Controller/Namespace, I/O queue creation) stays entirely in the
+//! kernel, unchanged — all of it runs on the *admin* queue, which this
+//! migration doesn't touch at all.
+//!
+//! **A constraint none of the previous 4 migrations had**: `read_blocks()`/
+//! `write_blocks()` are called synchronously during early boot (HepFS
+//! format/mount, `kernel.txt`/demo file writes, desktop icon sync) — all of
+//! it *before* the scheduler even exists, let alone a userspace process.
+//! `nvmed` can only launch once `task_blink`'s own loop starts (same
+//! deferred-spawn constraint every other driver has), which happens *after*
+//! all of that early-boot I/O already completed. So this module keeps the
+//! original, fully-synchronous in-kernel I/O-queue implementation as
+//! `read_blocks_direct()`/`write_blocks_direct()` — early boot uses these
+//! directly (there's no other option), and `spawn_pending_driver()` hands
+//! off to `nvmed` only once, reading the I/O queue's *live* software
+//! position (`sq_tail`/`cq_head`/`phase`) at that exact moment (not a
+//! boot-time snapshot) so the handoff is seamless regardless of how much
+//! direct-path I/O already happened. From that point on, `read_blocks()`/
+//! `write_blocks()` (same public signatures, zero caller changes) route
+//! through `nvmed`'s mailbox instead.
+//!
+//! **Also unlike AHCI**: NVMe's submission/completion queue doorbell
+//! registers are write-only per spec — there's no hardware register to
+//! recover `sq_tail`/`cq_head`/`phase` from after a `nvmed` restart (unlike
+//! RTL8139's readable `CAPR`). So `nvmed` persists its own live queue
+//! position back into the mailbox every loop iteration, the same fix
+//! `xhcid` needed for its event/HID rings — this was built in from the
+//! start here rather than discovered the hard way again.
+
+use crate::{paging, pci, pmm, process, serial, syscall, vmm};
+use core::sync::atomic::{fence, AtomicBool, Ordering};
 
 // â"€â"€ NVMe register offsets â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 const REG_CAP:  usize = 0x00;
@@ -71,13 +106,76 @@ struct Queue {
 
 unsafe impl Send for Queue {}
 
+/// Shared memory mailbox — one physical page, mapped into both the kernel
+/// (via `vmm::phys_to_virt`) and the `nvmed` userspace process (via
+/// `SYS_MMAP_MMIO`, using the physical address handed to it as its one
+/// launch argument). **Layout must stay byte-for-byte identical to the copy
+/// in `userspace/nvmed/src/main.rs`.**
+#[repr(C)]
+struct Mailbox {
+    regs_phys:  u64,
+    io_sq_phys: u64,
+    io_cq_phys: u64,
+    dstrd:      u32,
+    qd:         u32,
+    /// Live I/O-queue software position, read once by `spawn_pending_driver()`
+    /// from the kernel's own in-progress `Queue` state at the moment of
+    /// handoff (not a boot-time snapshot — see the module doc comment for
+    /// why that distinction matters). `nvmed` writes these back every loop
+    /// iteration so a `service stop`/`start` cycle resumes from wherever it
+    /// actually left off — NVMe's SQ/CQ doorbells are write-only per spec,
+    /// so unlike RTL8139's `CAPR` there's no hardware register to recover
+    /// this from after a restart.
+    sq_tail: u32,
+    cq_head: u32,
+    phase:   u32, // bool as u32
+    /// 0 = idle, 1 = read request, 2 = write request. Kernel writes this
+    /// last (after `lba`/`count`, and after `data` for a write) to hand off
+    /// a request; `nvmed` clears it back to 0 once `status` is final.
+    op:     u32,
+    /// 0 = request still pending, 1 = done ok, 2 = done with an error.
+    status: u32,
+    lba:    u64,
+    count:  u32,
+    _pad0:  u32,
+    /// Fixed bounce buffer both sides DMA through — sized to exactly match
+    /// `hepfs::BLOCK_SIZE` (4096 bytes), the only transfer size any real
+    /// caller ever uses (see `hepfs.rs`'s `spb`/`read_blocks`/`write_blocks`
+    /// call sites) — same reasoning as `ahci.rs`'s identical bounce buffer.
+    data: [u8; 4096],
+    /// 0 = keep running. Kernel writes 1 to request a cooperative shutdown
+    /// (`service stop nvmed` / `kill <pid>`) — see `stop_service()`'s doc
+    /// comment for why this is cooperative rather than a true forced kill.
+    stop: u32,
+}
+
+/// `Mailbox`'s header fields plus its 4096-byte `data` buffer add up to just
+/// over one page — needs 2 contiguous physical pages, not 1 (same lesson
+/// learned the hard way with `ahci.rs`'s identically-shaped mailbox).
+const MAILBOX_PAGES: usize = 2;
+const _: () = assert!(core::mem::size_of::<Mailbox>() <= MAILBOX_PAGES * 4096);
+
 pub struct NvmeController {
     regs:       *mut u8,
+    regs_phys:  u64,
+    dstrd:      usize,
     admin:      Queue,
     io:         Queue,
     cid:        u16,
     pub lba_size:  u32,
     pub lba_count: u64,
+    /// `Some` exactly when `nvmed` is the current authority over the I/O
+    /// queue — `read_blocks()`/`write_blocks()` check this every call.
+    /// `None` means the in-kernel direct path (`self.io`) is authoritative,
+    /// which is true at boot and again any time `nvmed` is stopped (see
+    /// `stop_service()` — it syncs `self.io`'s position back from the
+    /// mailbox before clearing this, so falling back is always safe).
+    mailbox: Option<*mut Mailbox>,
+    /// The mailbox page itself, allocated once on the very first handoff
+    /// and reused for every subsequent stop/start cycle (not reallocated —
+    /// `nvmed`'s launch argument, and every grant, always refers to the
+    /// same physical page for this controller's whole lifetime).
+    mailbox_page_phys: Option<u64>,
 }
 
 unsafe impl Send for NvmeController {}
@@ -86,6 +184,11 @@ unsafe impl Sync for NvmeController {}
 pub static CONTROLLER: spin::Mutex<Option<NvmeController>> = spin::Mutex::new(None);
 
 impl NvmeController {
+    /// True once handoff has happened and `read_blocks()`/`write_blocks()`
+    /// are routing through `nvmed`'s mailbox instead of the direct in-kernel
+    /// path — mainly useful for diagnostics/tests.
+    pub fn mailbox_is_active(&self) -> bool { self.mailbox.is_some() }
+
     fn read32(&self, off: usize) -> u32 {
         unsafe { (self.regs.add(off) as *const u32).read_volatile() }
     }
@@ -143,7 +246,11 @@ impl NvmeController {
         assert!(s == 0, "NVMe Create I/O SQ failed: {}", s);
     }
 
-    pub fn read_blocks(&mut self, lba: u64, count: u16, buf_phys: u64) {
+    /// Original, fully in-kernel I/O-queue path — used directly for all
+    /// early-boot I/O (before `nvmed` can exist at all) and as the
+    /// underlying implementation `spawn_pending_driver()` hands off *from*.
+    /// Never called again once handoff has happened (see module doc).
+    fn read_blocks_direct(&mut self, lba: u64, count: u16, buf_phys: u64) {
         let cid = self.next_cid();
         q_submit(&mut self.io, cid, SqEntry {
             cdw0: 0x02, nsid: 1, prp1: buf_phys,
@@ -154,7 +261,7 @@ impl NvmeController {
         assert!(s == 0, "NVMe read failed: {}", s);
     }
 
-    pub fn write_blocks(&mut self, lba: u64, count: u16, buf_phys: u64) {
+    fn write_blocks_direct(&mut self, lba: u64, count: u16, buf_phys: u64) {
         let cid = self.next_cid();
         q_submit(&mut self.io, cid, SqEntry {
             cdw0: 0x01, nsid: 1, prp1: buf_phys,
@@ -164,7 +271,84 @@ impl NvmeController {
         let s = q_wait(&mut self.io, cid);
         assert!(s == 0, "NVMe write failed: {}", s);
     }
+
+    /// Read `count` blocks (max one `hepfs::BLOCK_SIZE`'s worth per call —
+    /// see the mailbox's fixed `data` buffer) starting at `lba` into the
+    /// contiguous physical buffer `buf_phys`. Routes through `nvmed`'s
+    /// mailbox once handoff has happened; falls back to the original
+    /// direct in-kernel path before that (see module doc comment) —
+    /// **same public signature as before this migration, zero caller
+    /// changes needed** in `hepfs.rs`/`main.rs`.
+    pub fn read_blocks(&mut self, lba: u64, count: u16, buf_phys: u64) {
+        if self.mailbox.is_none() {
+            self.read_blocks_direct(lba, count, buf_phys);
+            return;
+        }
+        let len = count as u32 * self.lba_size;
+        assert!(len as usize <= 4096, "NVMe: mailbox request too large for one block ({} bytes)", len);
+        let _io = IO_LOCK.lock();
+        let mb = self.mailbox.unwrap();
+        unsafe {
+            core::ptr::write_volatile(&mut (*mb).lba, lba);
+            core::ptr::write_volatile(&mut (*mb).count, count as u32);
+            core::ptr::write_volatile(&mut (*mb).status, 0);
+            core::ptr::write_volatile(&mut (*mb).op, 1); // release — hands off to nvmed
+        }
+        let mut ok = false;
+        for _ in 0..MAILBOX_WAIT_SPINS {
+            let status = unsafe { core::ptr::read_volatile(&(*mb).status) };
+            if status != 0 { ok = status == 1; break; }
+            core::hint::spin_loop();
+        }
+        if ok {
+            unsafe {
+                core::ptr::copy_nonoverlapping((*mb).data.as_ptr(), vmm::phys_to_virt(buf_phys), len as usize);
+            }
+        } else {
+            serial::print("nvme: mailbox read timeout/error\n");
+        }
+        unsafe { core::ptr::write_volatile(&mut (*mb).status, 0); }
+        assert!(ok, "NVMe read failed (mailbox)");
+    }
+
+    /// Same as `read_blocks()`, mirrored for writes.
+    pub fn write_blocks(&mut self, lba: u64, count: u16, buf_phys: u64) {
+        if self.mailbox.is_none() {
+            self.write_blocks_direct(lba, count, buf_phys);
+            return;
+        }
+        let len = count as u32 * self.lba_size;
+        assert!(len as usize <= 4096, "NVMe: mailbox request too large for one block ({} bytes)", len);
+        let _io = IO_LOCK.lock();
+        let mb = self.mailbox.unwrap();
+        unsafe {
+            core::ptr::copy_nonoverlapping(vmm::phys_to_virt(buf_phys), (*mb).data.as_mut_ptr(), len as usize);
+            core::ptr::write_volatile(&mut (*mb).lba, lba);
+            core::ptr::write_volatile(&mut (*mb).count, count as u32);
+            core::ptr::write_volatile(&mut (*mb).status, 0);
+            core::ptr::write_volatile(&mut (*mb).op, 2); // release — hands off to nvmed
+        }
+        let mut ok = false;
+        for _ in 0..MAILBOX_WAIT_SPINS {
+            let status = unsafe { core::ptr::read_volatile(&(*mb).status) };
+            if status != 0 { ok = status == 1; break; }
+            core::hint::spin_loop();
+        }
+        if !ok { serial::print("nvme: mailbox write timeout/error\n"); }
+        unsafe { core::ptr::write_volatile(&mut (*mb).status, 0); }
+        assert!(ok, "NVMe write failed (mailbox)");
+    }
 }
+
+/// Number of spin iterations to wait for `nvmed` to service one mailbox
+/// request — generous for the same reason `ahci.rs`'s identical constant
+/// is (the driver only polls once per ~10ms timer tick).
+const MAILBOX_WAIT_SPINS: u32 = 500_000_000;
+
+/// Serializes whole read/write transactions against each other and against
+/// `spawn_pending_driver()`'s one-time handoff — same reasoning as
+/// `ahci.rs`'s `AHCI_IO_LOCK`.
+static IO_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
 fn q_submit(q: &mut Queue, cid: u16, mut cmd: SqEntry) {
     cmd.cdw0 = (cmd.cdw0 & 0xFFFF) | ((cid as u32) << 16);
@@ -321,11 +505,15 @@ pub fn init(devices: &[pci::PciDevice]) -> Option<NvmeController> {
 
     let mut ctrl = NvmeController {
         regs,
+        regs_phys: bar_phys,
+        dstrd,
         admin,
         io: io_q,
         cid: 0,
         lba_size: 512,
         lba_count: 0,
+        mailbox: None,
+        mailbox_page_phys: None,
     };
     serial::print("NVMe: ctrl struct built\n");
 
@@ -358,4 +546,174 @@ pub fn init(devices: &[pci::PciDevice]) -> Option<NvmeController> {
     serial::print("NVMe: IO queues ready\n");
 
     Some(ctrl)
+}
+
+// ── Service management (`service`/`kill` terminal commands) ──────────────────
+//
+// **A real, previously-latent design mistake found and fixed via actual
+// testing, not by inspection**: an early version of this migration treated
+// `nvmed` like every other driver — once handed off, `stop` was meant to
+// genuinely disable I/O until `start` relaunched it, matching the other 3
+// services' "stop means stop" behavior. On real hardware/QEMU that's
+// tolerable (no mouse, no audio, no network for a while); for NVMe it's
+// not: this is the actual HepFS boot filesystem, and something on the
+// desktop touches it constantly (icon refresh, file listings, ...) whether
+// or not a human just ran `service stop nvmed`. The very first real test of
+// a stop/start cycle — background desktop activity, not even the test
+// itself — hit `read_blocks()`/`write_blocks()` while `nvmed` was down,
+// spin-waited forever for a mailbox response that would never come, and
+// **panicked the whole kernel** via the same `assert!` that's always fired
+// on a genuine unrecoverable disk error (this migration didn't introduce
+// that assert, but it did make "the service is stopped" — an expected,
+// user-reachable state — trigger the exact same fatal path as real hardware
+// failure).
+//
+// Fixed by making `stop`/`start` a genuine two-way handoff instead of a
+// one-way trip: `stop_service()` syncs `self.io`'s software position
+// (`sq_tail`/`cq_head`/`phase`) *back* from the mailbox before clearing
+// `ctrl.mailbox`, so the in-kernel direct path (`read_blocks_direct()`/
+// `write_blocks_direct()`) picks up exactly where `nvmed` left off and
+// stays fully functional while the service is down — the boot filesystem
+// never actually goes away, only the userspace process does. `start_service()`
+// (and the very first `spawn_pending_driver()` handoff) then does the
+// mirror image: builds the mailbox from `self.io`'s *current* live position
+// (by definition up to date, since the direct path was authoritative the
+// whole time `nvmed` was stopped) before relaunching. Both directions share
+// `handoff_to_nvmed()`/`handoff_from_nvmed()` below.
+static ENABLED: AtomicBool = AtomicBool::new(true);
+pub const SERVICE_NAME: &str = "<nvmed>";
+const STOP_WAIT_SPINS: u32 = 500_000_000;
+static STARTING: AtomicBool = AtomicBool::new(false);
+
+pub fn is_enabled() -> bool { ENABLED.load(Ordering::Relaxed) }
+pub fn set_enabled(v: bool) { ENABLED.store(v, Ordering::Relaxed); }
+pub fn is_running() -> bool { process::is_process_running(SERVICE_NAME) }
+
+// Baked-in nvmed ELF (generated by build.rs from userspace/target/.../nvmed).
+// Empty slice if userspace hasn't been rebuilt since this driver was added.
+include!(concat!(env!("OUT_DIR"), "/nvmed_elf.rs"));
+
+/// Build (or reuse the already-allocated) mailbox from `ctrl.io`'s *current*
+/// live position, grant the ranges `nvmed` needs, launch it, and wait for
+/// it to actually register as running before declaring `ctrl.mailbox`
+/// active — never finalizes the handoff on a launch that didn't land (see
+/// the "why the direct path must stay safe" note in the module/service
+/// doc comments above). Must be called with `CONTROLLER` unlocked (it locks
+/// internally); safe to call whether this is the very first handoff or a
+/// restart after `handoff_from_nvmed()`.
+fn handoff_to_nvmed() -> Result<(), &'static str> {
+    if NVMED_ELF.is_empty() { return Err("nvmed ELF not built"); }
+    let mailbox_phys = {
+        let mut guard = CONTROLLER.lock();
+        let Some(ctrl) = guard.as_mut() else { return Err("driver not initialized"); };
+        let mailbox_phys = match ctrl.mailbox_page_phys {
+            Some(p) => p,
+            None => {
+                let Some(p) = pmm::alloc_contiguous(MAILBOX_PAGES) else {
+                    return Err("mailbox OOM");
+                };
+                ctrl.mailbox_page_phys = Some(p);
+                p
+            }
+        };
+        let mailbox_virt = vmm::phys_to_virt(mailbox_phys) as *mut Mailbox;
+        unsafe {
+            core::ptr::write_bytes(mailbox_virt as *mut u8, 0, MAILBOX_PAGES * 4096);
+            (*mailbox_virt).regs_phys  = ctrl.regs_phys;
+            (*mailbox_virt).io_sq_phys = ctrl.io.sq_phys;
+            (*mailbox_virt).io_cq_phys = ctrl.io.cq_phys;
+            (*mailbox_virt).dstrd      = ctrl.dstrd as u32;
+            (*mailbox_virt).qd         = QD as u32;
+            // Live handoff — captures wherever the direct path (the sole
+            // authority while nvmed was down/never yet started) actually
+            // left the queue, not a stale snapshot.
+            (*mailbox_virt).sq_tail = ctrl.io.sq_tail;
+            (*mailbox_virt).cq_head = ctrl.io.cq_head;
+            (*mailbox_virt).phase   = ctrl.io.phase as u32;
+        }
+        syscall::grant_mmio_range(ctrl.regs_phys, 65536);
+        syscall::grant_mmio_range(ctrl.io.sq_phys, 4096);
+        syscall::grant_mmio_range(ctrl.io.cq_phys, 4096);
+        syscall::grant_mmio_range(mailbox_phys, (MAILBOX_PAGES * 4096) as u64);
+        mailbox_phys
+        // NOT setting ctrl.mailbox yet — read_blocks()/write_blocks() must
+        // keep using the fully-working direct path until nvmed is actually
+        // confirmed alive below.
+    };
+
+    process::exec_async_with_arg(usize::MAX, SERVICE_NAME, NVMED_ELF, mailbox_phys)?;
+    for _ in 0..STOP_WAIT_SPINS {
+        if is_running() { break; }
+        core::hint::spin_loop();
+    }
+    if !is_running() { return Err("nvmed did not come up"); }
+
+    let mut guard = CONTROLLER.lock();
+    let Some(ctrl) = guard.as_mut() else { return Err("driver not initialized"); };
+    ctrl.mailbox = Some(vmm::phys_to_virt(mailbox_phys) as *mut Mailbox);
+    Ok(())
+}
+
+/// The reverse of `handoff_to_nvmed()`: sync `ctrl.io`'s software position
+/// back from the mailbox (nvmed's last-persisted values, always current —
+/// it writes them every loop iteration) and clear `ctrl.mailbox`, restoring
+/// the in-kernel direct path to full authority. Must be called only after
+/// confirming `nvmed` has actually exited (its stop-flag check happens once
+/// per loop iteration, so its very last mailbox write is guaranteed to have
+/// already landed by the time `is_process_running()` reports it gone).
+fn handoff_from_nvmed() {
+    let mut guard = CONTROLLER.lock();
+    let Some(ctrl) = guard.as_mut() else { return; };
+    let Some(mb) = ctrl.mailbox else { return; };
+    unsafe {
+        ctrl.io.sq_tail = core::ptr::read_volatile(&(*mb).sq_tail);
+        ctrl.io.cq_head = core::ptr::read_volatile(&(*mb).cq_head);
+        ctrl.io.phase   = core::ptr::read_volatile(&(*mb).phase) != 0;
+    }
+    ctrl.mailbox = None;
+}
+
+/// Hands off from the in-kernel direct I/O-queue path to a freshly-spawned
+/// `nvmed` process, if this is the first call and hardware was found. Must
+/// be called only after the scheduler's idle/blink tasks are registered and
+/// the timer is running (i.e. from within `task_blink`'s own loop) — see
+/// every other driver's identical constraint. A no-op on every call after
+/// the first (or if there's no controller).
+pub fn spawn_pending_driver() {
+    static HANDED_OFF: AtomicBool = AtomicBool::new(false);
+    if HANDED_OFF.swap(true, Ordering::AcqRel) { return; }
+    if CONTROLLER.lock().is_none() { return; }
+    match handoff_to_nvmed() {
+        Ok(()) => serial::print("nvme: nvmed launched and confirmed running — I/O now routed through it\n"),
+        Err(e) => serial::print(&alloc::format!("nvme: nvmed handoff failed ({}) — staying on the in-kernel direct I/O path\n", e)),
+    }
+}
+
+pub fn stop_service() -> Result<(), &'static str> {
+    if !is_running() { return Err("not running"); }
+    let mb = { let g = CONTROLLER.lock(); g.as_ref().and_then(|c| c.mailbox) };
+    let Some(mb) = mb else { return Err("driver not initialized") };
+    unsafe { core::ptr::write_volatile(&mut (*mb).stop, 1); }
+    for _ in 0..STOP_WAIT_SPINS {
+        if !is_running() {
+            // Restore the in-kernel direct path to authority *before*
+            // returning — see the doc comment above for the real crash
+            // this closes (background I/O landing on a dead mailbox).
+            handoff_from_nvmed();
+            return Ok(());
+        }
+        core::hint::spin_loop();
+    }
+    Err("timeout waiting for driver to stop")
+}
+
+pub fn start_service() -> Result<(), &'static str> {
+    if !is_enabled() { return Err("disabled"); }
+    if is_running() { return Err("already running"); }
+    if STARTING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return Err("start already in progress");
+    }
+    let result = handoff_to_nvmed();
+    STARTING.store(false, Ordering::Release);
+    result
 }

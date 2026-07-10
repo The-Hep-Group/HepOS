@@ -1,0 +1,12 @@
+[package]
+name = "nvmed"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "nvmed"
+path = "src/main.rs"
+
+[dependencies]
+hepos-rt  = { path = "../hepos-rt" }
+hepos-std = { path = "../hepos-std" }

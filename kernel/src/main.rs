@@ -799,6 +799,11 @@ fn task_blink() -> ! {
         ahci::spawn_pending_driver();
         // Same one-shot deferred-spawn pattern, for the XHCI/USB HID driver.
         xhci::spawn_pending_driver();
+        // Same one-shot deferred-spawn pattern, for the NVMe driver — except
+        // this one hands off from a fully-functional in-kernel direct path
+        // (used for all early-boot I/O) rather than merely launching a
+        // previously-inert queued mailbox; see nvme.rs's module doc comment.
+        nvme::spawn_pending_driver();
 
         ps2::poll();
         mouse::poll();
