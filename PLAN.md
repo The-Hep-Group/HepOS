@@ -1,13 +1,13 @@
 # HepOS — Design Reference & Roadmap
 
 > **Purpose:** Authoritative reference for HepOS. Survives context compaction.
-> **Last updated:** 2026-07-07 (Next Steps cleaned up — completed items removed, see git history for their writeups; new gaps added from the Original Design Plan audit below)
+> **Last updated:** 2026-07-09 (4 drivers — RTL8139/HDA/AHCI/XHCI — migrated to userspace processes with `service`/`kill` management; Original Design Plan audit and "What's Built" tables updated to match)
 
 ---
 
 ## Overview
 
-HepOS is a custom x86\_64 operating system written in Rust using an **exokernel architecture**. The kernel only does hardware multiplexing; all OS abstractions live in a kernel-space libOS for now. Single user, no permissions, networking partially implemented.
+HepOS is a custom x86\_64 operating system written in Rust using an **exokernel architecture**. The kernel does hardware multiplexing plus the delicate one-time bring-up for each device; the ongoing hot-path work for 4 drivers (RTL8139, Intel HDA, AHCI, XHCI) now runs as persistent userspace processes talking to the kernel through shared-memory mailboxes — NVMe, PCI, ACPI, and GOP still run entirely in-kernel. Single user, no permissions, networking partially implemented.
 
 **Language:** Rust (nightly, `no_std` + `alloc`)  
 **Target:** x86\_64, bare metal  
@@ -35,13 +35,13 @@ The project started from a design doc with a specific target shape (libOS-in-use
 **Drivers (plan: "all in libOS userspace except where HW forces kernel")**
 | Item | Status | Notes |
 |---|---|---|
-| XHCI → USB HID (keyboard/mouse) | 🟡 | XHCI drives a USB HID **mouse** only (tablet). Keyboard is PS/2, not USB HID. |
-| Intel HDA (audio out) | ✅ | Non-blocking playback (`hda::play_pcm()` + `poll()`) |
-| NVMe (storage) | ✅ | |
-| PCI enumeration | ✅ | |
-| ACPI (shutdown/reboot) | 🟡 | QEMU-only (hardcoded port 0x604); no real FADT parsing for physical hardware |
-| GOP framebuffer (display) | ✅ | Via HepBL's BootInfo; also mirrored live to a virtio-gpu device when present (`virtio_gpu.rs`) as a first step toward real GPU-assisted display |
-| **Drivers live in userspace libOS** | ❌ | **Not true.** Every driver (XHCI, HDA, NVMe, PCI, ACPI, GOP) runs in the kernel (ring 0). `userspace/` only contains `hepos-rt`/`hepos-std`/the `hello` demo — no actual drivers have been moved out. This is the single biggest architectural gap versus the original plan. |
+| XHCI → USB HID (keyboard/mouse) | 🟡 | XHCI drives a USB HID **mouse** only by default (tablet) — keyboard support exists in the driver but isn't attached in the shared dev QEMU scripts (see Next Steps). Ongoing event-ring polling now runs in userspace (`userspace/xhcid`), not the kernel — see the userspace-drivers row below. |
+| Intel HDA (audio out) | ✅ | Non-blocking playback (`hda::play_pcm()` + `poll()`); ongoing codec/DMA work now runs in userspace (`userspace/hdad`) — see the userspace-drivers row below. |
+| NVMe (storage) | ✅ | Still runs entirely in-kernel — the actual HepFS boot disk, so migrating it is one of the two remaining higher-stakes candidates (see Next Steps). |
+| PCI enumeration | ✅ | One-shot enumeration at boot, no ongoing hot path — not really a "migrate to userspace" candidate in the same sense as the polled/interrupt-driven drivers. |
+| ACPI (shutdown/reboot) | 🟡 | Real FADT/DSDT parsing (`acpi.rs`) — real hardware's actual PM1a/b_CNT_BLK ports and SLP_TYP values, not hardcoded QEMU-only ports. One-shot, no ongoing hot path to migrate. |
+| GOP framebuffer (display) | ✅ | Via HepBL's BootInfo; also mirrored live to a virtio-gpu device when present (`virtio_gpu.rs`). Still runs entirely in-kernel — the other remaining higher-stakes migration candidate (a bug here means no display at all). |
+| **Drivers live in userspace libOS** | 🟡 | **4 of 6 now migrated.** RTL8139 (NIC), Intel HDA (audio), AHCI (SATA), and XHCI (USB HID) all run their ongoing per-request/per-event hot-path work as persistent userspace processes (`userspace/{rtl8139d,hdad,ahcid,xhcid}`) talking to the kernel through shared-memory mailboxes — the kernel keeps only the one-time hardware bring-up (PCI enable, DMA buffer allocation, etc.) that needs `pmm`/PCI access no ring-3 process has. A `service`/`kill` terminal command layer manages all 4 (start/stop/enable/disable — see "Service management" above). NVMe, PCI, ACPI, and GOP still run entirely in the kernel; NVMe and GOP are the two meaningfully-remaining candidates (PCI/ACPI are one-shot work, not really in scope for this kind of migration). |
 
 **Custom Filesystem (HepFS)**
 | Item | Status | Notes |
@@ -479,6 +479,8 @@ Blocks 38+   : Data blocks  (4KB each)
 
 ## XHCI USB Mouse Driver
 
+Hardware/protocol reference below is accurate regardless of where the driver runs. The one-time bring-up (port reset, Enable Slot/Address Device/Configure Endpoint) still runs in the kernel; ongoing event-ring polling now runs in userspace (`userspace/xhcid`) — see "Service management" and the "Drivers live in userspace libOS" rows above for the current architecture.
+
 **Device:** QEMU `qemu-xhci` (PCI 1B36:000D) + `usb-tablet` (absolute coordinates)
 
 **USB HID report (6 bytes):** `[buttons] [x_lo] [x_hi] [y_lo] [y_hi] [wheel]`  
@@ -533,15 +535,15 @@ Range 0–32767 scaled to framebuffer size.
 | ✓ | PS/2 mouse — relative with non-linear acceleration (1×/2×/3× by speed) |
 | ✓ | XHCI USB host controller + USB HID tablet (absolute mouse) |
 | ✓ | NVMe — admin + IO queues |
-| ✓ | RTL8139 NIC — TX only |
+| ✓ | RTL8139 NIC — TX + RX, full `ping`/`wget` round-trips confirmed; ongoing driver work runs in userspace (`userspace/rtl8139d`) — see the userspace-drivers row below |
 | ✓ | e1000 NIC — TX only |
-| ✓ | Networking RX — e1000 RX confirmed working on QEMU/Windows (ping 10.0.2.2 replies) |
-| ✓ | Intel HDA audio — `beep [hz] [ms]` via hda-output codec (switched from hda-duplex — see Known Issues), square-wave PCM, DMA stream |
+| ✓ | Networking RX — both e1000 and RTL8139 RX confirmed working on QEMU/Windows (ping 10.0.2.2 replies) |
+| ✓ | Intel HDA audio — `beep [hz] [ms]` via hda-output codec (switched from hda-duplex — see Known Issues), square-wave PCM, DMA stream; ongoing codec/DMA work runs in userspace (`userspace/hdad`) — see the userspace-drivers row below |
 | ✓ | ACPI FADT parsing — `acpi.rs`: real RSDP→RSDT/XSDT→FADT→DSDT parsing, byte-scanning the DSDT for the `\_S5` package (the well-known hobbyist recipe, not a full AML interpreter — see the module doc) to get the real PM1a/b_CNT_BLK ports and SLP_TYP values, instead of hardcoded QEMU-only ports |
-| ✓ | AHCI/SATA driver — `ahci.rs`: PCI detect, port init, IDENTIFY, LBA48 read/write via a single polled command slot, all bounded (never `panic!`/hang on timeout). HepFS now mounts over it too via `hepfs::BlockDev` — see Storage table. |
+| ✓ | AHCI/SATA driver — `ahci.rs`: PCI detect, port init, IDENTIFY, LBA48 read/write via a single polled command slot, all bounded (never `panic!`/hang on timeout). HepFS now mounts over it too via `hepfs::BlockDev` — see Storage table. Ongoing per-request command-issue-and-poll work runs in userspace (`userspace/ahcid`) — see the userspace-drivers row below. |
 | ✓ | virtio-gpu driver — `virtio_gpu.rs`: modern virtio-pci transport from scratch (PCI cap-list walk, virtqueue, polled), `GET_DISPLAY_INFO` + full 2D resource create/attach/scanout/transfer/flush pipeline. The real desktop now mirrors to it live (zero-copy, same backbuffer physical memory) alongside the GOP boot display. |
 | 🟡 | USB HID keyboard — `xhci.rs` driver support done (translates USB boot-protocol keycodes to PS/2 scancodes, reusing `ps2::handle_scancode()`'s existing shift/caps/ctrl state machine); **not exercised by default** — the shared dev QEMU scripts don't attach a `usb-kbd` device, since doing so risks double-registering every keystroke (QEMU delivers host key events to both PS/2 *and* a USB keyboard simultaneously, and PS/2 stays enabled). See Next Steps for the tradeoff. |
-| ○ | Drivers moved to userspace libOS — original plan put all drivers (XHCI/HDA/NVMe/PCI/ACPI/GOP) in userspace except where hardware forces kernel; every driver is still in-kernel (ring 0) today, `userspace/` only has the `hepos-rt`/`hepos-std`/`hello` scaffolding. Biggest architectural gap vs. the original design. |
+| 🟡 | Drivers moved to userspace libOS — **4 of 6 done.** RTL8139 (`userspace/rtl8139d`), Intel HDA (`userspace/hdad`), AHCI (`userspace/ahcid`), and XHCI (`userspace/xhcid`) all run their ongoing hot-path work as persistent userspace processes, talking to the kernel through shared-memory mailboxes (one-time hardware bring-up stays in-kernel, since it needs `pmm`/PCI access no ring-3 process has). A `service`/`kill` terminal command layer (see Terminal → Service management) manages start/stop/enable/disable for all 4. NVMe, PCI, ACPI, and GOP are still in-kernel; NVMe and GOP remain the two meaningfully-higher-stakes migration candidates (PCI/ACPI are one-shot enumeration work, not really in scope for this). |
 
 ### Storage
 | ✓/○ | Feature |
@@ -657,7 +659,7 @@ Range 0–32767 scaled to framebuffer size.
 
 Completed items are removed once done — see the "Original Design Plan vs. Current Reality" audit above for current status, "What's Built" below for what exists, and `git log` for how each one was actually implemented (every fix this project has made has a detailed commit/PLAN.md history if it's ever needed again).
 
-1. 🟡 **Move drivers to userspace libOS** — original plan's biggest deviation; XHCI/HDA/NVMe/PCI/ACPI/GOP all still run in-kernel. The foundational IPC/MMIO-passthrough syscall layer this needs first now exists and is proven working; no existing kernel driver has been migrated yet (see below for exactly what remains).
+1. 🟡 **Move drivers to userspace libOS** — original plan's biggest deviation. **4 of 6 drivers now migrated**: RTL8139 (NIC), Intel HDA (audio), AHCI (SATA), and XHCI (USB HID) all run their ongoing hot-path work as persistent userspace processes (`userspace/{rtl8139d,hdad,ahcid,xhcid}`), talking to the kernel through shared-memory mailboxes, with a `service`/`kill` command layer to start/stop/enable/disable each one (see the "Service management" section above). NVMe (the actual HepFS boot disk), PCI enumeration, ACPI, and GOP (the framebuffer) still run entirely in-kernel — PCI/ACPI are mostly one-shot enumeration work with no real ongoing hot path to migrate, so NVMe and GOP are the two meaningfully-remaining, higher-stakes candidates (see below for exactly what's left).
     - Three new HepOS-specific syscalls (`kernel/src/syscall.rs`, numbered 500+ so they can never collide with a real Linux-ABI syscall this project might add later): `SYS_MMAP_MMIO(phys_addr, len) -> user VA` maps a physical MMIO region directly into the calling process's own page tables (via a new `paging::map_page_current_user()`, which — unlike `map_page_into` — operates on the *currently loaded* CR3 with the USER bit set at every page-table level, since a syscall runs with the calling process's PML4 already live); `SYS_PORT_IN(port, width)`/`SYS_PORT_OUT(port, width, val)` do privileged port I/O *inside* the syscall (ring 3 has no IOPL/I/O-bitmap set up here, so this boundary **is** the permission check for now — deliberately not real permission scoping, see below).
     - Once mapped, the process reads/writes the MMIO region directly with no further syscalls — the actual point of "passthrough": a real driver needs fast polled access, not a syscall per register touch.
     - Proven end-to-end with a new userspace program, `userspace/hwtest` (built alongside `hello`, baked into the kernel the same way, run via the terminal's `runhwtest` command): reads the RTC "seconds" register through `SYS_PORT_IN`/`SYS_PORT_OUT` (ports 0x70/0x71 — fixed ISA ports, no PCI/BAR discovery needed) and the Local APIC ID register through `SYS_MMAP_MMIO` (physical address 0xFEE00000 — a fixed x86_64 architectural constant, likewise no BAR discovery needed) — entirely from ring 3, with zero kernel-side driver code involved for either read. Verified via a temporary boot-time test: both reads returned real hardware values (`RTC seconds (BCD) via SYS_PORT_IN: 0x27`, `Local APIC ID via SYS_MMAP_MMIO: 0`) and the process exited cleanly.
@@ -738,8 +740,8 @@ terminal::TERMINAL         Mutex<Option<Terminal>>
 editor::EDITOR             Mutex<Option<Editor>>
 scheduler::SCHEDULER       Mutex<Scheduler>
 mouse::MOUSE               Mutex<Mouse>                 // x, y, buttons — written by XHCI + PS/2
-process::CURRENT_PID       AtomicU32                    // PID of running user process (0 = none)
-process::PROCTAB           Mutex<Vec<ProcEntry>>        // process history (max 32, oldest exited dropped)
+process::PROC_SLOTS        [ProcSlot; MAX_TASKS]        // per-task process state (pid, exit_code, running, mmio bump alloc) — NOT a single global; several processes run concurrently now (see scheduler::Task::cr3's doc comment)
+process::PROCTAB           Mutex<Vec<ProcEntry>>        // process history (max 32, oldest exited dropped) — backs `ps`/`service`/`kill`
 ```
 
 ```rust
