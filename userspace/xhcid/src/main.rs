@@ -224,6 +224,32 @@ pub unsafe extern "C" fn _start(mailbox_phys: u64) -> ! {
             }
         }
 
+        // Persist our live ring-position state back into the mailbox —
+        // `evt_i`/`evt_c`/`mouse.hid_i`/`mouse.hid_c` (and `kbd`'s) were
+        // only ever *read* from the mailbox once, at startup (the kernel's
+        // own bring-up had already advanced them past several command
+        // completions before handing off). Without writing them back, a
+        // `service stop xhcid` + `service start xhcid` cycle would relaunch
+        // a fresh `xhcid` that resumes from those stale *boot-time* ring
+        // positions instead of wherever this instance actually left off —
+        // desyncing it from the real hardware/software ring state (the
+        // event ring's cycle-bit convention no longer matches what the xHC
+        // itself has already produced, and the HID ring's next slot no
+        // longer matches what's actually free) — symptom: after a restart
+        // the cursor reappears (the process is alive and mapped) but never
+        // moves again (`dequeue()` never sees a matching cycle bit, so no
+        // report ever reaches the mailbox's report ring). Cheap to keep
+        // fresh unconditionally every iteration — just a few writes into
+        // already-mapped memory, no syscall.
+        core::ptr::write_volatile(&mut (*mb).evt_i, evt_i as u32);
+        core::ptr::write_volatile(&mut (*mb).evt_c, evt_c as u32);
+        core::ptr::write_volatile(&mut (*mb).mouse.hid_i, mouse.hid_i as u32);
+        core::ptr::write_volatile(&mut (*mb).mouse.hid_c, mouse.hid_c as u32);
+        if let Some(k) = kbd.as_ref() {
+            core::ptr::write_volatile(&mut (*mb).kbd.hid_i, k.hid_i as u32);
+            core::ptr::write_volatile(&mut (*mb).kbd.hid_c, k.hid_c as u32);
+        }
+
         // Rate-limit to once per timer tick, same reasoning as every other
         // userspace driver in this kernel (see rtl8139d/hdad/ahcid) — a
         // never-yielding poll loop starves the host's own I/O handling
