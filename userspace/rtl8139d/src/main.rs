@@ -80,7 +80,19 @@ pub unsafe extern "C" fn _start(mailbox_phys: u64) -> ! {
     println!("rtl8139d: ready (io_base {:#x})", io);
 
     let mut tx_slot = 0usize;
-    let mut rx_off  = 0usize;
+    // Recover the RX read position from the hardware's own CAPR register
+    // instead of assuming a fresh ring (rx_off = 0) — CAPR is a real
+    // hardware register that persists across a process restart (it's set
+    // by whichever `rtl8139d` instance last ran, via the `sys_port_out`
+    // calls below), so on a `service start` after a `service stop`/`kill`,
+    // it already reflects exactly where the *previous* instance left off.
+    // Starting fresh from 0 instead would read the ring at the wrong byte
+    // offset — real, previously-unnoticed bug found the same way as the
+    // identical one in `userspace/xhcid` (see PLAN.md's Service management
+    // section): a restarted driver silently desyncs from where the
+    // hardware actually is, misparsing whatever bytes happen to sit at the
+    // stale offset as a bogus packet header forever after.
+    let mut rx_off = (hepos_rt::sys_port_in(io + CAPR, 2) as usize + 16) % 65536;
 
     loop {
         if core::ptr::read_volatile(&mb.stop) != 0 {
