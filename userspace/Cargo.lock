@@ -11,6 +11,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fstest"
+version = "0.1.0"
+dependencies = [
+ "hepos-rt",
+ "hepos-std",
+]
+
+[[package]]
 name = "hdad"
 version = "0.1.0"
 dependencies = [
@@ -46,6 +54,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "inputtest"
+version = "0.1.0"
+dependencies = [
+ "hepos-rt",
+ "hepos-std",
+]
+
+[[package]]
+name = "memtest"
+version = "0.1.0"
+dependencies = [
+ "hepos-rt",
+ "hepos-std",
+]
+
+[[package]]
 name = "nvmed"
 version = "0.1.0"
 dependencies = [
@@ -55,6 +79,14 @@ dependencies = [
 
 [[package]]
 name = "rtl8139d"
+version = "0.1.0"
+dependencies = [
+ "hepos-rt",
+ "hepos-std",
+]
+
+[[package]]
+name = "svctest"
 version = "0.1.0"
 dependencies = [
  "hepos-rt",

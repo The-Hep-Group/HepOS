@@ -97,4 +97,58 @@ fn main() {
     } else {
         std::fs::write(&gen_nvmed, "static NVMED_ELF: &[u8] = &[];\n").unwrap();
     }
+
+    // Bake the userspace memtest ELF (proves out SYS_MMAP_ANON — Phase 1 of
+    // the desktop-to-userspace migration, see PLAN.md) the same way.
+    let memtest     = root.join("userspace/target/x86_64-unknown-none/release/memtest");
+    let gen_memtest = std::path::Path::new(&out_dir).join("memtest_elf.rs");
+    if memtest.exists() {
+        let bytes = std::fs::read(&memtest).expect("read memtest ELF");
+        let lit: String = bytes.iter().map(|b| format!("{},", b)).collect();
+        std::fs::write(&gen_memtest, format!("static MEMTEST_ELF: &[u8] = &[{}];\n", lit)).unwrap();
+        println!("cargo:rerun-if-changed={}", memtest.display());
+    } else {
+        std::fs::write(&gen_memtest, "static MEMTEST_ELF: &[u8] = &[];\n").unwrap();
+    }
+
+    // Bake the userspace inputtest ELF (proves out SYS_INPUT_STATE — Phase 1
+    // of the desktop-to-userspace migration, see PLAN.md) the same way.
+    let inputtest     = root.join("userspace/target/x86_64-unknown-none/release/inputtest");
+    let gen_inputtest = std::path::Path::new(&out_dir).join("inputtest_elf.rs");
+    if inputtest.exists() {
+        let bytes = std::fs::read(&inputtest).expect("read inputtest ELF");
+        let lit: String = bytes.iter().map(|b| format!("{},", b)).collect();
+        std::fs::write(&gen_inputtest, format!("static INPUTTEST_ELF: &[u8] = &[{}];\n", lit)).unwrap();
+        println!("cargo:rerun-if-changed={}", inputtest.display());
+    } else {
+        std::fs::write(&gen_inputtest, "static INPUTTEST_ELF: &[u8] = &[];\n").unwrap();
+    }
+
+    // Bake the userspace fstest ELF (proves out SYS_FS_LIST_DIR/READ_FILE/
+    // WRITE_FILE/CREATE — Phase 1 of the desktop-to-userspace migration,
+    // see PLAN.md) the same way.
+    let fstest     = root.join("userspace/target/x86_64-unknown-none/release/fstest");
+    let gen_fstest = std::path::Path::new(&out_dir).join("fstest_elf.rs");
+    if fstest.exists() {
+        let bytes = std::fs::read(&fstest).expect("read fstest ELF");
+        let lit: String = bytes.iter().map(|b| format!("{},", b)).collect();
+        std::fs::write(&gen_fstest, format!("static FSTEST_ELF: &[u8] = &[{}];\n", lit)).unwrap();
+        println!("cargo:rerun-if-changed={}", fstest.display());
+    } else {
+        std::fs::write(&gen_fstest, "static FSTEST_ELF: &[u8] = &[];\n").unwrap();
+    }
+
+    // Bake the userspace svctest ELF (proves out SYS_SERVICE_CTL/POLL and
+    // SYS_SPAWN_BYTES — Phase 1 item 4, the last of the desktop-to-userspace
+    // migration's foundational syscalls, see PLAN.md) the same way.
+    let svctest     = root.join("userspace/target/x86_64-unknown-none/release/svctest");
+    let gen_svctest = std::path::Path::new(&out_dir).join("svctest_elf.rs");
+    if svctest.exists() {
+        let bytes = std::fs::read(&svctest).expect("read svctest ELF");
+        let lit: String = bytes.iter().map(|b| format!("{},", b)).collect();
+        std::fs::write(&gen_svctest, format!("static SVCTEST_ELF: &[u8] = &[{}];\n", lit)).unwrap();
+        println!("cargo:rerun-if-changed={}", svctest.display());
+    } else {
+        std::fs::write(&gen_svctest, "static SVCTEST_ELF: &[u8] = &[];\n").unwrap();
+    }
 }

@@ -29,7 +29,7 @@ const COMMAND_NAMES: &[&str] = &[
     "rm", "cp", "mv", "write", "edit", "uname", "mem", "date",
     "history", "lspci", "netdiag", "netstart", "netpoll", "ifconfig",
     "ping", "wget", "udp", "view", "play", "shutdown", "reboot", "echo",
-    "sysinfo", "syscallinfo", "runtest", "runhello", "runhwtest", "exec", "ps", "newterm", "beep", "volume", "sata",
+    "sysinfo", "syscallinfo", "runtest", "runhello", "runhwtest", "runmemtest", "runinputtest", "runfstest", "runsvctest", "exec", "ps", "newterm", "beep", "volume", "sata",
     "service", "kill",
 ];
 
@@ -1032,6 +1032,34 @@ impl Terminal {
                 match crate::process::run_hwtest_async(self.win_id) {
                     Ok(()) => self.print_colored("Launching hwtest (userspace MMIO/port-IO demo)...\n", OK),
                     Err(e) => self.print_colored(&alloc::format!("runhwtest: {}\n", e), ERR),
+                }
+            }
+
+            "runmemtest" => {
+                match crate::process::run_memtest_async(self.win_id) {
+                    Ok(()) => self.print_colored("Launching memtest (SYS_MMAP_ANON demo)...\n", OK),
+                    Err(e) => self.print_colored(&alloc::format!("runmemtest: {}\n", e), ERR),
+                }
+            }
+
+            "runinputtest" => {
+                match crate::process::run_inputtest_async(self.win_id) {
+                    Ok(()) => self.print_colored("Launching inputtest (SYS_INPUT_STATE demo)...\n", OK),
+                    Err(e) => self.print_colored(&alloc::format!("runinputtest: {}\n", e), ERR),
+                }
+            }
+
+            "runfstest" => {
+                match crate::process::run_fstest_async(self.win_id) {
+                    Ok(()) => self.print_colored("Launching fstest (SYS_FS_* demo)...\n", OK),
+                    Err(e) => self.print_colored(&alloc::format!("runfstest: {}\n", e), ERR),
+                }
+            }
+
+            "runsvctest" => {
+                match crate::process::run_svctest_async(self.win_id) {
+                    Ok(()) => self.print_colored("Launching svctest (SYS_SERVICE_CTL/SYS_SPAWN_BYTES demo)...\n", OK),
+                    Err(e) => self.print_colored(&alloc::format!("runsvctest: {}\n", e), ERR),
                 }
             }
 

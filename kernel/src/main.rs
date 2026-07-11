@@ -1874,6 +1874,19 @@ fn task_blink() -> ! {
         // state machine — see hda::play_pcm()/poll() docs).
         hda::poll();
 
+        // Advance any in-progress async HepFS syscall job (SYS_FS_LIST_DIR/
+        // READ_FILE/WRITE_FILE/CREATE) — see syscall::fs_service()'s doc
+        // comment for why this can't just run synchronously inside the
+        // syscall itself (it needs to safely wait on nvmed's mailbox, which
+        // requires interrupts enabled).
+        syscall::fs_service();
+
+        // Advance any in-progress async SYS_SERVICE_CTL start/stop job — same
+        // reasoning as fs_service() above (start_service()/stop_service()
+        // spin-wait for the driver task to be scheduled, impossible from
+        // inside a syscall).
+        syscall::svc_service();
+
         // Expire the desktop's transient "Programs can't be renamed" toast, if any.
         { let mut dt = desktop::DESKTOP.lock(); if let Some(dt) = dt.as_mut() { dt.tick_icon_message(); } }
 

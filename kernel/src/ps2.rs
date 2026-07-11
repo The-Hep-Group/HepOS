@@ -167,6 +167,23 @@ pub fn read_char() -> Option<char> {
     KEYBUF.lock().pop().map(|b| b as char)
 }
 
+/// Same as `read_char()`, but never spins waiting for `KEYBUF`'s own lock
+/// either — returns `None` if the lock is currently held by someone else,
+/// instead of busy-waiting for it. Needed by `SYS_INPUT_STATE`
+/// (`syscall.rs`): a syscall handler runs with interrupts disabled the
+/// whole time (SFMASK clears IF on `SYSCALL` entry), so if the *only* other
+/// holder of this lock (`poll()`, called from `task_blink`) got preempted
+/// mid-hold by the very timer interrupt that would otherwise reschedule it
+/// back in, an ordinary `.lock()` here would spin forever with no way to
+/// ever make progress — a real, previously-latent deadlock a plain `.lock()`
+/// call in a syscall handler can hit that in-kernel code calling `.lock()`
+/// from `task_blink`'s own single-threaded context never could (nothing
+/// else ever contended these locks from a genuinely different scheduled
+/// task before this syscall existed).
+pub fn try_read_char() -> Option<char> {
+    KEYBUF.try_lock().and_then(|mut g| g.pop()).map(|b| b as char)
+}
+
 /// Blocking read — spins until a key is available.
 pub fn read_char_blocking() -> char {
     loop {
