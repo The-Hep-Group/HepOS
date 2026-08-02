@@ -576,7 +576,14 @@ pub fn exec_async_with_arg(issuer: usize, name: &str, data: &[u8], arg: u64) -> 
     if data.is_empty() { return Err("nothing to run"); }
     ACTIVE_JOBS.fetch_add(1, Ordering::Relaxed);
     PENDING_QUEUE.lock().push(AsyncJob { issuer, name: String::from(name), data: data.to_vec(), arg });
-    scheduler::spawn("user_proc", async_task_entry);
+    let _task_id = scheduler::spawn("user_proc", async_task_entry);
+    // TEMPORARY DIAGNOSTIC: scheduler.rs reverted to the pre-session original
+    // (plain flat round-robin, no set_priority_task()) for an isolation test
+    // — see kernel/src/scheduler.rs's own note. Restore this block once that
+    // test concludes.
+    // if name == crate::xhci::SERVICE_NAME {
+    //     scheduler::set_priority_task(_task_id);
+    // }
     Ok(())
 }
 

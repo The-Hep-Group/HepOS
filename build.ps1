@@ -64,6 +64,17 @@ if (-not (Test-Path $sata_disk)) {
 # ── 7. Run in QEMU (UEFI boot via HepBL) ─────────────────────────────────────
 # X-PciMmio64Mb=0 keeps all PCI BARs below 4 GiB (kernel reads 32-bit BARs,
 # and HepBL's HHDM covers 0..4 GiB).
+#
+# Tried -accel whpx as an experiment (hardware-accelerated Windows Hypervisor
+# Platform instead of plain software emulation) to see if the host itself was
+# the bottleneck behind choppy cursor/window-drag rendering. Reverted: it made
+# things dramatically worse, not better — HepOS's timing-sensitive code (TSC
+# calibration, APIC timer setup, device bring-up delays) was written and tuned
+# entirely against TCG's specific (slower, more deterministic) instruction
+# timing, and doesn't cope with WHPX's real-hardware-speed execution. Confirmed
+# incompatible; stick with plain software emulation (the default with no
+# -accel flag) unless someone specifically re-tunes the timing-sensitive code
+# for it first.
 $qemu = "C:\Program Files\qemu\qemu-system-x86_64.exe"
 & $qemu `
     -M q35 `

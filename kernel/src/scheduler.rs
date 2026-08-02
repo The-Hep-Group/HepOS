@@ -116,25 +116,11 @@ impl Task {
 pub struct Scheduler {
     pub tasks:   Vec<Task>,
     pub current: usize,
-    /// Toggles every `next()` call — alternates between "give the desktop's
-    /// own render task (`blink`) first refusal" and "ordinary round-robin
-    /// among everything else". See `next()`'s doc comment for why plain flat
-    /// round-robin isn't good enough once several background tasks exist.
-    prefer_foreground: bool,
-    /// Independent rotation cursor for the background-task pool (everything
-    /// except `blink`/`idle`) — advances only when a background task is
-    /// actually picked. Deliberately *not* the same thing as `self.current`:
-    /// `current` is `blink`'s own index every other tick (right after a
-    /// foreground pick), so scanning from `current + 1` would always resume
-    /// right after `blink` and find the same one task sitting there — see
-    /// `next()`'s doc comment for the real starvation bug that caused before
-    /// this field existed.
-    bg_cursor: usize,
 }
 
 impl Scheduler {
     pub const fn empty() -> Self {
-        Scheduler { tasks: Vec::new(), current: 0, prefer_foreground: true, bg_cursor: 0 }
+        Scheduler { tasks: Vec::new(), current: 0 }
     }
 
     pub fn add(&mut self, task: Task) {
@@ -154,37 +140,6 @@ impl Scheduler {
     /// `Blocked`) on themselves *before* calling this, and that must survive
     /// the switch untouched — overwriting it back to `Ready` here would undo
     /// the exit/sleep the instant it took effect.
-    ///
-    /// **Foreground priority (see `prefer_foreground`):** plain flat
-    /// round-robin used to be fine with just `idle`+`blink` competing, but
-    /// every userspace driver migration (`rtl8139d`/`hdad`/`ahcid`/`xhcid`/
-    /// `nvmed`, now `svcworker` too) added another task that ends its loop
-    /// blocked on the *timer* IRQ (`sys_wait_irq(0x20)`) — meaning all of
-    /// them become `Ready` again on the very same tick, together. Flat
-    /// round-robin then gives each of them a full turn before `blink` comes
-    /// back around, so `blink`'s duty cycle silently shrank from 1-in-2 (just
-    /// `idle`) to 1-in-8 (every background task added) — visibly choppy
-    /// cursor/window-drag rendering, worse with each driver migrated.
-    /// Background tasks don't actually need more than a once-per-tick look
-    /// (that's the whole reason they block on the timer IRQ specifically),
-    /// so giving `blink` first refusal every *other* tick costs them nothing
-    /// they were using, while restoring the render loop's original ~50% duty
-    /// cycle regardless of how many more drivers move to userspace later.
-    /// `idle` is also deprioritized below the moment any real task is
-    /// `Ready` — it exists purely as "nothing else to do" filler, not an
-    /// equal competitor for timeslices.
-    ///
-    /// **Real bug this went through first:** the background-pool scan used
-    /// to start at `self.current + 1`. Since `self.current` is `blink`'s own
-    /// index on every "off" tick (right after a foreground pick), that scan
-    /// always resumed scanning right after `blink` and immediately found
-    /// whichever single task happens to sit next in the list (`svcworker`,
-    /// registered right after `blink` in `kmain`) — picking that same one
-    /// task forever and starving every other background task (all 5 real
-    /// userspace drivers) completely, not just throttling them. Fixed with
-    /// `bg_cursor`, a rotation position that only moves when a background
-    /// task is actually chosen, independent of how many foreground picks
-    /// happen in between.
     pub fn next(&mut self) -> Option<(*mut u64, u64, u64, u64)> {
         let n = self.tasks.len();
         if n < 2 { return None; }
@@ -201,41 +156,12 @@ impl Scheduler {
             }
         }
 
-        let mut next = None;
-
-        if self.prefer_foreground {
-            if let Some(idx) = self.tasks.iter().position(|t| t.name == "blink") {
-                if idx != self.current && self.tasks[idx].state == TaskState::Ready {
-                    next = Some(idx);
-                }
-            }
+        let mut next = (self.current + 1) % n;
+        for _ in 0..n {
+            if self.tasks[next].state == TaskState::Ready { break; }
+            next = (next + 1) % n;
         }
-
-        if next.is_none() {
-            let mut candidate = (self.bg_cursor + 1) % n;
-            let mut idle_candidate = None;
-            for _ in 0..n {
-                if self.tasks[candidate].state == TaskState::Ready {
-                    if self.tasks[candidate].name == "idle" {
-                        if idle_candidate.is_none() { idle_candidate = Some(candidate); }
-                    } else {
-                        next = Some(candidate);
-                        break;
-                    }
-                }
-                candidate = (candidate + 1) % n;
-            }
-            if let Some(picked) = next {
-                self.bg_cursor = picked;
-            } else if let Some(picked) = idle_candidate {
-                next = Some(picked);
-                self.bg_cursor = picked;
-            }
-        }
-
-        self.prefer_foreground = !self.prefer_foreground;
-
-        let Some(next) = next else { return None; };
+        if self.tasks[next].state != TaskState::Ready { return None; }
         if next == self.current { return None; }
 
         if self.tasks[self.current].state == TaskState::Running {
@@ -283,8 +209,8 @@ pub fn set_current_cr3(cr3: u64) {
 
 pub static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::empty());
 
-// IDs 0/1/2 are the boot-registered idle/blink/svcworker tasks (kmain, see main.rs).
-static NEXT_TASK_ID: AtomicUsize = AtomicUsize::new(3);
+// IDs 0/1 are the boot-registered idle/blink tasks (kmain, see main.rs).
+static NEXT_TASK_ID: AtomicUsize = AtomicUsize::new(2);
 
 /// Spawn a new task at runtime. Reuses a `Dead` task's slot (and its stack
 /// allocation) if one exists — same "evict an exited entry" pattern
