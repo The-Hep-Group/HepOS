@@ -182,14 +182,16 @@ struct HepfsNav {
     /// directory never opens already scrolled from wherever the previous
     /// one was left.
     scroll: usize,
-    /// Cached `hepfs::list_dir(cache_ino)` result, valid as long as
-    /// `cache_gen` still matches `hepfs::generation()` — see
-    /// `hepfs_list_dir_cached()`'s doc comment for why this exists (avoiding
-    /// a real disk round trip, now routed through `nvmed`'s mailbox, on
-    /// every single render frame while dragging any window).
+    /// Cached `hepfs::list_dir(cache_ino)` result — each entry resolved to
+    /// `(ino, name, is_dir, size)` up front — valid as long as `cache_gen`
+    /// still matches `hepfs::generation()`. See `hepfs_list_dir_cached()`'s
+    /// doc comment for why this exists (avoiding a real disk round trip, now
+    /// routed through `nvmed`'s mailbox, on every single render frame while
+    /// dragging any window) and why `is_dir`/`size` are resolved into the
+    /// cache itself rather than left for the caller to look up per entry.
     cache_ino:     Option<u32>,
     cache_gen:     u64,
-    cache_entries: alloc::vec::Vec<(u32, alloc::string::String)>,
+    cache_entries: alloc::vec::Vec<(u32, alloc::string::String, bool, u64)>,
 }
 
 // One entry per Files window, keyed by window id — same pattern as
@@ -207,27 +209,43 @@ fn hepfs_nav_new() -> HepfsNav {
     }
 }
 
-/// Returns `hepfs::list_dir(ino)` for `win_id`'s navigator, using its cached
-/// copy if `ino` and `hepfs::generation()` both still match what was cached
-/// last time — avoiding a real disk read (a round trip through `nvmed`'s
-/// mailbox post-migration) on every call. Callers that need this on every
-/// single render frame (the file manager's own draw function, its scrollbar
-/// math, and its marquee-select hit-testing) used to call
-/// `hepfs::list_dir()` directly and unconditionally — harmless when it was a
-/// fast direct in-kernel read, but a genuine per-frame stall once `nvmed`
-/// might not have run yet. Falls back to an uncached, one-shot read (no
-/// caching) if `win_id` has no registered navigator — callers should treat
-/// that as "shouldn't normally happen" rather than design around it.
-fn hepfs_list_dir_cached(win_id: usize, ctrl: &mut hepfs::BlockDev, ino: u32) -> alloc::vec::Vec<(u32, alloc::string::String)> {
+/// Resolves `hepfs::list_dir(ino)` into `(ino, name, is_dir, size)` tuples —
+/// each entry's inode looked up once here, not by the caller.
+fn list_dir_with_info(ctrl: &mut hepfs::BlockDev, ino: u32) -> alloc::vec::Vec<(u32, alloc::string::String, bool, u64)> {
+    hepfs::list_dir(ctrl, ino).into_iter()
+        .map(|(i, name)| {
+            let inode = hepfs::read_inode(ctrl, i);
+            (i, name, inode.flags == hepfs::F_DIR, inode.size)
+        })
+        .collect()
+}
+
+/// Returns `list_dir_with_info(ino)` for `win_id`'s navigator, using its
+/// cached copy if `ino` and `hepfs::generation()` both still match what was
+/// cached last time — avoiding a real disk read (a round trip through
+/// `nvmed`'s mailbox post-migration) on every call. Callers that need this
+/// on every single render frame (the file manager's own draw function, its
+/// scrollbar math, and its marquee-select hit-testing) used to call
+/// `hepfs::list_dir()` *plus a separate `hepfs::read_inode()` per entry*
+/// directly and unconditionally — harmless when they were fast direct
+/// in-kernel reads, but a genuine per-frame stall (one full mailbox round
+/// trip *per entry*, not just once) once `nvmed` might not have run yet.
+/// That per-entry `read_inode()` call is exactly why caching just
+/// `list_dir()`'s own result wasn't enough on its own — the inode lookups
+/// were still happening every frame. Falls back to an uncached, one-shot
+/// read (no caching) if `win_id` has no registered navigator — callers
+/// should treat that as "shouldn't normally happen" rather than design
+/// around it.
+fn hepfs_list_dir_cached(win_id: usize, ctrl: &mut hepfs::BlockDev, ino: u32) -> alloc::vec::Vec<(u32, alloc::string::String, bool, u64)> {
     let mut navs = HEPFS_NAVS.lock();
     let Some((_, nav)) = navs.iter_mut().find(|(id, _)| *id == win_id) else {
-        return hepfs::list_dir(ctrl, ino);
+        return list_dir_with_info(ctrl, ino);
     };
     let gen = hepfs::generation();
     if nav.cache_ino == Some(ino) && nav.cache_gen == gen {
         return nav.cache_entries.clone();
     }
-    let entries = hepfs::list_dir(ctrl, ino);
+    let entries = list_dir_with_info(ctrl, ino);
     nav.cache_ino = Some(ino);
     nav.cache_gen = gen;
     nav.cache_entries = entries.clone();
@@ -2413,7 +2431,7 @@ fn render_hepfs_window(display: &mut framebuffer::Display, wx: usize, wy: usize,
         let ctrl = &mut hepfs::BlockDev::Nvme(ctrl);
         let entries = hepfs_list_dir_cached(win_id, ctrl, cur_ino);
         let dirs: alloc::vec::Vec<_> = entries.iter()
-            .filter(|(ino, _)| hepfs::read_inode(ctrl, *ino).flags == hepfs::F_DIR)
+            .filter(|(_, _, is_dir, _)| *is_dir)
             .collect();
 
         let hover = framebuffer::Color::from_hex(0x1E1E40);
@@ -2427,7 +2445,7 @@ fn render_hepfs_window(display: &mut framebuffer::Display, wx: usize, wy: usize,
             display.draw_text(wx + 18, y, "..", dir_col, 1);
             y += 14; row += 1;
         }
-        for (_, name) in &dirs {
+        for (_, name, _, _) in &dirs {
             if y + 12 > list_top + list_h { break; }
             if is_highlighted(3, row) { display.fill_rect(wx, y.saturating_sub(1), left_w, 13, hover); }
             icons::draw_file_icon(display, wx + 3, y.saturating_sub(1), 12, true, name);
@@ -2498,10 +2516,8 @@ fn render_hepfs_window(display: &mut framebuffer::Display, wx: usize, wy: usize,
         if !at_root {
             draw_grid_cell(display, true, "..", None);
         }
-        for (ino, name) in &entries {
-            let inode = hepfs::read_inode(ctrl, *ino);
-            let is_dir = inode.flags == hepfs::F_DIR;
-            draw_grid_cell(display, is_dir, name, if is_dir { None } else { Some(inode.size) });
+        for (_, name, is_dir, size) in &entries {
+            draw_grid_cell(display, *is_dir, name, if *is_dir { None } else { Some(*size) });
         }
         if entries.is_empty() && at_root {
             display.draw_text(right_x + 4, list_top + 4, "(empty)", dim, 1);

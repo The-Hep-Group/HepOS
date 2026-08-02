@@ -74,6 +74,8 @@ Hardware: x86_64, UEFI boot (OVMF/TianoCore firmware under QEMU)
 
 > MSYS2/xorriso are **no longer needed** — HepOS dropped the ISO + Limine pipeline in favor of HepBL + a plain FAT boot directory that QEMU mounts directly.
 
+> **Turn off Smart App Control before building.** If it's on (Settings → Privacy & security → Windows Security → App & browser control → Smart App Control), Windows silently blocks the nightly toolchain's `rustc.exe` from ever running — `cargo +nightly build` fails with `could not execute process ... error: An Application Control policy has blocked this file. (os error 4551)`, with no indication of what's actually wrong. Microsoft only supports turning Smart App Control **off**, not back on, without a clean Windows reinstall — so check this *before* you ever build, not after chasing a phantom build failure.
+
 ### Linux (Debian/Ubuntu)
 
 ```bash
@@ -115,6 +117,8 @@ cd HepOS
 No submodules or extra clones needed — HepBL replaced Limine, so there's no external bootloader binary to fetch.
 
 ### Windows
+
+> Make sure Smart App Control is off first — see the Prerequisites note above. If `build.ps1` fails with `An Application Control policy has blocked this file`, that's what's wrong.
 
 ```powershell
 .\build.ps1
