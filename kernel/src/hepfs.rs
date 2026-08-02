@@ -13,6 +13,26 @@
 use alloc::{string::String, vec::Vec};
 use crate::{ahci, nvme::NvmeController, pmm, vmm};
 
+/// Bumped by every directory-structure mutation (create/remove/rename/move —
+/// see each function's call to `bump_generation()`). Lets a caller that
+/// caches a `list_dir()` result (see `main.rs`'s `HepfsNav` cache) know
+/// whether its cache is still valid without re-reading the directory from
+/// disk: same `ino` + same generation number means nothing has changed.
+/// Needed because a real disk read here now means a round trip through
+/// `nvmed`'s mailbox (post-userspace-migration), so calling `list_dir()`
+/// unconditionally on every render frame — which is what every caller used
+/// to do, harmlessly, when it was a fast direct in-kernel call — became a
+/// genuine per-frame stall waiting for `nvmed` to get its next scheduler
+/// turn. Deliberately coarse-grained (one counter for the whole filesystem,
+/// not per-directory) — simple, and cheap enough that over-invalidating a
+/// cache on an unrelated directory's change is not worth avoiding.
+static GENERATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Current generation number — see `GENERATION`'s doc comment.
+pub fn generation() -> u64 { GENERATION.load(core::sync::atomic::Ordering::Relaxed) }
+
+fn bump_generation() { GENERATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
+
 /// Block-device backend HepFS is mounted on — NVMe (the only one actually
 /// wired up to mount/format/boot logic today) or AHCI/SATA (driver exists
 /// and is verified standalone, see `ahci.rs`, but nothing mounts HepFS on it
@@ -387,6 +407,7 @@ fn add_dir_entry(ctrl: &mut BlockDev, dir_ino: u32, name: &str, ino: u32) {
 
 /// Create a file inside parent directory. Returns the new inode number.
 pub fn create_file(ctrl: &mut BlockDev, parent: u32, name: &str) -> u32 {
+    bump_generation();
     let ino  = alloc_inode(ctrl);
     let inode = Inode { flags: F_FILE, ..Default::default() };
     write_inode(ctrl, ino, &inode);
@@ -396,6 +417,7 @@ pub fn create_file(ctrl: &mut BlockDev, parent: u32, name: &str) -> u32 {
 
 /// Create a subdirectory inside parent directory. Returns the new inode number.
 pub fn create_dir(ctrl: &mut BlockDev, parent: u32, name: &str) -> u32 {
+    bump_generation();
     let ino  = alloc_inode(ctrl);
     let blk  = alloc_block(ctrl);
     let inode = Inode { flags: F_DIR, nblocks: 1, direct: { let mut d = [0u32; 12]; d[0] = blk; d }, ..Default::default() };
@@ -523,6 +545,7 @@ pub fn write_file(ctrl: &mut BlockDev, ino: u32, data: &[u8]) {
 
 /// Remove a file or empty directory from its parent. Returns true on success.
 pub fn remove(ctrl: &mut BlockDev, parent_ino: u32, name: &str) -> bool {
+    bump_generation();
     let ino = match find_in_dir(ctrl, parent_ino, name) {
         Some(i) => i,
         None    => return false,
@@ -603,6 +626,7 @@ pub fn remove(ctrl: &mut BlockDev, parent_ino: u32, name: &str) -> bool {
 /// (and, for a directory, its contents) is untouched. Returns false if
 /// `old_name` doesn't exist or `new_name` is already taken.
 pub fn rename(ctrl: &mut BlockDev, parent_ino: u32, old_name: &str, new_name: &str) -> bool {
+    bump_generation();
     if find_in_dir(ctrl, parent_ino, new_name).is_some() { return false; }
     let name_bytes = new_name.as_bytes();
     if name_bytes.len() > 27 { return false; }
@@ -640,6 +664,7 @@ pub fn rename(ctrl: &mut BlockDev, parent_ino: u32, old_name: &str, new_name: &s
 /// programmatic caller (e.g. a future `mv` shell command) starts calling
 /// this directly with arbitrary paths.
 pub fn move_entry(ctrl: &mut BlockDev, from_parent: u32, to_parent: u32, name: &str) -> bool {
+    bump_generation();
     if from_parent == to_parent { return false; }
     if find_in_dir(ctrl, to_parent, name).is_some() { return false; }
     let Some(ino) = find_in_dir(ctrl, from_parent, name) else { return false; };

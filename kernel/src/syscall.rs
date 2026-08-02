@@ -676,12 +676,28 @@ fn sys_fs_poll(out_ptr: u64, out_cap: u64) -> u64 {
     result as u64
 }
 
+/// True while either job queue has unfinished work — lets `task_svc_worker`
+/// (see `main.rs`) tell "actively driving a job forward" apart from "nothing
+/// to do right now", so it only busy-spins while real work is in flight and
+/// sleeps the rest of the time instead of fighting `task_blink` for every
+/// single timeslice.
+pub fn has_pending_job() -> bool {
+    let fs_pending = FS_JOB.lock().as_ref().map(|j| !j.done).unwrap_or(false);
+    let svc_pending = SVC_JOB.lock().as_ref().map(|j| !j.done).unwrap_or(false);
+    fs_pending || svc_pending
+}
+
 /// Advance the in-progress HepFS job, if any — call this once per
 /// `task_blink` frame, same as `net::poll()`/`hda::poll()`. Runs with
 /// interrupts enabled (this is ordinary kernel code, not a syscall), so
 /// unlike the syscalls above, it's safe to actually let a HepFS call wait
 /// on `nvmed`'s mailbox here — see this module's own doc comment for why
 /// that distinction is exactly what forced this whole redesign.
+///
+/// No longer called from `task_blink` itself — moved to its own scheduler
+/// task (`task_svc_worker`, `main.rs`) so a slow disk job or driver
+/// start/stop can't stall cursor/window rendering. See that task's doc
+/// comment for the full reasoning.
 pub fn fs_service() {
     let mut guard = FS_JOB.lock();
     let Some(job) = guard.as_mut() else { return; };
@@ -895,9 +911,11 @@ fn sys_service_poll() -> u64 {
 }
 
 /// Advance the in-progress service start/stop, if any — call once per
-/// `task_blink` frame, same as `fs_service()`. Interrupts are enabled here,
-/// so it's safe to let `start_service()`/`stop_service()` actually spin
-/// waiting for the driver task to be scheduled.
+/// `task_svc_worker` iteration (see `main.rs`), same as `fs_service()`.
+/// Interrupts are enabled here, so it's safe to let `start_service()`/
+/// `stop_service()` actually spin waiting for the driver task to be
+/// scheduled. No longer called from `task_blink` — see `task_svc_worker`'s
+/// doc comment.
 pub fn svc_service() {
     let mut guard = SVC_JOB.lock();
     let Some(job) = guard.as_mut() else { return; };

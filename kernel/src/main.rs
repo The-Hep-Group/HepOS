@@ -182,6 +182,14 @@ struct HepfsNav {
     /// directory never opens already scrolled from wherever the previous
     /// one was left.
     scroll: usize,
+    /// Cached `hepfs::list_dir(cache_ino)` result, valid as long as
+    /// `cache_gen` still matches `hepfs::generation()` — see
+    /// `hepfs_list_dir_cached()`'s doc comment for why this exists (avoiding
+    /// a real disk round trip, now routed through `nvmed`'s mailbox, on
+    /// every single render frame while dragging any window).
+    cache_ino:     Option<u32>,
+    cache_gen:     u64,
+    cache_entries: alloc::vec::Vec<(u32, alloc::string::String)>,
 }
 
 // One entry per Files window, keyed by window id — same pattern as
@@ -195,7 +203,35 @@ fn hepfs_nav_new() -> HepfsNav {
         back: alloc::vec::Vec::new(),
         fwd:  alloc::vec::Vec::new(),
         selected: None, selected_at: 0, range_selected: alloc::vec::Vec::new(), scroll: 0,
+        cache_ino: None, cache_gen: 0, cache_entries: alloc::vec::Vec::new(),
     }
+}
+
+/// Returns `hepfs::list_dir(ino)` for `win_id`'s navigator, using its cached
+/// copy if `ino` and `hepfs::generation()` both still match what was cached
+/// last time — avoiding a real disk read (a round trip through `nvmed`'s
+/// mailbox post-migration) on every call. Callers that need this on every
+/// single render frame (the file manager's own draw function, its scrollbar
+/// math, and its marquee-select hit-testing) used to call
+/// `hepfs::list_dir()` directly and unconditionally — harmless when it was a
+/// fast direct in-kernel read, but a genuine per-frame stall once `nvmed`
+/// might not have run yet. Falls back to an uncached, one-shot read (no
+/// caching) if `win_id` has no registered navigator — callers should treat
+/// that as "shouldn't normally happen" rather than design around it.
+fn hepfs_list_dir_cached(win_id: usize, ctrl: &mut hepfs::BlockDev, ino: u32) -> alloc::vec::Vec<(u32, alloc::string::String)> {
+    let mut navs = HEPFS_NAVS.lock();
+    let Some((_, nav)) = navs.iter_mut().find(|(id, _)| *id == win_id) else {
+        return hepfs::list_dir(ctrl, ino);
+    };
+    let gen = hepfs::generation();
+    if nav.cache_ino == Some(ino) && nav.cache_gen == gen {
+        return nav.cache_entries.clone();
+    }
+    let entries = hepfs::list_dir(ctrl, ino);
+    nav.cache_ino = Some(ino);
+    nav.cache_gen = gen;
+    nav.cache_entries = entries.clone();
+    entries
 }
 
 /// Spawn a brand-new Files window with its own independent navigator (starts at root).
@@ -761,6 +797,7 @@ extern "C" fn kmain(bi_ptr: *const bootinfo::BootInfo) -> ! {
         let mut sched = scheduler::SCHEDULER.lock();
         sched.add(scheduler::Task::new(0, "idle",  task_idle));
         sched.add(scheduler::Task::new(1, "blink", task_blink));
+        sched.add(scheduler::Task::new(2, "svcworker", task_svc_worker));
         sched.tasks[0].state = scheduler::TaskState::Running;
     }
     idt::set_handler(apic::timer_vector(), idt::timer_stub as u64);
@@ -775,6 +812,37 @@ extern "C" fn kmain(bi_ptr: *const bootinfo::BootInfo) -> ! {
 
 fn task_idle() -> ! {
     loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
+}
+
+/// Drives `syscall::fs_service()`/`svc_service()` — the async SYS_FS_*/
+/// SYS_SERVICE_CTL job handlers — on its own scheduler task instead of
+/// inline in `task_blink`'s render loop.
+///
+/// Both handlers can genuinely block for a while (a real disk read/write
+/// waiting on `nvmed`'s mailbox, or a driver start/stop spin-waiting for its
+/// task to be scheduled) — that's *why* they were moved out of the syscall
+/// path in the first place (see their own doc comments), but running them
+/// inline in `task_blink` just relocated the block: task_blink itself
+/// couldn't get back to painting the cursor or finishing an in-progress
+/// window drag until the job finished, since interrupts being enabled here
+/// is what lets `nvmed`/the driver task actually make progress, but nothing
+/// then made task_blink give up its own timeslice while waiting.
+///
+/// Running these on a separate preemptible task fixes that for free: the
+/// APIC timer preempts this task the same as any other, so task_blink keeps
+/// getting its regular timeslices and keeps rendering smoothly regardless of
+/// how long a job takes. `sleep_ms(10)` when nothing is pending keeps this
+/// task from burning a full timeslice every tick fighting task_blink for the
+/// CPU when there's no work to do — it only stays runnable back-to-back
+/// while a job is actually in flight.
+fn task_svc_worker() -> ! {
+    loop {
+        syscall::fs_service();
+        syscall::svc_service();
+        if !syscall::has_pending_job() {
+            scheduler::sleep_ms(10);
+        }
+    }
 }
 
 fn task_blink() -> ! {
@@ -1874,18 +1942,13 @@ fn task_blink() -> ! {
         // state machine — see hda::play_pcm()/poll() docs).
         hda::poll();
 
-        // Advance any in-progress async HepFS syscall job (SYS_FS_LIST_DIR/
-        // READ_FILE/WRITE_FILE/CREATE) — see syscall::fs_service()'s doc
-        // comment for why this can't just run synchronously inside the
-        // syscall itself (it needs to safely wait on nvmed's mailbox, which
-        // requires interrupts enabled).
-        syscall::fs_service();
-
-        // Advance any in-progress async SYS_SERVICE_CTL start/stop job — same
-        // reasoning as fs_service() above (start_service()/stop_service()
-        // spin-wait for the driver task to be scheduled, impossible from
-        // inside a syscall).
-        syscall::svc_service();
+        // NOTE: SYS_FS_*/SYS_SERVICE_CTL job servicing (syscall::fs_service()/
+        // svc_service()) used to run inline right here. Moved to its own
+        // scheduler task (`task_svc_worker`, spawned in `kmain`) — a pending
+        // job can block for the real duration of a disk read or a driver
+        // start/stop, and running that inline in this loop stalled cursor and
+        // window-drag rendering for exactly that long. See task_svc_worker's
+        // doc comment.
 
         // Expire the desktop's transient "Programs can't be renamed" toast, if any.
         { let mut dt = desktop::DESKTOP.lock(); if let Some(dt) = dt.as_mut() { dt.tick_icon_message(); } }
@@ -2348,7 +2411,7 @@ fn render_hepfs_window(display: &mut framebuffer::Display, wx: usize, wy: usize,
     let mut ctrl = nvme::CONTROLLER.lock();
     if let Some(ctrl) = ctrl.as_mut() {
         let ctrl = &mut hepfs::BlockDev::Nvme(ctrl);
-        let entries = hepfs::list_dir(ctrl, cur_ino);
+        let entries = hepfs_list_dir_cached(win_id, ctrl, cur_ino);
         let dirs: alloc::vec::Vec<_> = entries.iter()
             .filter(|(ino, _)| hepfs::read_inode(ctrl, *ino).flags == hepfs::F_DIR)
             .collect();
@@ -2488,7 +2551,7 @@ fn hepfs_scroll_max(win_id: usize, right_w: usize, list_h: usize) -> Option<usiz
     let mut ctrl = nvme::CONTROLLER.lock();
     let ctrl = ctrl.as_mut()?;
     let ctrl = &mut hepfs::BlockDev::Nvme(ctrl);
-    let total = hepfs::list_dir(ctrl, cur_ino).len() + if at_root { 0 } else { 1 };
+    let total = hepfs_list_dir_cached(win_id, ctrl, cur_ino).len() + if at_root { 0 } else { 1 };
     let cols = grid_cols(right_w);
     let total_rows   = total.div_ceil(cols);
     let visible_rows = list_h.div_ceil(GRID_CELL_H).max(1);
@@ -2517,7 +2580,7 @@ fn fs_marquee_hits(win_id: usize, wx: i32, wy: i32, ww: usize, wh: usize, rx0: i
         let mut ctrl = nvme::CONTROLLER.lock();
         let Some(ctrl) = ctrl.as_mut() else { return alloc::vec::Vec::new() };
         let ctrl = &mut hepfs::BlockDev::Nvme(ctrl);
-        hepfs::list_dir(ctrl, cur_ino).len() + if at_root { 0 } else { 1 }
+        hepfs_list_dir_cached(win_id, ctrl, cur_ino).len() + if at_root { 0 } else { 1 }
     };
     let cols = grid_cols(right_w);
 
