@@ -807,12 +807,6 @@ extern "C" fn kmain(bi_ptr: *const bootinfo::BootInfo) -> ! {
     serial::print("Input init\n");
 
     serial::print("Boot complete\n");
-    // Temporary diagnostic marker — proves whether a given boot's serial log
-    // actually came from a binary containing this session's scheduler/hepfs
-    // fixes (foreground-priority scheduling, xhcid input priority, HepFS
-    // directory/inode caching) or a stale pre-fix build. Remove once dragging
-    // smoothness is confirmed fixed or root-caused to something else.
-    serial::print("BUILD-MARKER: true-pre-session-baseline\n");
 
     // Register scheduler tasks and start APIC timer AFTER all init is stable.
     // First timer tick switches from kmain → task_blink; task_blink runs forever
@@ -821,16 +815,14 @@ extern "C" fn kmain(bi_ptr: *const bootinfo::BootInfo) -> ! {
         let mut sched = scheduler::SCHEDULER.lock();
         sched.add(scheduler::Task::new(0, "idle",  task_idle));
         sched.add(scheduler::Task::new(1, "blink", task_blink));
-        // TEMPORARY DIAGNOSTIC: svcworker disabled — testing whether the mere
-        // presence of one more task in the rotation (regardless of how little
-        // work it actually does) is itself the dominant cost on this host
-        // under software emulation, isolated from every scheduling-fairness
-        // fix layered on top of it. If dragging is smooth with this task gone
-        // entirely, SYS_FS_*/SYS_SERVICE_CTL job servicing needs a
-        // fundamentally different design (e.g. only spawning this task
-        // on-demand when a job is actually submitted, not keeping it alive
-        // for the whole session) rather than more scheduling-policy tweaks.
-        // sched.add(scheduler::Task::new(2, "svcworker", task_svc_worker));
+        // Drives SYS_FS_*/SYS_SERVICE_CTL job servicing (see task_svc_worker's
+        // doc comment) off task_blink's own render loop — confirmed this
+        // doesn't reintroduce the choppiness a fancier priority-scheduling
+        // algorithm did (see scheduler.rs's `next()`: kept deliberately plain
+        // flat round-robin after that regression). One more task in an
+        // otherwise-unchanged flat round-robin measured smooth; the earlier
+        // regression was the scheduling *algorithm*, not task count.
+        sched.add(scheduler::Task::new(2, "svcworker", task_svc_worker));
         sched.tasks[0].state = scheduler::TaskState::Running;
     }
     idt::set_handler(apic::timer_vector(), idt::timer_stub as u64);
