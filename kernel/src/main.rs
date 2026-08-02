@@ -897,6 +897,13 @@ fn task_blink() -> ! {
         // (used for all early-boot I/O) rather than merely launching a
         // previously-inert queued mailbox; see nvme.rs's module doc comment.
         nvme::spawn_pending_driver();
+        // Same one-shot deferred-spawn pattern, for `gopd` — the GOP-flush
+        // userspace driver (moves the backbuffer→real-framebuffer copy off
+        // the kernel; see framebuffer.rs's `spawn_gopd()` doc comment for
+        // exactly what did and didn't move). Called via `DISPLAY` directly
+        // rather than a bare module function, since `Display` owns its own
+        // mailbox pointer instead of a dedicated per-driver static.
+        if let Some(d) = DISPLAY.lock().as_mut() { d.spawn_gopd(); }
 
         ps2::poll();
         mouse::poll();

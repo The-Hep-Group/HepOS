@@ -1,5 +1,5 @@
 [workspace]
-members = ["hepos-rt", "hepos-std", "hello", "hwtest", "rtl8139d", "hdad", "ahcid", "xhcid", "nvmed", "memtest", "inputtest", "fstest", "svctest"]
+members = ["hepos-rt", "hepos-std", "hello", "hwtest", "rtl8139d", "hdad", "ahcid", "xhcid", "nvmed", "memtest", "inputtest", "fstest", "svctest", "gopd"]
 resolver = "2"
 
 [profile.dev]

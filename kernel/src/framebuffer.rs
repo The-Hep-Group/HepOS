@@ -1,4 +1,5 @@
 use crate::bootinfo::BootInfo;
+use crate::{pmm, process, syscall, vmm};
 
 #[derive(Clone, Copy)]
 pub struct Color {
@@ -37,6 +38,102 @@ pub struct Display {
                               // Lets virtio_gpu.rs attach it directly as a resource's
                               // backing memory (zero-copy mirroring of the real
                               // desktop, not just a synthetic test pattern).
+    /// Physical address of the real GOP framebuffer (`addr` is the HHDM
+    /// *virtual* address BootInfo hands the kernel; this is that minus
+    /// `vmm::hhdm_offset()`) — needed to grant `gopd` an MMIO mapping onto
+    /// it, since `SYS_MMAP_MMIO` takes a physical address. Computed once in
+    /// `new()`.
+    fb_phys: u64,
+    /// Null until `spawn_gopd()` successfully launches the `gopd` process —
+    /// see that method's doc comment for the GOP-flush userspace migration
+    /// this backs. `flush()`/`flush_rows()` fall back to the original direct
+    /// MMIO copy whenever this is null, same "direct path until handoff"
+    /// pattern `nvme.rs` uses for early-boot I/O before `nvmed` exists.
+    mailbox_virt: *mut GopMailbox,
+    mailbox_phys: u64,
+    /// Dedicated snapshot buffer `gopd` exclusively reads — see
+    /// `GopMailbox`'s doc comment for the tearing bug this fixes. Same
+    /// layout as `backbuf` (tightly packed `width * height` `u32`s, no
+    /// pitch padding). Allocated once in `spawn_gopd()`, null before that
+    /// (and whenever `gopd` isn't running).
+    publish_buf:  *mut u32,
+    publish_phys: u64,
+}
+
+/// Shared memory mailbox — one physical page, mapped into both the kernel
+/// (via `vmm::phys_to_virt`) and the `gopd` userspace process (via
+/// `SYS_MMAP_MMIO`, using the physical address handed to it as its one
+/// launch argument). **Layout must stay byte-for-byte identical to the copy
+/// in `userspace/gopd/src/main.rs`** — no shared crate between them enforces
+/// this (userspace crates can't depend on kernel code — different target, no
+/// `std`, different address space).
+///
+/// **Not fire-and-forget like RTL8139/HDA's mailboxes — a real bug found the
+/// hard way.** The first version pointed `gopd` straight at the live
+/// `Display::backbuf` and never waited for anything, on the theory that
+/// nothing needs the flush's *result* back. That's true, but irrelevant: the
+/// actual problem is that `backbuf` is a **shared mutable buffer** —
+/// `task_blink` keeps rendering the *next* frame into it the instant
+/// `flush()`/`flush_rows()` returns, since neither ever blocked. `gopd` is a
+/// genuinely separate, concurrently-scheduled task, so it can be mid-copy of
+/// one frame's rows while `task_blink` (preempted back in) is already
+/// overwriting `backbuf` with the *next* frame's content — real tearing,
+/// visible as flicker especially during window drags, which redraw the full
+/// screen every frame. The old, pre-migration `flush()` never had this
+/// problem: it was the copy, running synchronously and atomically inside
+/// `task_blink` itself, so nothing else could ever be mutating `backbuf`
+/// while it ran.
+///
+/// Fixed with a request/ack handshake and a dedicated `publish_buf` (see
+/// `Display`) that only `gopd` ever reads: `request_flush()` only copies
+/// `backbuf`'s dirty rows into `publish_buf` (safe — `gopd` guarantees it
+/// isn't touching `publish_buf` right now, see below) if `ack == req` (i.e.
+/// `gopd` has fully finished the *previous* request); if `gopd` hasn't
+/// caught up yet, the new flush is simply dropped rather than racing its
+/// read of the buffer it might still be mid-copy from — an ordinary,
+/// harmless frame-drop under backpressure, not corruption. `gopd` writes
+/// `ack = req` only *after* finishing its copy out to the real framebuffer,
+/// which is what makes it safe for the kernel to reuse `publish_buf` for the
+/// next snapshot the moment it sees `ack == req` again. No lock needed: on
+/// this single-core cooperative-preemptive scheduler, whichever side runs
+/// between the other's check-then-act pair simply sees state that hasn't
+/// changed yet, never state that's changing mid-read.
+#[repr(C)]
+struct GopMailbox {
+    /// Physical address of the real GOP framebuffer — written once by the
+    /// kernel; `gopd` never needs to know it again after its first map.
+    fb_phys: u64,
+    /// Physical address of `Display::publish_buf` — a dedicated snapshot
+    /// buffer `gopd` exclusively reads, **not** the live `backbuf` (see this
+    /// struct's own doc comment for why that distinction is the whole fix).
+    publish_phys: u64,
+    /// Bytes per scanline of the *real* framebuffer (may differ from
+    /// `width * 4` due to hardware padding) — `publish_buf` itself has no
+    /// such padding (tightly packed `width * height` `u32`s, mirroring
+    /// `backbuf`'s own layout), so `gopd` copies `width` pixels per row but
+    /// advances by `fb_pitch / 4` in the destination and by `width` in the
+    /// source.
+    fb_pitch: u32,
+    width:  u32,
+    height: u32,
+    /// First dirty row (inclusive) and how many rows starting there need
+    /// copying — set by the kernel before bumping `req`.
+    dirty_y:     u32,
+    dirty_count: u32,
+    /// Bumped by the kernel every time a new flush is actually published
+    /// (i.e. `ack == req` held at request time — see this struct's doc
+    /// comment). `gopd` remembers the last value it serviced and only
+    /// copies again once this changes.
+    req: u32,
+    /// Set by `gopd` to the `req` value it just finished copying out to the
+    /// real framebuffer — the other half of the handshake. The kernel only
+    /// writes new data into `publish_buf` while `ack == req` holds.
+    ack: u32,
+    /// 0 = keep running, 1 = kernel wants this process to exit (`service
+    /// stop gopd` / `kill`) — same cooperative-shutdown convention every
+    /// other migrated driver uses (see e.g. `rtl8139.rs`'s `stop_service()`
+    /// doc comment for why it's cooperative, not a forced kill).
+    stop: u32,
 }
 
 unsafe impl Send for Display {}
@@ -56,6 +153,11 @@ impl Display {
             scene_buf:    core::ptr::null_mut(),
             backbuf_len:  0,
             backbuf_phys: 0,
+            fb_phys:      (bi.fb_addr).wrapping_sub(vmm::hhdm_offset()),
+            mailbox_virt: core::ptr::null_mut(),
+            mailbox_phys: 0,
+            publish_buf:  core::ptr::null_mut(),
+            publish_phys: 0,
         }
     }
 
@@ -119,13 +221,53 @@ impl Display {
 
     /// Flush the entire backbuf to the physical framebuffer.
     pub fn flush(&mut self) {
+        self.request_flush(0, self.height);
+    }
+
+    /// Common body of `flush()`/`flush_rows()`: routes through `gopd`'s
+    /// mailbox once it's up (see `spawn_gopd()`), falling back to the
+    /// original direct MMIO copy before that — same "direct path until
+    /// handoff" shape `nvme.rs`'s `read_blocks()` uses for early-boot I/O.
+    ///
+    /// See `GopMailbox`'s doc comment for the tearing bug this handshake
+    /// fixes: only copies `backbuf`'s dirty rows into `publish_buf` (the
+    /// buffer `gopd` actually reads) while `ack == req` — i.e. `gopd` has
+    /// fully finished the previous request and is guaranteed not to be
+    /// touching `publish_buf` right now. If `gopd` hasn't caught up yet,
+    /// this flush is simply dropped (no spin-wait — that would reintroduce
+    /// exactly the "task_blink stalls on a background task's scheduling
+    /// turn" latency problem this session's earlier scheduler fixes solved)
+    /// rather than racing a concurrent read of a buffer that's still in use.
+    fn request_flush(&mut self, y: usize, count: usize) {
         if self.backbuf.is_null() || self.bpp != 4 { return; }
-        let pitch_u32 = self.pitch / 4;
-        unsafe {
-            for y in 0..self.height {
+        if !self.mailbox_virt.is_null() && !self.publish_buf.is_null() {
+            let y0 = y.min(self.height);
+            let y1 = (y + count).min(self.height);
+            if y0 >= y1 { return; }
+            unsafe {
+                let mb = self.mailbox_virt;
+                let ack = core::ptr::read_volatile(&(*mb).ack);
+                let req = core::ptr::read_volatile(&(*mb).req);
+                if ack != req { return; } // gopd still catching up — drop this frame
                 core::ptr::copy_nonoverlapping(
-                    self.backbuf.add(y * self.width),
-                    (self.addr as *mut u32).add(y * pitch_u32),
+                    self.backbuf.add(y0 * self.width),
+                    self.publish_buf.add(y0 * self.width),
+                    (y1 - y0) * self.width,
+                );
+                core::ptr::write_volatile(&mut (*mb).dirty_y, y0 as u32);
+                core::ptr::write_volatile(&mut (*mb).dirty_count, (y1 - y0) as u32);
+                core::ptr::write_volatile(&mut (*mb).req, req.wrapping_add(1));
+            }
+            return;
+        }
+        let pitch_u32 = self.pitch / 4;
+        let y0 = y.min(self.height);
+        let y1 = (y + count).min(self.height);
+        unsafe {
+            for row in y0..y1 {
+                core::ptr::copy_nonoverlapping(
+                    self.backbuf.add(row * self.width),
+                    (self.addr as *mut u32).add(row * pitch_u32),
                     self.width,
                 );
             }
@@ -135,18 +277,81 @@ impl Display {
     /// Flush only rows `y .. y+count` of backbuf to the physical framebuffer.
     /// Used for cursor-only updates — far cheaper than a full flush.
     pub fn flush_rows(&mut self, y: usize, count: usize) {
-        if self.backbuf.is_null() || self.bpp != 4 { return; }
-        let y0        = y.min(self.height);
-        let y1        = (y + count).min(self.height);
-        let pitch_u32 = self.pitch / 4;
+        self.request_flush(y, count);
+    }
+
+    /// One-time bring-up of `gopd`, the GOP-flush userspace driver — moves
+    /// the actual backbuffer→real-framebuffer copy (`flush()`/`flush_rows()`)
+    /// off the kernel, the closest thing GOP has to a "hot path" analogous to
+    /// a NIC's RX ring or a disk's I/O queue (see PLAN.md's GOP Phase 2 write
+    /// up for why the rest of the compositor — everything that draws *into*
+    /// the backbuffer — isn't part of this migration). A no-op after the
+    /// first successful call, or if the backbuffer isn't allocated yet
+    /// (`init_backbuf()` must run first — called once at boot before
+    /// `task_blink` starts, so by the time this runs from that loop it
+    /// always has). Must be called from `task_blink`'s own loop, same
+    /// "scheduler must already be live" constraint every other driver's
+    /// `spawn_pending_driver()` has — see e.g. `rtl8139.rs`'s doc comment on
+    /// why spawning any earlier corrupts the task-0 bootstrap.
+    /// Idempotent across restarts, not just the first call: `mailbox_phys`/
+    /// `publish_phys` are only ever allocated once (guarded by
+    /// `self.mailbox_phys == 0`, which survives a `stop_service()` — only
+    /// `mailbox_virt` gets nulled by that) and reused on every subsequent
+    /// `start_service()` — same "one-time DMA-buffer allocation in `init()`,
+    /// reused across restarts" pattern every other migrated driver uses
+    /// (e.g. `rtl8139.rs`'s `tx_phys`/`rx_phys`). Allocating fresh buffers on
+    /// every restart instead would leak the old ones every single
+    /// `service stop`/`start gopd` cycle.
+    pub fn spawn_gopd(&mut self) {
+        if !self.mailbox_virt.is_null() || self.backbuf.is_null() { return; }
+
+        let bytes = self.backbuf_len * 4;
+
+        if self.mailbox_phys == 0 {
+            // Dedicated snapshot buffer gopd exclusively reads — see
+            // `GopMailbox`'s doc comment for why this can't just be
+            // `backbuf` itself. Same size/layout as `backbuf`.
+            let pages = (bytes + 4095) / 4096;
+            let Some(publish_phys) = pmm::alloc_contiguous(pages) else {
+                crate::serial::print("gopd: publish buffer OOM\n");
+                return;
+            };
+            self.publish_phys = publish_phys;
+            self.publish_buf  = vmm::phys_to_virt(publish_phys) as *mut u32;
+            unsafe { core::ptr::write_bytes(self.publish_buf as *mut u8, 0, bytes); }
+
+            let Some(mailbox_phys) = pmm::alloc_page() else {
+                crate::serial::print("gopd: mailbox OOM\n");
+                return;
+            };
+            self.mailbox_phys = mailbox_phys;
+
+            syscall::grant_mmio_range(self.fb_phys, (self.height * self.pitch) as u64);
+            syscall::grant_mmio_range(publish_phys, bytes as u64);
+            syscall::grant_mmio_range(mailbox_phys, 4096);
+        }
+
+        let mailbox_virt = vmm::phys_to_virt(self.mailbox_phys) as *mut GopMailbox;
         unsafe {
-            for row in y0..y1 {
-                core::ptr::copy_nonoverlapping(
-                    self.backbuf.add(row * self.width),
-                    (self.addr as *mut u32).add(row * pitch_u32),
-                    self.width,
-                );
+            // Re-zero (not just on first alloc) so a restart starts the
+            // ack/req handshake fresh at (0, 0) rather than resuming
+            // whatever counters the previous `gopd` instance left behind —
+            // `gopd` itself starts `last_req` at 0 too (see its own
+            // `_start()`), so both sides agree on a clean initial state.
+            core::ptr::write_bytes(mailbox_virt as *mut u8, 0, 4096);
+            (*mailbox_virt).fb_phys      = self.fb_phys;
+            (*mailbox_virt).publish_phys = self.publish_phys;
+            (*mailbox_virt).fb_pitch     = self.pitch as u32;
+            (*mailbox_virt).width        = self.width as u32;
+            (*mailbox_virt).height       = self.height as u32;
+        }
+
+        match process::exec_async_with_arg(usize::MAX, SERVICE_NAME, GOPD_ELF, self.mailbox_phys) {
+            Ok(()) => {
+                self.mailbox_virt = mailbox_virt;
+                crate::serial::print("gopd: launched\n");
             }
+            Err(_) => crate::serial::print("gopd: launch failed\n"),
         }
     }
 
@@ -228,6 +433,87 @@ impl Display {
         }
     }
 }
+
+// ── gopd service management (`service`/`kill` terminal commands) ─────────────
+//
+// Same conventions every other migrated driver's service layer uses (see
+// e.g. `rtl8139.rs`), just reading/writing `Display::mailbox_virt` via
+// `crate::DISPLAY` (`main.rs`) instead of a dedicated per-driver static,
+// since the mailbox pointer lives on `Display` itself here rather than a
+// separate `NIC`/`CONTROLLER`-style struct.
+
+static ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+pub const SERVICE_NAME: &str = "<gopd>";
+
+pub fn is_enabled() -> bool { ENABLED.load(core::sync::atomic::Ordering::Relaxed) }
+pub fn set_enabled(v: bool) { ENABLED.store(v, core::sync::atomic::Ordering::Relaxed); }
+pub fn is_running() -> bool { process::is_process_running(SERVICE_NAME) }
+
+/// Number of spin iterations to wait for `gopd` to notice `stop` and exit,
+/// or for a fresh launch to register as running — same generous budget
+/// every other driver's identical constant uses (the driver only checks
+/// once per ~10ms timer tick).
+const STOP_WAIT_SPINS: u32 = 500_000_000;
+
+static STARTING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Request a cooperative shutdown of the running `gopd` and wait for it to
+/// actually exit. Once stopped, `flush()`/`flush_rows()` fall straight back
+/// to the direct MMIO copy (see `request_flush()`) — the desktop keeps
+/// rendering the entire time the service is down, only the userspace
+/// process itself goes away.
+pub fn stop_service() -> Result<(), &'static str> {
+    if !is_running() { return Err("not running"); }
+    let mb = { crate::DISPLAY.lock().as_ref().map(|d| d.mailbox_virt) };
+    let Some(mb) = mb else { return Err("driver not initialized") };
+    if mb.is_null() { return Err("driver not initialized"); }
+    unsafe { core::ptr::write_volatile(&mut (*mb).stop, 1); }
+    for _ in 0..STOP_WAIT_SPINS {
+        if !is_running() {
+            if let Some(d) = crate::DISPLAY.lock().as_mut() {
+                d.mailbox_virt = core::ptr::null_mut();
+            }
+            return Ok(());
+        }
+        core::hint::spin_loop();
+    }
+    Err("timeout waiting for driver to stop")
+}
+
+/// Launch a fresh `gopd` instance. Unlike the other 4 drivers, there's no
+/// separate one-time hardware bring-up to reuse here — `spawn_gopd()` *is*
+/// both the bring-up and the launch, guarded by `mailbox_virt` already being
+/// null (cleared by `stop_service()` above) — so this just re-runs it.
+pub fn start_service() -> Result<(), &'static str> {
+    use core::sync::atomic::Ordering;
+    if !is_enabled() { return Err("disabled"); }
+    if is_running() { return Err("already running"); }
+    if STARTING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return Err("start already in progress");
+    }
+    let result = (|| {
+        if GOPD_ELF.is_empty() { return Err("gopd ELF not built"); }
+        {
+            let mut guard = crate::DISPLAY.lock();
+            let Some(d) = guard.as_mut() else { return Err("display not initialized"); };
+            if !d.mailbox_virt.is_null() { return Err("already running"); }
+            d.spawn_gopd();
+            if d.mailbox_virt.is_null() { return Err("launch failed"); }
+        }
+        for _ in 0..STOP_WAIT_SPINS {
+            if is_running() { return Ok(()); }
+            core::hint::spin_loop();
+        }
+        Err("timeout waiting for driver to start")
+    })();
+    STARTING.store(false, Ordering::Release);
+    result
+}
+
+// Baked-in gopd ELF (generated by build.rs from userspace/target/.../gopd).
+// Empty slice if userspace hasn't been rebuilt since this driver was added.
+include!(concat!(env!("OUT_DIR"), "/gopd_elf.rs"));
 
 // 8x8 bitmap font — printable ASCII starting at 0x20
 static FONT: [[u8; 8]; 128] = {

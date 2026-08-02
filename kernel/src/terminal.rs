@@ -49,6 +49,7 @@ const SERVICE_TABLE: &[(&str, &str)] = &[
     ("hdad",     "Intel HDA audio driver"),
     ("ahcid",    "AHCI/SATA disk driver"),
     ("xhcid",    "XHCI USB HID (mouse/keyboard) driver"),
+    ("gopd",     "GOP framebuffer-flush driver"),
 ];
 
 #[derive(Clone, Copy)]
@@ -73,6 +74,7 @@ fn service_is_enabled(name: &str) -> bool {
         "hdad"     => crate::hda::is_enabled(),
         "ahcid"    => crate::ahci::is_enabled(),
         "xhcid"    => crate::xhci::is_enabled(),
+        "gopd"     => crate::framebuffer::is_enabled(),
         _ => false,
     }
 }
@@ -83,6 +85,7 @@ fn service_is_running(name: &str) -> bool {
         "hdad"     => crate::hda::is_running(),
         "ahcid"    => crate::ahci::is_running(),
         "xhcid"    => crate::xhci::is_running(),
+        "gopd"     => crate::framebuffer::is_running(),
         _ => false,
     }
 }
@@ -108,6 +111,7 @@ fn service_dispatch(name: &str, action: ServiceAction) -> Result<String, String>
                 "hdad"     => crate::hda::set_enabled(true),
                 "ahcid"    => crate::ahci::set_enabled(true),
                 "xhcid"    => crate::xhci::set_enabled(true),
+                "gopd"     => crate::framebuffer::set_enabled(true),
                 _ => unreachable!(),
             }
             return Ok(alloc::format!("{} enabled", name));
@@ -118,6 +122,7 @@ fn service_dispatch(name: &str, action: ServiceAction) -> Result<String, String>
                 "hdad"     => crate::hda::set_enabled(false),
                 "ahcid"    => crate::ahci::set_enabled(false),
                 "xhcid"    => crate::xhci::set_enabled(false),
+                "gopd"     => crate::framebuffer::set_enabled(false),
                 _ => unreachable!(),
             }
             return Ok(alloc::format!("{} disabled (won't affect an already-running instance)", name));
@@ -133,6 +138,8 @@ fn service_dispatch(name: &str, action: ServiceAction) -> Result<String, String>
         ("ahcid",    ServiceAction::Stop)  => crate::ahci::stop_service(),
         ("xhcid",    ServiceAction::Start) => crate::xhci::start_service(),
         ("xhcid",    ServiceAction::Stop)  => crate::xhci::stop_service(),
+        ("gopd",     ServiceAction::Start) => crate::framebuffer::start_service(),
+        ("gopd",     ServiceAction::Stop)  => crate::framebuffer::stop_service(),
         _ => unreachable!(),
     };
     match result {

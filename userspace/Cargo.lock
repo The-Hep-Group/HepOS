@@ -19,6 +19,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "gopd"
+version = "0.1.0"
+dependencies = [
+ "hepos-rt",
+ "hepos-std",
+]
+
+[[package]]
 name = "hdad"
 version = "0.1.0"
 dependencies = [

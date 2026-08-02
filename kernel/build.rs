@@ -98,6 +98,19 @@ fn main() {
         std::fs::write(&gen_nvmed, "static NVMED_ELF: &[u8] = &[];\n").unwrap();
     }
 
+    // Bake the userspace gopd ELF (the persistent GOP-flush driver process —
+    // see framebuffer.rs) the same way.
+    let gopd     = root.join("userspace/target/x86_64-unknown-none/release/gopd");
+    let gen_gopd = std::path::Path::new(&out_dir).join("gopd_elf.rs");
+    if gopd.exists() {
+        let bytes = std::fs::read(&gopd).expect("read gopd ELF");
+        let lit: String = bytes.iter().map(|b| format!("{},", b)).collect();
+        std::fs::write(&gen_gopd, format!("static GOPD_ELF: &[u8] = &[{}];\n", lit)).unwrap();
+        println!("cargo:rerun-if-changed={}", gopd.display());
+    } else {
+        std::fs::write(&gen_gopd, "static GOPD_ELF: &[u8] = &[];\n").unwrap();
+    }
+
     // Bake the userspace memtest ELF (proves out SYS_MMAP_ANON — Phase 1 of
     // the desktop-to-userspace migration, see PLAN.md) the same way.
     let memtest     = root.join("userspace/target/x86_64-unknown-none/release/memtest");
