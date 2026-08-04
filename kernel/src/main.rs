@@ -2072,7 +2072,18 @@ fn task_blink() -> ! {
                     dt.as_ref().map(|d| d.cursor_type_at(mx, my))
                         .unwrap_or(desktop::CursorType::Normal)
                 };
-                match cursor_type {
+                let cursor_kind = match cursor_type {
+                    desktop::CursorType::Normal     => 0,
+                    desktop::CursorType::ResizeEW   => 1,
+                    desktop::CursorType::ResizeNS   => 2,
+                    desktop::CursorType::ResizeNWSE => 3,
+                    desktop::CursorType::ResizeNESW => 4,
+                };
+                if $display.gopd_active() {
+                    // gopd owns final cursor composition.  It receives this
+                    // staged value atomically with the next published frame.
+                    $display.set_gop_cursor(cx as i32, cy as i32, cursor_kind);
+                } else { match cursor_type {
                     // SE diagonal (↘)
                     desktop::CursorType::ResizeNWSE => {
                         for i in -4_i32..=4 {
@@ -2134,7 +2145,7 @@ fn task_blink() -> ! {
                         $display.fill_rect(cx.saturating_sub(6), cy, 13, 1, white);
                         $display.fill_rect(cx, cy.saturating_sub(6), 1, 13, white);
                     }
-                }
+                }}
             }};
         }
 

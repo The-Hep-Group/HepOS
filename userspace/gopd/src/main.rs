@@ -52,7 +52,32 @@ struct Mailbox {
     dirty_count:  u32,
     req:          u32,
     ack:          u32,
+    cursor_x:     i32,
+    cursor_y:     i32,
+    cursor_kind:  u32,
     stop:         u32,
+}
+
+unsafe fn pixel(fb: *mut u32, pitch: usize, width: usize, height: usize, x: i32, y: i32, color: u32) {
+    if x >= 0 && y >= 0 && (x as usize) < width && (y as usize) < height {
+        core::ptr::write_volatile(fb.add(y as usize * pitch + x as usize), color);
+    }
+}
+
+unsafe fn rect(fb: *mut u32, pitch: usize, width: usize, height: usize, x: i32, y: i32, w: usize, h: usize, color: u32) {
+    for yy in 0..h as i32 { for xx in 0..w as i32 { pixel(fb, pitch, width, height, x + xx, y + yy, color); } }
+}
+
+unsafe fn draw_cursor(fb: *mut u32, pitch: usize, width: usize, height: usize, cx: i32, cy: i32, kind: u32) {
+    const WHITE: u32 = 0x00FF_FFFF;
+    const BLACK: u32 = 0x0011_1111;
+    match kind {
+        1 => { rect(fb,pitch,width,height,cx-7,cy,15,1,BLACK); rect(fb,pitch,width,height,cx-7,cy-3,1,7,BLACK); rect(fb,pitch,width,height,cx+7,cy-3,1,7,BLACK); rect(fb,pitch,width,height,cx-6,cy,13,1,WHITE); rect(fb,pitch,width,height,cx-6,cy-2,1,5,WHITE); rect(fb,pitch,width,height,cx+6,cy-2,1,5,WHITE); }
+        2 => { rect(fb,pitch,width,height,cx,cy-7,1,15,BLACK); rect(fb,pitch,width,height,cx-3,cy-7,7,1,BLACK); rect(fb,pitch,width,height,cx-3,cy+7,7,1,BLACK); rect(fb,pitch,width,height,cx,cy-6,1,13,WHITE); rect(fb,pitch,width,height,cx-2,cy-6,5,1,WHITE); rect(fb,pitch,width,height,cx-2,cy+6,5,1,WHITE); }
+        3 => { for i in -4..=4 { pixel(fb,pitch,width,height,cx+i+1,cy+i+1,BLACK); pixel(fb,pitch,width,height,cx+i,cy+i,WHITE); } rect(fb,pitch,width,height,cx-3,cy-4,5,1,BLACK); rect(fb,pitch,width,height,cx-4,cy-3,1,4,BLACK); rect(fb,pitch,width,height,cx+1,cy+5,5,1,BLACK); rect(fb,pitch,width,height,cx+5,cy+1,1,4,BLACK); rect(fb,pitch,width,height,cx-3,cy-5,5,1,WHITE); rect(fb,pitch,width,height,cx-5,cy-3,1,4,WHITE); rect(fb,pitch,width,height,cx+1,cy+5,4,1,WHITE); rect(fb,pitch,width,height,cx+5,cy+1,1,4,WHITE); }
+        4 => { for i in -4..=4 { pixel(fb,pitch,width,height,cx+i+1,cy-i+1,BLACK); pixel(fb,pitch,width,height,cx+i,cy-i,WHITE); } rect(fb,pitch,width,height,cx-3,cy+4,5,1,BLACK); rect(fb,pitch,width,height,cx-4,cy-3,1,4,BLACK); rect(fb,pitch,width,height,cx+1,cy-4,5,1,BLACK); rect(fb,pitch,width,height,cx+5,cy-3,1,4,BLACK); rect(fb,pitch,width,height,cx-3,cy+4,4,1,WHITE); rect(fb,pitch,width,height,cx-5,cy-3,1,4,WHITE); rect(fb,pitch,width,height,cx+1,cy-5,5,1,WHITE); rect(fb,pitch,width,height,cx+5,cy-3,1,4,WHITE); }
+        _ => { rect(fb,pitch,width,height,cx-6,cy,13,1,WHITE); rect(fb,pitch,width,height,cx,cy-6,1,13,WHITE); }
+    }
 }
 
 #[no_mangle]
@@ -112,6 +137,12 @@ pub unsafe extern "C" fn _start(mailbox_phys: u64) -> ! {
                     width,
                 );
             }
+            draw_cursor(
+                fb, pitch_u32, width, height,
+                core::ptr::read_volatile(&mb.cursor_x),
+                core::ptr::read_volatile(&mb.cursor_y),
+                core::ptr::read_volatile(&mb.cursor_kind),
+            );
             // Signal completion — only now may the kernel reuse `publish`
             // for the next snapshot.
             core::ptr::write_volatile(&mut mb.ack, req);

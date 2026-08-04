@@ -58,6 +58,12 @@ pub struct Display {
     /// (and whenever `gopd` isn't running).
     publish_buf:  *mut u32,
     publish_phys: u64,
+    // Staged locally and committed with the next accepted present request.
+    // This prevents a later mouse move from changing the cursor attached to
+    // a snapshot gopd is already presenting.
+    cursor_x: i32,
+    cursor_y: i32,
+    cursor_kind: u32,
 }
 
 /// Shared memory mailbox — one physical page, mapped into both the kernel
@@ -129,6 +135,9 @@ struct GopMailbox {
     /// real framebuffer — the other half of the handshake. The kernel only
     /// writes new data into `publish_buf` while `ack == req` holds.
     ack: u32,
+    cursor_x: i32,
+    cursor_y: i32,
+    cursor_kind: u32,
     /// 0 = keep running, 1 = kernel wants this process to exit (`service
     /// stop gopd` / `kill`) — same cooperative-shutdown convention every
     /// other migrated driver uses (see e.g. `rtl8139.rs`'s `stop_service()`
@@ -158,6 +167,9 @@ impl Display {
             mailbox_phys: 0,
             publish_buf:  core::ptr::null_mut(),
             publish_phys: 0,
+            cursor_x: 0,
+            cursor_y: 0,
+            cursor_kind: 0,
         }
     }
 
@@ -256,6 +268,9 @@ impl Display {
                 );
                 core::ptr::write_volatile(&mut (*mb).dirty_y, y0 as u32);
                 core::ptr::write_volatile(&mut (*mb).dirty_count, (y1 - y0) as u32);
+                core::ptr::write_volatile(&mut (*mb).cursor_x, self.cursor_x);
+                core::ptr::write_volatile(&mut (*mb).cursor_y, self.cursor_y);
+                core::ptr::write_volatile(&mut (*mb).cursor_kind, self.cursor_kind);
                 core::ptr::write_volatile(&mut (*mb).req, req.wrapping_add(1));
             }
             return;
@@ -278,6 +293,16 @@ impl Display {
     /// Used for cursor-only updates — far cheaper than a full flush.
     pub fn flush_rows(&mut self, y: usize, count: usize) {
         self.request_flush(y, count);
+    }
+
+    /// True when final composition is delegated to gopd.
+    pub fn gopd_active(&self) -> bool { !self.mailbox_virt.is_null() }
+
+    /// Wire enum: 0 normal, 1 EW, 2 NS, 3 NWSE, 4 NESW.
+    pub fn set_gop_cursor(&mut self, x: i32, y: i32, kind: u32) {
+        self.cursor_x = x;
+        self.cursor_y = y;
+        self.cursor_kind = kind;
     }
 
     /// One-time bring-up of `gopd`, the GOP-flush userspace driver — moves
